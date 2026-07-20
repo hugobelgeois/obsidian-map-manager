@@ -1,0 +1,11 @@
+{
+	"id": "obsidian-map-manager",
+	"name": "Map Manager",
+	"version": "0.1.0",
+	"minAppVersion": "1.6.0",
+	"description": "Design interactive square or hexagonal grid maps with a background image, zone types, stamps and note links, embeddable in any page.",
+	"author": "Hugo Belgeois",
+	"authorUrl": "https://github.com/hugobelgeois/obsidian-map-manager",
+	"fundingUrl": "https://obsidian.md/pricing",
+	"isDesktopOnly": false
+}
