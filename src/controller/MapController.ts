@@ -1,10 +1,19 @@
-import { CellData, Marker, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
+import { CellData, Marker, VisionBlockerType, WallPoint, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
 
 export type MapControllerListener = () => void;
 
 export type MapMode = "edit" | "view";
 
-export type EditTool = "none" | "brush" | "fill";
+export type EditTool = "none" | "brush" | "fill" | "wall";
+
+/** One step of the in-progress wall chain (see `commitWallPoint`/`undoLastWallPoint`). */
+interface WallChainStep {
+	pointId: string;
+	/** Whether this step created a new point (vs. reusing/snapping onto an existing one) — determines whether undo deletes the point or just the segment. */
+	createdPoint: boolean;
+	/** The segment connecting this step to the previous one, or `null` for the chain's first point. */
+	segmentId: string | null;
+}
 
 const MAX_HISTORY = 100;
 
@@ -16,20 +25,24 @@ export class MapController {
 	selectedCellKey: string | null = null;
 	selectedTokenId: string | null = null;
 	selectedMarkerId: string | null = null;
+	selectedWallPointId: string | null = null;
 	mode: MapMode;
 	/** Whether the grid/cell overlay is shown in view mode (edit mode always shows it). Session-only, not persisted. */
 	showCells = true;
 
 	/**
-	 * Brush/fill tools (edit mode): apply a zone type / vision blocker to cells, either one at a
-	 * time while dragging (brush) or flood-filled from a click (fill). Session-only, not persisted.
-	 * `brushZoneMode` is "keep" (untouched), "clear" (remove the zone), or a zoneTypeId to apply.
-	 * In grid type "none" these paint the hidden square substrate used for fog only (see `updateCell`).
+	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
+	 * (brush) or flood-filled from a click (fill). Session-only, not persisted. `brushZoneMode` is
+	 * "keep" (untouched), "clear" (remove the zone), or a zoneTypeId to apply.
 	 */
 	activeTool: EditTool = "none";
 	brushRadius = 0;
 	brushZoneMode = "keep";
-	brushBlockerMode: "keep" | "opaque" | "dim" | "off" = "keep";
+
+	/** Default blocker type applied to newly-drawn wall segments (edit mode, "wall" tool). Session-only. */
+	wallDrawBlockerType: VisionBlockerType = "opaque";
+	/** The in-progress wall chain — each left-click while the "wall" tool is active pushes one step (see `commitWallPoint`). Session-only. */
+	private wallChain: WallChainStep[] = [];
 
 	private data: MapFileData;
 	private listeners: Set<MapControllerListener> = new Set();
@@ -120,26 +133,38 @@ export class MapController {
 	// ---- Selection ----
 
 	selectCell(key: string | null): void {
-		if (this.selectedCellKey === key && this.selectedTokenId === null && this.selectedMarkerId === null) return;
+		if (this.selectedCellKey === key && this.selectedTokenId === null && this.selectedMarkerId === null && this.selectedWallPointId === null) return;
 		this.selectedCellKey = key;
 		this.selectedTokenId = null;
 		this.selectedMarkerId = null;
+		this.selectedWallPointId = null;
 		this.notify();
 	}
 
 	selectToken(tokenId: string | null): void {
-		if (this.selectedTokenId === tokenId && this.selectedCellKey === null && this.selectedMarkerId === null) return;
+		if (this.selectedTokenId === tokenId && this.selectedCellKey === null && this.selectedMarkerId === null && this.selectedWallPointId === null) return;
 		this.selectedTokenId = tokenId;
 		this.selectedCellKey = null;
 		this.selectedMarkerId = null;
+		this.selectedWallPointId = null;
 		this.notify();
 	}
 
 	selectMarker(markerId: string | null): void {
-		if (this.selectedMarkerId === markerId && this.selectedCellKey === null && this.selectedTokenId === null) return;
+		if (this.selectedMarkerId === markerId && this.selectedCellKey === null && this.selectedTokenId === null && this.selectedWallPointId === null) return;
 		this.selectedMarkerId = markerId;
 		this.selectedCellKey = null;
 		this.selectedTokenId = null;
+		this.selectedWallPointId = null;
+		this.notify();
+	}
+
+	selectWallPoint(pointId: string | null): void {
+		if (this.selectedWallPointId === pointId && this.selectedCellKey === null && this.selectedTokenId === null && this.selectedMarkerId === null) return;
+		this.selectedWallPointId = pointId;
+		this.selectedCellKey = null;
+		this.selectedTokenId = null;
+		this.selectedMarkerId = null;
 		this.notify();
 	}
 
@@ -158,6 +183,11 @@ export class MapController {
 		return this.findMarker(this.selectedMarkerId);
 	}
 
+	getSelectedWallPoint(): WallPoint | undefined {
+		if (!this.selectedWallPointId) return undefined;
+		return this.findWallPoint(this.selectedWallPointId);
+	}
+
 	findToken(tokenId: string): Token | undefined {
 		return this.data.tokens.find((t) => t.id === tokenId);
 	}
@@ -166,6 +196,14 @@ export class MapController {
 		for (const layer of this.data.layers) {
 			const marker = layer.markers.find((m) => m.id === markerId);
 			if (marker) return marker;
+		}
+		return undefined;
+	}
+
+	findWallPoint(pointId: string): WallPoint | undefined {
+		for (const layer of this.data.layers) {
+			const point = layer.wallPoints.find((p) => p.id === pointId);
+			if (point) return point;
 		}
 		return undefined;
 	}
@@ -191,6 +229,9 @@ export class MapController {
 
 	setActiveTool(tool: EditTool): void {
 		this.activeTool = this.activeTool === tool ? "none" : tool;
+		// A fresh activation of the wall tool always starts an unconnected chain, whether it's being
+		// turned on for the first time or re-toggled after being switched off mid-chain.
+		if (tool === "wall") this.resetWallChain();
 		this.notify();
 	}
 
@@ -204,22 +245,137 @@ export class MapController {
 		this.notify();
 	}
 
-	setBrushBlockerMode(mode: "keep" | "opaque" | "dim" | "off"): void {
-		this.brushBlockerMode = mode;
+	/** Applies the current brush zone type to one cell (called continuously while painting/filling). */
+	paintCell(key: string): void {
+		if (this.brushZoneMode === "keep") return;
+		const zoneMode = this.brushZoneMode;
+		this.updateCell(key, (cell) => {
+			if (zoneMode === "clear") cell.zoneTypeId = undefined;
+			else cell.zoneTypeId = zoneMode;
+		});
+	}
+
+	// ---- Walls (freeform vision-blocking lines, scoped to the active layer) ----
+
+	setWallDrawBlockerType(type: VisionBlockerType): void {
+		this.wallDrawBlockerType = type;
 		this.notify();
 	}
 
-	/** Applies the current brush settings to one cell (called continuously while painting/filling). */
-	paintCell(key: string): void {
-		if (this.brushZoneMode === "keep" && this.brushBlockerMode === "keep") return;
-		const zoneMode = this.brushZoneMode;
-		const blockerMode = this.brushBlockerMode;
-		this.updateCell(key, (cell) => {
-			if (zoneMode === "clear") cell.zoneTypeId = undefined;
-			else if (zoneMode !== "keep") cell.zoneTypeId = zoneMode;
-			if (blockerMode === "off") cell.visionBlocker = undefined;
-			else if (blockerMode !== "keep") cell.visionBlocker = blockerMode;
+	/** Clears the in-progress chain without deleting anything (tool toggled off/on). */
+	resetWallChain(): void {
+		this.wallChain = [];
+	}
+
+	/** The chain's current tail point (where the next click continues from), or `null` if no chain is in progress — used to draw the live preview line. */
+	getWallChainTailId(): string | null {
+		return this.wallChain[this.wallChain.length - 1]?.pointId ?? null;
+	}
+
+	/**
+	 * The single entry point for every left-click while the "wall" tool is active: resolves the
+	 * clicked point (reusing `existingPointId` if the click snapped onto one, else creating a new
+	 * point at `x,y`), connects it to the chain's previous point with a segment if there is one, and
+	 * selects it. `existingPointId`, when given, must belong to a `WallPoint` already present on some
+	 * layer (found via `resolveWallPlacement` in MapCanvas).
+	 */
+	commitWallPoint(x: number, y: number, existingPointId?: string): void {
+		const blockerType = this.wallDrawBlockerType;
+		const previous = this.wallChain[this.wallChain.length - 1];
+		this.update((data) => {
+			const layer = getActiveLayer(data);
+			let pointId = existingPointId;
+			if (!pointId) {
+				const point: WallPoint = { id: generateLocalId("wallpoint"), x, y };
+				layer.wallPoints.push(point);
+				pointId = point.id;
+			}
+			let segmentId: string | null = null;
+			if (previous && previous.pointId !== pointId) {
+				segmentId = generateLocalId("wallsegment");
+				layer.wallSegments.push({ id: segmentId, aId: previous.pointId, bId: pointId, blockerType });
+			}
+			this.wallChain.push({ pointId, createdPoint: !existingPointId, segmentId });
 		});
+		this.selectWallPoint(this.wallChain[this.wallChain.length - 1]?.pointId ?? null);
+	}
+
+	/** Right-click handler: undoes just the last placed point (and its connecting segment), like a vector pen tool. */
+	undoLastWallPoint(): void {
+		const last = this.wallChain.pop();
+		if (!last) return;
+		this.update((data) => {
+			for (const layer of data.layers) {
+				if (last.segmentId) layer.wallSegments = layer.wallSegments.filter((s) => s.id !== last.segmentId);
+				if (last.createdPoint) layer.wallPoints = layer.wallPoints.filter((p) => p.id !== last.pointId);
+			}
+		});
+		const newLast = this.wallChain[this.wallChain.length - 1];
+		this.selectWallPoint(newLast?.pointId ?? null);
+	}
+
+	/**
+	 * Every point/segment reachable from `pointId` by following wall segments (within the same
+	 * layer, since a segment can't span layers — see `setActiveLayer`) — i.e. the whole connected
+	 * "shape" this point belongs to, not just its immediately-touching segments. Deleting a point and
+	 * changing a shape's blocker type both act on this whole set, since a wall's shape is one unit.
+	 */
+	private wallShapeOf(pointId: string): { layer: Layer; pointIds: Set<string>; segmentIds: Set<string> } | undefined {
+		const layer = this.data.layers.find((l) => l.wallPoints.some((p) => p.id === pointId));
+		if (!layer) return undefined;
+		const pointIds = new Set<string>([pointId]);
+		const segmentIds = new Set<string>();
+		const queue: string[] = [pointId];
+		while (queue.length > 0) {
+			const current = queue.shift();
+			if (current === undefined) break;
+			for (const segment of layer.wallSegments) {
+				if (segment.aId !== current && segment.bId !== current) continue;
+				segmentIds.add(segment.id);
+				const other = segment.aId === current ? segment.bId : segment.aId;
+				if (!pointIds.has(other)) {
+					pointIds.add(other);
+					queue.push(other);
+				}
+			}
+		}
+		return { layer, pointIds, segmentIds };
+	}
+
+	/** Deletes a wall point's entire connected shape — every point and segment reachable from it (info-panel delete button). */
+	removeWallPoint(pointId: string): void {
+		const shape = this.wallShapeOf(pointId);
+		if (!shape) return;
+		const { layer, pointIds, segmentIds } = shape;
+		this.update((data) => {
+			const target = data.layers.find((l) => l.id === layer.id);
+			if (!target) return;
+			target.wallPoints = target.wallPoints.filter((p) => !pointIds.has(p.id));
+			target.wallSegments = target.wallSegments.filter((s) => !segmentIds.has(s.id));
+		});
+		this.wallChain = this.wallChain.filter((step) => !pointIds.has(step.pointId));
+		if (this.selectedWallPointId && pointIds.has(this.selectedWallPointId)) this.selectWallPoint(null);
+	}
+
+	/** Bulk-sets the blocker type of every segment in `pointId`'s whole connected shape (info-panel type editor). */
+	setWallPointBlockerType(pointId: string, type: VisionBlockerType): void {
+		const shape = this.wallShapeOf(pointId);
+		if (!shape) return;
+		const { layer, segmentIds } = shape;
+		this.update((data) => {
+			const target = data.layers.find((l) => l.id === layer.id);
+			if (!target) return;
+			for (const segment of target.wallSegments) {
+				if (segmentIds.has(segment.id)) segment.blockerType = type;
+			}
+		});
+	}
+
+	/** Every segment in `pointId`'s whole connected shape, for the info panel's type editor. */
+	getSegmentsForPoint(pointId: string): { blockerType: VisionBlockerType }[] {
+		const shape = this.wallShapeOf(pointId);
+		if (!shape) return [];
+		return shape.layer.wallSegments.filter((s) => shape.segmentIds.has(s.id));
 	}
 
 	// ---- Tokens (map-level: not tied to any layer) ----
@@ -381,6 +537,10 @@ export class MapController {
 		this.update((data) => {
 			if (data.layers.some((l) => l.id === layerId)) data.activeLayerId = layerId;
 		});
+		// A wall chain's points/segments all belong to whichever layer was active while drawing it
+		// (see `commitWallPoint`) — switching layers mid-chain would connect a new point on the new
+		// active layer to a previous point that only exists on the old one, so end the chain here.
+		this.resetWallChain();
 	}
 
 	toggleLayerVisibility(layerId: string): void {

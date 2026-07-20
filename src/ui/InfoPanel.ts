@@ -11,6 +11,7 @@ import {
 	TOKEN_SIZES,
 	Token,
 	TokenTemplate,
+	VisionBlockerType,
 	makeLink,
 	splitLink,
 } from "../data/mapData";
@@ -131,6 +132,20 @@ export class InfoPanel {
 			}
 		}
 
+		if (this.controller.selectedWallPointId) {
+			const found = this.controller.findWallPoint(this.controller.selectedWallPointId);
+			if (found) {
+				this.el.addClass("is-open");
+				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
+				header.createEl("h4", { text: "Point de mur" });
+				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
+				closeBtn.onclick = () => this.controller.selectWallPoint(null);
+
+				this.renderWallPointPanel(found.id);
+				return;
+			}
+		}
+
 		const key = this.controller.selectedCellKey;
 		const data = this.controller.getData();
 		if (!key || data.gridType === "none") {
@@ -173,20 +188,6 @@ export class InfoPanel {
 			if (cell.zoneTypeId === z.id) opt.selected = true;
 		}
 		select.onchange = () => this.updateCell(key, (c) => (c.zoneTypeId = select.value || undefined));
-
-		// Vision blocker
-		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
-		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
-		const blockerSelect = blockerField.createEl("select");
-		const noneBlockerOpt = blockerSelect.createEl("option", { text: "Aucun" });
-		noneBlockerOpt.value = "";
-		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-		opaqueOpt.value = "opaque";
-		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-		dimOpt.value = "dim";
-		blockerSelect.value = cell.visionBlocker ?? "";
-		blockerSelect.onchange = () =>
-			this.updateCell(key, (c) => (c.visionBlocker = blockerSelect.value === "opaque" || blockerSelect.value === "dim" ? blockerSelect.value : undefined));
 
 		// Stamp
 		const stampField = this.el.createDiv({ cls: "map-manager-field" });
@@ -231,7 +232,6 @@ export class InfoPanel {
 				c.stamp = undefined;
 				c.label = undefined;
 				c.links = undefined;
-				c.visionBlocker = undefined;
 			});
 	}
 
@@ -306,6 +306,33 @@ export class InfoPanel {
 		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 		const deleteBtn = footer.createEl("button", { text: "Supprimer le tampon", cls: "map-manager-btn map-manager-btn-danger" });
 		deleteBtn.onclick = () => this.controller.removeMarker(marker.id);
+	}
+
+	// ---- Wall points (freeform vision-blocking lines, edit mode only) ----
+
+	private renderWallPointPanel(pointId: string): void {
+		const segments = this.controller.getSegmentsForPoint(pointId);
+
+		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
+		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		const blockerSelect = blockerField.createEl("select");
+		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
+		opaqueOpt.value = "opaque";
+		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
+		dimOpt.value = "dim";
+		// Segments connected to this point may not all share the same type; leave the control on its
+		// first option in that case rather than misrepresenting a single value.
+		const firstType = segments[0]?.blockerType;
+		const allSame = segments.every((s) => s.blockerType === firstType);
+		if (allSame && firstType) blockerSelect.value = firstType;
+		blockerSelect.onchange = () => this.controller.setWallPointBlockerType(pointId, blockerSelect.value as VisionBlockerType);
+		if (segments.length === 0) {
+			blockerField.createDiv({ cls: "map-manager-infopanel-empty", text: "Ce point n'est relié à aucune ligne." });
+		}
+
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		const deleteBtn = footer.createEl("button", { text: "Supprimer le point", cls: "map-manager-btn map-manager-btn-danger" });
+		deleteBtn.onclick = () => this.controller.removeWallPoint(pointId);
 	}
 
 	// ---- Tokens (always editable, in both edit and view mode) ----

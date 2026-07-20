@@ -180,3 +180,97 @@ export const SQUARE_CELL_SCALE = Math.sqrt(3);
 export function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));
 }
+
+// ---------------- Wall-point grid snapping ----------------
+
+export interface Point {
+	x: number;
+	y: number;
+}
+
+/** 0 = a grid corner, 1 = an edge's midpoint, 2 = anywhere along an edge (projected, clamped to the segment). */
+export interface SnapCandidate extends Point {
+	priority: 0 | 1 | 2;
+}
+
+/** Nearest point on segment `a`-`b` to `(x, y)`, clamped to the segment (not the infinite line). */
+function projectOntoSegment(x: number, y: number, a: Point, b: Point): Point {
+	const abx = b.x - a.x;
+	const aby = b.y - a.y;
+	const lenSq = abx * abx + aby * aby;
+	if (lenSq === 0) return { x: a.x, y: a.y };
+	const t = clamp(((x - a.x) * abx + (y - a.y) * aby) / lenSq, 0, 1);
+	return { x: a.x + t * abx, y: a.y + t * aby };
+}
+
+/** Corner (priority 0), midpoint (priority 1) and nearest-projected-point (priority 2) candidates for each edge of a closed polygon (`corners`, in order). */
+function polygonSnapCandidates(corners: Point[], x: number, y: number): SnapCandidate[] {
+	const candidates: SnapCandidate[] = corners.map((c) => ({ x: c.x, y: c.y, priority: 0 }));
+	const n = corners.length;
+	for (let i = 0; i < n; i++) {
+		const a = corners[i];
+		const b = corners[(i + 1) % n];
+		if (!a || !b) continue;
+		candidates.push({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, priority: 1 });
+		const proj = projectOntoSegment(x, y, a, b);
+		candidates.push({ ...proj, priority: 2 });
+	}
+	return candidates;
+}
+
+/** Corners/edges/midpoints of the square grid cell containing `(x, y)`, for wall-point snapping. */
+export function squareGridSnapCandidates(x: number, y: number, cellSize: number): SnapCandidate[] {
+	const col = Math.floor(x / cellSize);
+	const row = Math.floor(y / cellSize);
+	const corners: Point[] = [
+		{ x: col * cellSize, y: row * cellSize },
+		{ x: (col + 1) * cellSize, y: row * cellSize },
+		{ x: (col + 1) * cellSize, y: (row + 1) * cellSize },
+		{ x: col * cellSize, y: (row + 1) * cellSize },
+	];
+	return polygonSnapCandidates(corners, x, y);
+}
+
+/** Corners/edges/midpoints of the hex grid cell containing `(x, y)`, for wall-point snapping. */
+export function hexGridSnapCandidates(x: number, y: number, cellSize: number, orientation: HexOrientation): SnapCandidate[] {
+	const cell = hexWorldToCell(x, y, cellSize, orientation);
+	const center = hexCellToWorldCenter(cell.a, cell.b, cellSize, orientation);
+	const corners = hexCorners(center.x, center.y, cellSize, orientation);
+	return polygonSnapCandidates(corners, x, y);
+}
+
+// ---------------- Segment / ray-segment intersection ----------------
+
+/** Where two finite segments `p1`-`p2` and `p3`-`p4` cross, or `null` if they don't (parallel or out of range). */
+export function segmentIntersection(p1: Point, p2: Point, p3: Point, p4: Point): Point | null {
+	const d1x = p2.x - p1.x;
+	const d1y = p2.y - p1.y;
+	const d2x = p4.x - p3.x;
+	const d2y = p4.y - p3.y;
+	const denom = d1x * d2y - d1y * d2x;
+	if (denom === 0) return null;
+	const dx = p3.x - p1.x;
+	const dy = p3.y - p1.y;
+	const t = (dx * d2y - dy * d2x) / denom;
+	const u = (dx * d1y - dy * d1x) / denom;
+	if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+	return { x: p1.x + t * d1x, y: p1.y + t * d1y };
+}
+
+/**
+ * Distance along the ray from `origin` in unit direction `(dx, dy)` to where it crosses segment
+ * `a`-`b`, or `null` if it doesn't cross within `[0, maxDist]`. `(dx, dy)` must already be a unit
+ * vector — the returned distance is the direct `t` parameter, not rescaled.
+ */
+export function raySegmentDistance(origin: Point, dx: number, dy: number, maxDist: number, a: Point, b: Point): number | null {
+	const sx = b.x - a.x;
+	const sy = b.y - a.y;
+	const denom = dx * sy - dy * sx;
+	if (denom === 0) return null;
+	const diffX = a.x - origin.x;
+	const diffY = a.y - origin.y;
+	const t = (diffX * sy - diffY * sx) / denom;
+	const u = (diffX * dy - diffY * dx) / denom;
+	if (t < 0 || t > maxDist || u < 0 || u > 1) return null;
+	return t;
+}

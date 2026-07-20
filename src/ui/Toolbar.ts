@@ -1,6 +1,6 @@
 import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
-import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, getActiveLayer } from "../data/mapData";
+import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
 import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
@@ -142,9 +142,9 @@ export class Toolbar {
 			setTooltip(newTokenBtn, "Nouveau pion");
 			newTokenBtn.onclick = () => this.addTokenAtCenter();
 
-			if (data.gridType !== "none") {
-				this.renderFogDropdown(this.el, data);
-			}
+			// Fog runs even in grid type "none" (on its hidden square substrate — see MapCanvas),
+			// so the toggle/reset controls aren't restricted to celled grid types.
+			this.renderFogDropdown(this.el, data);
 		}
 
 		const recenterGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
@@ -352,9 +352,10 @@ export class Toolbar {
 	}
 
 	/**
-	 * Brush (paint while dragging) and fill (flood-fill a closed perimeter) tools, mutually exclusive.
-	 * Both apply the same zone/blocker settings. In grid type "none" there's no visible zone to paint,
-	 * so only the blocker control shows — it still paints the hidden square substrate used for fog.
+	 * Brush (paint while dragging) and fill (flood-fill a closed perimeter) tools, mutually exclusive,
+	 * both painting the same zone type. A third "wall" tool draws freeform vision-blocking lines
+	 * (see MapCanvas) independent of the grid — its own control just picks the default blocker type
+	 * (opaque/dim) for newly-drawn segments.
 	 */
 	private renderToolControls(container: HTMLElement, data: MapFileData): void {
 		const toolGroup = container.createDiv({ cls: "map-manager-toolbar-group" });
@@ -368,7 +369,23 @@ export class Toolbar {
 		setTooltip(fillBtn, "Remplissage");
 		fillBtn.toggleClass("is-active", this.controller.activeTool === "fill");
 		fillBtn.onclick = () => this.controller.setActiveTool("fill");
+		const wallBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(wallBtn, "spline");
+		setTooltip(wallBtn, "Murs (blocage de vue)");
+		wallBtn.toggleClass("is-active", this.controller.activeTool === "wall");
+		wallBtn.onclick = () => this.controller.setActiveTool("wall");
 		if (this.controller.activeTool === "none") return;
+
+		if (this.controller.activeTool === "wall") {
+			const blockerSelect = toolGroup.createEl("select");
+			const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
+			opaqueOpt.value = "opaque";
+			const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
+			dimOpt.value = "dim";
+			blockerSelect.value = this.controller.wallDrawBlockerType;
+			blockerSelect.onchange = () => this.controller.setWallDrawBlockerType(blockerSelect.value as VisionBlockerType);
+			return;
+		}
 
 		if (this.controller.activeTool === "brush") {
 			const radiusField = toolGroup.createDiv({ cls: "map-manager-field-inline" });
@@ -395,18 +412,6 @@ export class Toolbar {
 			zoneSelect.value = this.controller.brushZoneMode;
 			zoneSelect.onchange = () => this.controller.setBrushZoneMode(zoneSelect.value);
 		}
-
-		const blockerSelect = toolGroup.createEl("select");
-		const keepBlockerOpt = blockerSelect.createEl("option", { text: "Bloc visuel : ne pas changer" });
-		keepBlockerOpt.value = "keep";
-		const opaqueBlockerOpt = blockerSelect.createEl("option", { text: "Bloc visuel : opaque" });
-		opaqueBlockerOpt.value = "opaque";
-		const dimBlockerOpt = blockerSelect.createEl("option", { text: "Bloc visuel : partiel" });
-		dimBlockerOpt.value = "dim";
-		const offBlockerOpt = blockerSelect.createEl("option", { text: "Bloc visuel : aucun" });
-		offBlockerOpt.value = "off";
-		blockerSelect.value = this.controller.brushBlockerMode;
-		blockerSelect.onchange = () => this.controller.setBrushBlockerMode(blockerSelect.value as "keep" | "opaque" | "dim" | "off");
 	}
 
 	private renderBackgroundControls(container: HTMLElement): void {

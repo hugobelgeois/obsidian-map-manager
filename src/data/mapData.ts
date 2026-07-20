@@ -15,6 +15,11 @@ export interface ZoneType {
 	color: string;
 }
 
+/**
+ * Blocks line of sight for fog-of-war vision cones/radii (a wall, a door, ...), on a `WallSegment`.
+ * "opaque" hides everything beyond it entirely; "dim" still stops direct/clear vision but lets
+ * cells beyond be marked "explored" (dimly visible), like a window or a searched-but-unlit room.
+ */
 export type VisionBlockerType = "opaque" | "dim";
 
 export interface CellData {
@@ -22,12 +27,6 @@ export interface CellData {
 	stamp?: string;
 	label?: string;
 	links?: string[];
-	/**
-	 * Blocks line of sight for fog-of-war vision cones/radii (a wall, a door, ...).
-	 * "opaque" hides everything beyond it entirely; "dim" still stops direct/clear vision but lets
-	 * cells beyond be marked "explored" (dimly visible), like a window or a searched-but-unlit room.
-	 */
-	visionBlocker?: VisionBlockerType;
 }
 
 /**
@@ -119,6 +118,21 @@ export interface Marker {
 	links?: string[];
 }
 
+/** A freeform vision-blocking wall vertex, in world coordinates — independent of grid type/cells. */
+export interface WallPoint {
+	id: string;
+	x: number;
+	y: number;
+}
+
+/** A vision-blocking line between two `WallPoint`s (by id, both on the same layer). */
+export interface WallSegment {
+	id: string;
+	aId: string;
+	bId: string;
+	blockerType: VisionBlockerType;
+}
+
 export interface Layer {
 	id: string;
 	name: string;
@@ -127,10 +141,13 @@ export interface Layer {
 	cellsByGridType: CellsByGridType;
 	/** Free-floating stamps for the "no grid" mode; unused for celled grid types. */
 	markers: Marker[];
+	/** Freeform vision-blocking wall vertices/segments, independent of grid type. */
+	wallPoints: WallPoint[];
+	wallSegments: WallSegment[];
 }
 
 export interface MapFileData {
-	version: 11;
+	version: 12;
 	gridType: GridType;
 	cellSize: number;
 	zoneTypes: ZoneType[];
@@ -167,7 +184,7 @@ export interface MapDefaults {
 
 export function isCellEmpty(cell: CellData | undefined): boolean {
 	if (!cell) return true;
-	return !cell.zoneTypeId && !cell.stamp && !cell.label && !cell.visionBlocker && (!cell.links || cell.links.length === 0);
+	return !cell.zoneTypeId && !cell.stamp && !cell.label && (!cell.links || cell.links.length === 0);
 }
 
 function emptyCellsByGridType(): CellsByGridType {
@@ -187,6 +204,8 @@ export function createLayer(name: string): Layer {
 		visible: true,
 		cellsByGridType: emptyCellsByGridType(),
 		markers: [],
+		wallPoints: [],
+		wallSegments: [],
 	};
 }
 
@@ -197,7 +216,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 11,
+		version: 12,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		zoneTypes: defaults.zoneTypes.map((z) => ({ ...z })),
@@ -232,13 +251,6 @@ function isString(value: unknown): value is string {
 	return typeof value === "string";
 }
 
-/** `true` is the pre-v10 shape (a plain on/off blocker), migrated to "opaque" to preserve its old behavior. */
-function parseVisionBlocker(value: unknown): VisionBlockerType | undefined {
-	if (value === true) return "opaque";
-	if (value === "opaque" || value === "dim") return value;
-	return undefined;
-}
-
 function parseCellsByGridType(raw: unknown): CellsByGridType {
 	const cellsByGridType = emptyCellsByGridType();
 	const rawCellsByGridType = isRecord(raw) ? raw : {};
@@ -253,7 +265,6 @@ function parseCellsByGridType(raw: unknown): CellsByGridType {
 						stamp: isString(c.stamp) ? c.stamp : undefined,
 						label: isString(c.label) ? c.label : undefined,
 						links: Array.isArray(c.links) ? c.links.filter(isString) : undefined,
-						visionBlocker: parseVisionBlocker(c.visionBlocker),
 					};
 					if (!isCellEmpty(cell)) cellsByGridType[gt][key] = cell;
 				}
@@ -261,6 +272,35 @@ function parseCellsByGridType(raw: unknown): CellsByGridType {
 		}
 	}
 	return cellsByGridType;
+}
+
+function isVisionBlockerType(value: unknown): value is VisionBlockerType {
+	return value === "opaque" || value === "dim";
+}
+
+function parseWallPoint(value: unknown): WallPoint | null {
+	if (!isRecord(value) || !isString(value.id) || typeof value.x !== "number" || typeof value.y !== "number") return null;
+	return { id: value.id, x: value.x, y: value.y };
+}
+
+function parseWallPointArray(raw: unknown): WallPoint[] {
+	if (!Array.isArray(raw)) return [];
+	return raw.map(parseWallPoint).filter((p): p is WallPoint => p !== null);
+}
+
+function parseWallSegment(value: unknown): WallSegment | null {
+	if (!isRecord(value) || !isString(value.id) || !isString(value.aId) || !isString(value.bId) || !isVisionBlockerType(value.blockerType)) return null;
+	return { id: value.id, aId: value.aId, bId: value.bId, blockerType: value.blockerType };
+}
+
+/** Drops segments referencing a point that doesn't exist among `points` (e.g. hand-edited/corrupted files). */
+function parseWallSegmentArray(raw: unknown, points: WallPoint[]): WallSegment[] {
+	if (!Array.isArray(raw)) return [];
+	const pointIds = new Set(points.map((p) => p.id));
+	return raw
+		.map(parseWallSegment)
+		.filter((s): s is WallSegment => s !== null)
+		.filter((s) => pointIds.has(s.aId) && pointIds.has(s.bId));
 }
 
 function isTokenCategory(value: unknown): value is TokenCategory {
@@ -345,6 +385,7 @@ function parseBackground(raw: unknown, cellSize: number, convertFromPixels: bool
 
 function parseLayer(value: unknown, fallbackName: string, cellSize: number, convertFromPixels: boolean): Layer | null {
 	if (!isRecord(value)) return null;
+	const wallPoints = parseWallPointArray(value.wallPoints);
 	return {
 		id: isString(value.id) ? value.id : generateLocalId("layer"),
 		name: isString(value.name) ? value.name : fallbackName,
@@ -352,6 +393,8 @@ function parseLayer(value: unknown, fallbackName: string, cellSize: number, conv
 		background: parseBackground(value.background, cellSize, convertFromPixels),
 		cellsByGridType: parseCellsByGridType(value.cellsByGridType),
 		markers: parseMarkerArray(value.markers),
+		wallPoints,
+		wallSegments: parseWallSegmentArray(value.wallSegments, wallPoints),
 	};
 }
 
@@ -400,6 +443,8 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 			background: parseBackground(p.background, cellSize, true),
 			cellsByGridType: parseCellsByGridType(p.cellsByGridType),
 			markers: [],
+			wallPoints: [],
+			wallSegments: [],
 		};
 		layers = [legacyLayer];
 	} else {
@@ -425,7 +470,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 11, gridType, cellSize, zoneTypes, tokenTemplates, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
+	return { version: 12, gridType, cellSize, zoneTypes, tokenTemplates, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {
@@ -435,6 +480,12 @@ function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellDa
 		if (cell && !isCellEmpty(cell)) out[key] = cell;
 	}
 	return out;
+}
+
+/** Defense in depth: the controller should never produce a segment referencing a missing point. */
+function purgeOrphanWallSegments(points: WallPoint[], segments: WallSegment[]): WallSegment[] {
+	const pointIds = new Set(points.map((p) => p.id));
+	return segments.filter((s) => pointIds.has(s.aId) && pointIds.has(s.bId));
 }
 
 export function serializeMapData(data: MapFileData): string {
@@ -448,6 +499,7 @@ export function serializeMapData(data: MapFileData): string {
 				"hex-flat": purgeEmptyCells(layer.cellsByGridType["hex-flat"]),
 			},
 			markers: purgeEmptyMarkers(layer.markers),
+			wallSegments: purgeOrphanWallSegments(layer.wallPoints, layer.wallSegments),
 		})),
 	};
 	return JSON.stringify(cleaned, null, "\t");
