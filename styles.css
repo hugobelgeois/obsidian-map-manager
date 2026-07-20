@@ -175,6 +175,23 @@
 	overflow-y: auto;
 }
 
+.map-manager-wall-shape-dropdown-panel {
+	width: max-content;
+	min-width: 0;
+}
+
+.map-manager-wall-shape-row {
+	display: flex;
+	flex-direction: row;
+	gap: 0.35em;
+}
+
+.map-manager-wall-shape-hint {
+	font-size: 0.8em;
+	color: var(--text-muted);
+	max-width: 200px;
+}
+
 .map-manager-btn-danger {
 	color: var(--text-error);
 }

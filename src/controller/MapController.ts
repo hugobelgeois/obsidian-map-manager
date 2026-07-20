@@ -1,4 +1,5 @@
 import { CellData, Marker, VisionBlockerType, WallPoint, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
+import { WallShapeKind, wallShapeCorners } from "../grid/gridMath";
 
 export type MapControllerListener = () => void;
 
@@ -43,6 +44,15 @@ export class MapController {
 	wallDrawBlockerType: VisionBlockerType = "opaque";
 	/** The in-progress wall chain — each left-click while the "wall" tool is active pushes one step (see `commitWallPoint`). Session-only. */
 	private wallChain: WallChainStep[] = [];
+
+	/**
+	 * Which shape preset (if any) is being interactively placed: the first click records a corner
+	 * (`wallShapeFirstCorner`), the second commits a shape spanning both corners (see
+	 * `placeWallShapeCorner`). Both session-only, mutually exclusive with `wallChain` (starting a
+	 * shape placement resets the chain, and vice versa via `setActiveTool`).
+	 */
+	pendingWallShape: WallShapeKind | null = null;
+	private wallShapeFirstCorner: { x: number; y: number } | null = null;
 
 	private data: MapFileData;
 	private listeners: Set<MapControllerListener> = new Set();
@@ -229,9 +239,13 @@ export class MapController {
 
 	setActiveTool(tool: EditTool): void {
 		this.activeTool = this.activeTool === tool ? "none" : tool;
-		// A fresh activation of the wall tool always starts an unconnected chain, whether it's being
-		// turned on for the first time or re-toggled after being switched off mid-chain.
-		if (tool === "wall") this.resetWallChain();
+		// A fresh activation of the wall tool always starts an unconnected chain and cancels any
+		// pending shape placement, whether it's being turned on for the first time or re-toggled
+		// after being switched off mid-chain/mid-placement.
+		if (tool === "wall") {
+			this.resetWallChain();
+			this.cancelWallShapePlacement();
+		}
 		this.notify();
 	}
 
@@ -270,6 +284,74 @@ export class MapController {
 	/** The chain's current tail point (where the next click continues from), or `null` if no chain is in progress — used to draw the live preview line. */
 	getWallChainTailId(): string | null {
 		return this.wallChain[this.wallChain.length - 1]?.pointId ?? null;
+	}
+
+	/** The shape picker's first-clicked corner, or `null` if none has been placed yet — used to draw the live preview outline. */
+	getWallShapeFirstCorner(): { x: number; y: number } | null {
+		return this.wallShapeFirstCorner;
+	}
+
+	/**
+	 * Arms the interactive shape picker: the next click records a corner, the one after commits a
+	 * whole closed wall shape spanning both corners (see `placeWallShapeCorner`). Clicking the same
+	 * shape again cancels it, matching the toggle behavior of `setActiveTool`.
+	 */
+	startWallShapePlacement(shape: WallShapeKind): void {
+		if (this.pendingWallShape === shape) {
+			this.cancelWallShapePlacement();
+			return;
+		}
+		this.pendingWallShape = shape;
+		this.wallShapeFirstCorner = null;
+		this.resetWallChain();
+		this.notify();
+	}
+
+	/** Fully cancels the shape picker (toolbar toggle-off / re-arming a different shape). */
+	cancelWallShapePlacement(): void {
+		if (!this.pendingWallShape) return;
+		this.pendingWallShape = null;
+		this.wallShapeFirstCorner = null;
+		this.notify();
+	}
+
+	/** Right-click handler during shape placement: un-places the first corner if one was set, else cancels the picker entirely — mirrors `undoLastWallPoint`'s one-step-back undo. */
+	cancelWallShapeStep(): void {
+		if (!this.pendingWallShape) return;
+		if (this.wallShapeFirstCorner) this.wallShapeFirstCorner = null;
+		else this.pendingWallShape = null;
+		this.notify();
+	}
+
+	/**
+	 * The single entry point for every left-click while a shape is armed (`pendingWallShape` set):
+	 * the first call records `(x, y)` as the first corner; the second commits a whole closed wall
+	 * shape spanning both corners (see `wallShapeCorners`) using the current draw blocker type for
+	 * every edge, then disarms the picker.
+	 */
+	placeWallShapeCorner(x: number, y: number): void {
+		const shape = this.pendingWallShape;
+		if (!shape) return;
+		if (!this.wallShapeFirstCorner) {
+			this.wallShapeFirstCorner = { x, y };
+			this.notify();
+			return;
+		}
+		const blockerType = this.wallDrawBlockerType;
+		const corners = wallShapeCorners(shape, this.wallShapeFirstCorner, { x, y });
+		this.pendingWallShape = null;
+		this.wallShapeFirstCorner = null;
+		this.update((data) => {
+			const layer = getActiveLayer(data);
+			const points: WallPoint[] = corners.map((c) => ({ id: generateLocalId("wallpoint"), x: c.x, y: c.y }));
+			layer.wallPoints.push(...points);
+			for (let i = 0; i < points.length; i++) {
+				const a = points[i];
+				const b = points[(i + 1) % points.length];
+				if (!a || !b) continue;
+				layer.wallSegments.push({ id: generateLocalId("wallsegment"), aId: a.id, bId: b.id, blockerType });
+			}
+		});
 	}
 
 	/**
@@ -340,6 +422,20 @@ export class MapController {
 			}
 		}
 		return { layer, pointIds, segmentIds };
+	}
+
+	/** Moves a wall point to a new position (drag), searching across all layers by id like `updateMarker`. */
+	moveWallPoint(pointId: string, x: number, y: number): void {
+		this.update((data) => {
+			for (const layer of data.layers) {
+				const point = layer.wallPoints.find((p) => p.id === pointId);
+				if (point) {
+					point.x = x;
+					point.y = y;
+					return;
+				}
+			}
+		});
 	}
 
 	/** Deletes a wall point's entire connected shape — every point and segment reachable from it (info-panel delete button). */

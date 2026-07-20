@@ -56,8 +56,6 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 
 	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder }, controller, {
 		recenter: () => canvasRef?.recenter(),
-		getCenterCellKey: () => canvasRef?.getCenterCellKey() ?? "0,0",
-		getCenterWorld: () => canvasRef?.getCenterWorld() ?? { x: 0, y: 0 },
 	});
 	const body = host.createDiv({ cls: "map-manager-body" });
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });

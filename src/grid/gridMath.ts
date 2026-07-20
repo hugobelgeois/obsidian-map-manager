@@ -274,3 +274,48 @@ export function raySegmentDistance(origin: Point, dx: number, dy: number, maxDis
 	if (t < 0 || t > maxDist || u < 0 || u > 1) return null;
 	return t;
 }
+
+// ---------------- Wall shape presets (two-corner interactive placement) ----------------
+
+export type WallShapeKind = "square" | "triangle" | "losange";
+
+/**
+ * Closed-polygon corners for a wall shape preset spanning the bounding box between two opposite
+ * corners (the "click one corner, click the opposite corner" gesture):
+ * - "square": the bounding box itself — a rectangle in general, a square only if the two clicked
+ *   corners happen to be equally spaced on both axes.
+ * - "triangle": sits on its base (the box's bottom edge), apex centered on the top edge — fills the
+ *   box as much as a triangle can while standing flat.
+ * - "losange": a diamond touching the midpoint of each of the box's four edges — the same bounding
+ *   box as "square", just standing on a vertex (top-center) instead of a flat side.
+ */
+export function wallShapeCorners(shape: WallShapeKind, corner1: Point, corner2: Point): Point[] {
+	const minX = Math.min(corner1.x, corner2.x);
+	const maxX = Math.max(corner1.x, corner2.x);
+	const minY = Math.min(corner1.y, corner2.y);
+	const maxY = Math.max(corner1.y, corner2.y);
+	const midX = (minX + maxX) / 2;
+	const midY = (minY + maxY) / 2;
+
+	if (shape === "triangle") {
+		return [
+			{ x: midX, y: minY },
+			{ x: maxX, y: maxY },
+			{ x: minX, y: maxY },
+		];
+	}
+	if (shape === "losange") {
+		return [
+			{ x: midX, y: minY },
+			{ x: maxX, y: midY },
+			{ x: midX, y: maxY },
+			{ x: minX, y: midY },
+		];
+	}
+	return [
+		{ x: minX, y: minY },
+		{ x: maxX, y: minY },
+		{ x: maxX, y: maxY },
+		{ x: minX, y: maxY },
+	];
+}

@@ -1,4 +1,4 @@
-import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
+import { App, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
@@ -7,8 +7,6 @@ import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 
 export interface ToolbarActions {
 	recenter: () => void;
-	getCenterCellKey: () => string;
-	getCenterWorld: () => { x: number; y: number };
 }
 
 export interface ToolbarDeps {
@@ -31,23 +29,6 @@ function buildGridIcon(svg: SVGSVGElement, gridType: GridType): void {
 		.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
 		.join(" ");
 	svg.createSvg("polygon", { attr: { points } });
-}
-
-/** No chess-pawn glyph ships with Lucide, so it's hand-drawn here in the same stroke style as Obsidian's bundled icons. */
-function buildPawnIcon(svg: SVGSVGElement): void {
-	svg.setAttribute("viewBox", "0 0 24 24");
-	svg.setAttribute("stroke", "currentColor");
-	svg.setAttribute("fill", "none");
-	svg.setAttribute("stroke-width", "2");
-	svg.setAttribute("stroke-linecap", "round");
-	svg.setAttribute("stroke-linejoin", "round");
-	svg.addClass("svg-icon");
-	svg.createSvg("circle", { attr: { cx: "12", cy: "6", r: "3" } });
-	svg.createSvg("path", { attr: { d: "M9 9.5c-1.1 1.8-1.4 3.6-0.7 5.5h7.4c0.7-1.9 0.4-3.7-0.7-5.5" } });
-	svg.createSvg("path", { attr: { d: "M8.5 15h7" } });
-	svg.createSvg("path", { attr: { d: "M6 19h12" } });
-	svg.createSvg("path", { attr: { d: "M7.5 15 6 19" } });
-	svg.createSvg("path", { attr: { d: "M16.5 15 18 19" } });
 }
 
 /** Dropdowns (grid type / layers / image / fog / zoom range) are mutually exclusive and share one outside-click-to-close handler. */
@@ -118,11 +99,6 @@ export class Toolbar {
 			this.renderLayersDropdown(this.el, data);
 			this.renderGridDropdown(this.el, data);
 			this.renderToolControls(this.el, data);
-			if (data.gridType === "none") {
-				const markerGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
-				const newMarkerBtn = markerGroup.createEl("button", { text: "Nouveau tampon", cls: "map-manager-btn" });
-				newMarkerBtn.onclick = () => this.addMarkerAtCenter();
-			}
 			this.renderImageDropdown(this.el, activeLayer);
 			this.renderZoomDropdown(this.el, data);
 		}
@@ -135,12 +111,6 @@ export class Toolbar {
 				const cellsBtn = viewGroup.createEl("button", { text: this.controller.showCells ? "Masquer les cases" : "Afficher les cases", cls: "map-manager-btn" });
 				cellsBtn.onclick = () => this.controller.toggleShowCells();
 			}
-
-			const tokenGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
-			const newTokenBtn = tokenGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-			buildPawnIcon(newTokenBtn.createSvg("svg"));
-			setTooltip(newTokenBtn, "Nouveau pion");
-			newTokenBtn.onclick = () => this.addTokenAtCenter();
 
 			// Fog runs even in grid type "none" (on its hidden square substrate — see MapCanvas),
 			// so the toggle/reset controls aren't restricted to celled grid types.
@@ -369,11 +339,40 @@ export class Toolbar {
 		setTooltip(fillBtn, "Remplissage");
 		fillBtn.toggleClass("is-active", this.controller.activeTool === "fill");
 		fillBtn.onclick = () => this.controller.setActiveTool("fill");
-		const wallBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		// Wrapped in its own dropdown so the shape-insert panel (below) opens directly under this
+		// button specifically, not just somewhere in the toolbar row — the button itself keeps its
+		// original meaning (activates manual, point-by-point wall placement); shapes are a separate,
+		// additional way to get a wall, not something this icon represents.
+		const wallWrapper = toolGroup.createDiv({ cls: "map-manager-dropdown map-manager-wall-shape-dropdown" });
+		const wallBtn = wallWrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
 		setIcon(wallBtn, "spline");
-		setTooltip(wallBtn, "Murs (blocage de vue)");
+		setTooltip(wallBtn, "Murs : placer les points manuellement");
 		wallBtn.toggleClass("is-active", this.controller.activeTool === "wall");
 		wallBtn.onclick = () => this.controller.setActiveTool("wall");
+
+		if (this.controller.activeTool === "wall") {
+			wallWrapper.addClass("is-open");
+			const panel = wallWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-wall-shape-dropdown-panel" });
+			panel.createDiv({ cls: "map-manager-dropdown-title", text: "Insérer une forme" });
+			const shapeRow = panel.createDiv({ cls: "map-manager-wall-shape-row" });
+			const shapeBtn = (shape: "square" | "triangle" | "losange", icon: string, tooltip: string) => {
+				const btn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+				setIcon(btn, icon);
+				setTooltip(btn, tooltip);
+				btn.toggleClass("is-active", this.controller.pendingWallShape === shape);
+				btn.onclick = () => this.controller.startWallShapePlacement(shape);
+			};
+			shapeBtn("square", "square", "Carré / rectangle : cliquez un coin, puis le coin opposé");
+			shapeBtn("triangle", "triangle", "Triangle : cliquez un coin, puis le coin opposé de sa zone");
+			shapeBtn("losange", "diamond", "Losange : cliquez un coin, puis le coin opposé de sa zone");
+			if (this.controller.pendingWallShape) {
+				const hintText = this.controller.getWallShapeFirstCorner()
+					? "Cliquez pour poser le coin opposé (clic droit pour annuler)"
+					: "Cliquez pour poser le premier coin (clic droit pour annuler)";
+				panel.createDiv({ cls: "map-manager-wall-shape-hint", text: hintText });
+			}
+		}
+
 		if (this.controller.activeTool === "none") return;
 
 		if (this.controller.activeTool === "wall") {
@@ -442,28 +441,6 @@ export class Toolbar {
 		makeNumberInput("Échelle", bg.scale, (v) => {
 			if (v > 0) updateBackground((b) => (b.scale = v));
 		});
-	}
-
-	private addTokenAtCenter(): void {
-		if (this.controller.getData().gridType === "none") {
-			const center = this.actions.getCenterWorld();
-			const token = this.controller.addFreeToken(center.x, center.y);
-			this.controller.selectToken(token.id);
-			return;
-		}
-		const key = this.actions.getCenterCellKey();
-		const token = this.controller.addToken(key);
-		if (!token) {
-			new Notice("Impossible de placer un pion ici : la case est déjà occupée sur ce calque. Déplacez la vue et réessayez.");
-			return;
-		}
-		this.controller.selectToken(token.id);
-	}
-
-	private addMarkerAtCenter(): void {
-		const center = this.actions.getCenterWorld();
-		const marker = this.controller.addMarker(center.x, center.y);
-		this.controller.selectMarker(marker.id);
 	}
 
 	/** Background offsets are anchored on the image's center, so (0,0) always means "centered on the grid origin". */

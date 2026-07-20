@@ -1,4 +1,4 @@
-import { App, Notice } from "obsidian";
+import { App, Menu, Notice } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { MapManagerSettings } from "../settings/types";
 import {
@@ -34,6 +34,7 @@ import {
 	squareFootprintAnchor,
 	squareGridSnapCandidates,
 	squareWorldToCell,
+	wallShapeCorners,
 	worldToScreen,
 } from "../grid/gridMath";
 
@@ -81,7 +82,7 @@ const FOG_MEMORY_TREMBLE_SCREEN_PX = 10;
 /** Angular speed (rad/s) of the tremble's sine wave. */
 const FOG_TREMBLE_SPEED = 1.6;
 /** Fixed screen-pixel blur radius for the fog buffer (see `drawFog`) — independent of zoom or the LOD tile size. */
-const FOG_BLUR_SCREEN_PX = 8;
+const FOG_BLUR_SCREEN_PX = 22;
 /** Fixed screen-pixel overdraw margin on the offscreen fog buffer — see `renderFogLayer`. Comfortably larger than `FOG_BLUR_SCREEN_PX`. */
 const FOG_OVERDRAW_PX = FOG_BLUR_SCREEN_PX * 3;
 /** Fog animations (the tremble, and the render loop driving it) are force-disabled at or past this zoom — see `fogAnimationsActive`. */
@@ -134,6 +135,11 @@ interface DraggingToken {
 
 interface DraggingMarker {
 	marker: Marker;
+	currentWorld: { x: number; y: number };
+}
+
+interface DraggingWallPoint {
+	point: WallPoint;
 	currentWorld: { x: number; y: number };
 }
 
@@ -195,6 +201,7 @@ export class MapCanvas {
 	private dragMoved = false;
 	private draggingToken: DraggingToken | null = null;
 	private draggingMarker: DraggingMarker | null = null;
+	private draggingWallPoint: DraggingWallPoint | null = null;
 	/** True while the brush tool is actively painting cells under a held-down drag. */
 	private painting = false;
 	private lastPaintedKey: string | null = null;
@@ -211,9 +218,35 @@ export class MapCanvas {
 	private unsubscribe: () => void;
 
 	private onContextMenu = (e: MouseEvent) => {
-		if (this.controller.activeTool !== "wall") return;
+		if (this.controller.activeTool === "wall") {
+			e.preventDefault();
+			if (this.controller.pendingWallShape) {
+				this.controller.cancelWallShapeStep();
+			} else {
+				this.controller.undoLastWallPoint();
+			}
+			return;
+		}
+
+		const rect = this.canvas.getBoundingClientRect();
+		const px = e.clientX - rect.left;
+		const py = e.clientY - rect.top;
+
+		const menu = new Menu();
+		let hasItem = false;
+		// Markers are freeform (grid type "none" only, see `Marker`), so only offer to place one there.
+		if (this.controller.mode === "edit" && this.controller.getData().gridType === "none") {
+			menu.addItem((item) => item.setTitle("Placer un tampon ici").setIcon("map-pin").onClick(() => this.addMarkerAt(px, py)));
+			hasItem = true;
+		}
+		if (this.controller.mode === "view") {
+			menu.addItem((item) => item.setTitle("Placer un pion ici").setIcon("user").onClick(() => this.addTokenAt(px, py)));
+			hasItem = true;
+		}
+		// Nothing to offer (e.g. edit mode on a celled grid) — let the browser's own context menu show.
+		if (!hasItem) return;
 		e.preventDefault();
-		this.controller.undoLastWallPoint();
+		menu.showAtMouseEvent(e);
 	};
 
 	private onPointerDown = (e: PointerEvent) => {
@@ -249,15 +282,14 @@ export class MapCanvas {
 			}
 		}
 
-		// Wall points are clickable/selectable regardless of the active tool (like tokens/markers
+		// Wall points are draggable/selectable regardless of the active tool (like tokens/markers
 		// above), unless the wall tool itself is active — in that case the click instead goes through
 		// `resolveWallPlacement`/`commitWallPoint` below, which does its own hit-test as part of
 		// closing a shape onto an existing point.
 		if (this.controller.activeTool !== "wall") {
 			const hitPoint = this.findWallPointAtScreenPoint(px, py);
 			if (hitPoint) {
-				this.controller.selectWallPoint(hitPoint.id);
-				this.toolConsumedClick = true;
+				this.draggingWallPoint = { point: hitPoint, currentWorld: screenToWorld(px, py, this.transform) };
 				return;
 			}
 		}
@@ -277,15 +309,20 @@ export class MapCanvas {
 			this.toolConsumedClick = true;
 		} else if (this.controller.activeTool === "wall") {
 			const placement = this.resolveWallPlacement(px, py);
-			this.controller.commitWallPoint(placement.x, placement.y, placement.existingPointId);
+			if (this.controller.pendingWallShape) {
+				this.controller.placeWallShapeCorner(placement.x, placement.y);
+			} else {
+				this.controller.commitWallPoint(placement.x, placement.y, placement.existingPointId);
+			}
 			this.toolConsumedClick = true;
 		}
 	};
 
 	private onPointerMove = (e: PointerEvent) => {
-		// Unlike brush/drag gestures, wall points are placed one click at a time — the live preview
-		// of the next point must track the pointer even while no button is held (`!this.dragging`).
-		if (this.controller.activeTool === "wall" && this.controller.getWallChainTailId()) {
+		// Unlike brush/drag gestures, wall points/shape corners are placed one click at a time — the
+		// live preview of the next one must track the pointer even while no button is held
+		// (`!this.dragging`).
+		if (this.controller.activeTool === "wall" && (this.controller.getWallChainTailId() || this.controller.getWallShapeFirstCorner())) {
 			const rect = this.canvas.getBoundingClientRect();
 			this.wallPreview = this.resolveWallPlacement(e.clientX - rect.left, e.clientY - rect.top);
 			this.render();
@@ -324,6 +361,9 @@ export class MapCanvas {
 			this.render();
 		} else if (this.draggingMarker) {
 			this.draggingMarker.currentWorld = screenToWorld(px, py, this.transform);
+			this.render();
+		} else if (this.draggingWallPoint) {
+			this.draggingWallPoint.currentWorld = this.snapWorldToGrid(screenToWorld(px, py, this.transform));
 			this.render();
 		} else {
 			this.transform.panX += dx;
@@ -380,6 +420,18 @@ export class MapCanvas {
 			return;
 		}
 
+		if (this.draggingWallPoint) {
+			const drag = this.draggingWallPoint;
+			this.draggingWallPoint = null;
+			if (this.dragMoved) {
+				this.controller.moveWallPoint(drag.point.id, drag.currentWorld.x, drag.currentWorld.y);
+				this.render();
+			} else {
+				this.controller.selectWallPoint(drag.point.id);
+			}
+			return;
+		}
+
 		if (!this.dragMoved) this.handleClick(e);
 	};
 
@@ -387,6 +439,7 @@ export class MapCanvas {
 		this.dragging = false;
 		this.draggingToken = null;
 		this.draggingMarker = null;
+		this.draggingWallPoint = null;
 		if (this.painting) this.controller.endHistoryGroup();
 		this.painting = false;
 		this.lastPaintedKey = null;
@@ -529,17 +582,6 @@ export class MapCanvas {
 			const panMax = -bounds.y * zoom;
 			this.transform.panY = clamp(this.transform.panY, panMin, panMax);
 		}
-	}
-
-	/** World cell under the current viewport center, used to place newly created tokens. */
-	getCenterCellKey(): string {
-		const world = screenToWorld(this.viewportW / 2, this.viewportH / 2, this.transform);
-		return this.cellKeyAt(world.x, world.y);
-	}
-
-	/** World position under the current viewport center, used to place newly created free tokens/markers (grid type "none"). */
-	getCenterWorld(): { x: number; y: number } {
-		return screenToWorld(this.viewportW / 2, this.viewportH / 2, this.transform);
 	}
 
 	destroy(): void {
@@ -778,19 +820,10 @@ export class MapCanvas {
 		return null;
 	}
 
-	/**
-	 * Resolves where a wall-tool click at `(px, py)` should actually place its point: snapping onto
-	 * an existing point first (closes a shape / continues from a shared node), else onto a nearby
-	 * grid corner/edge-midpoint/edge (see `squareGridSnapCandidates`/`hexGridSnapCandidates`), else
-	 * the raw clicked position.
-	 */
-	private resolveWallPlacement(px: number, py: number): { x: number; y: number; existingPointId?: string } {
-		const hit = this.findWallPointAtScreenPoint(px, py);
-		if (hit) return { x: hit.x, y: hit.y, existingPointId: hit.id };
-
-		const world = screenToWorld(px, py, this.transform);
+	/** Snaps a world point onto a nearby grid corner/edge-midpoint/edge (see `squareGridSnapCandidates`/`hexGridSnapCandidates`), or returns it unchanged if none is close enough (or there's no grid). Used both when placing a new wall point and when dragging an existing one. */
+	private snapWorldToGrid(world: { x: number; y: number }): { x: number; y: number } {
 		const data = this.controller.getData();
-		if (data.gridType === "none") return { x: world.x, y: world.y };
+		if (data.gridType === "none") return world;
 
 		const cellSize = this.effectiveCellSize();
 		const candidates =
@@ -808,7 +841,18 @@ export class MapCanvas {
 				bestDist = dist;
 			}
 		}
-		return best ? { x: best.x, y: best.y } : { x: world.x, y: world.y };
+		return best ? { x: best.x, y: best.y } : world;
+	}
+
+	/**
+	 * Resolves where a wall-tool click at `(px, py)` should actually place its point: snapping onto
+	 * an existing point first (closes a shape / continues from a shared node), else onto the grid
+	 * via `snapWorldToGrid`, else the raw clicked position.
+	 */
+	private resolveWallPlacement(px: number, py: number): { x: number; y: number; existingPointId?: string } {
+		const hit = this.findWallPointAtScreenPoint(px, py);
+		if (hit) return { x: hit.x, y: hit.y, existingPointId: hit.id };
+		return this.snapWorldToGrid(screenToWorld(px, py, this.transform));
 	}
 
 	/** Every `WallSegment` (across visible layers) resolved to world-space endpoints, for ray casting and the fill tool's flood boundary. */
@@ -857,6 +901,30 @@ export class MapCanvas {
 		}
 
 		this.controller.selectCell(this.controller.selectedCellKey === key ? null : key);
+	}
+
+	/** Places a marker at a specific screen point (edit-mode right-click menu) rather than the viewport center. */
+	private addMarkerAt(px: number, py: number): void {
+		const world = screenToWorld(px, py, this.transform);
+		const marker = this.controller.addMarker(world.x, world.y);
+		this.controller.selectMarker(marker.id);
+	}
+
+	/** Places a token at a specific screen point (view-mode right-click menu) rather than the viewport center. */
+	private addTokenAt(px: number, py: number): void {
+		const world = screenToWorld(px, py, this.transform);
+		if (this.controller.getData().gridType === "none") {
+			const token = this.controller.addFreeToken(world.x, world.y);
+			this.controller.selectToken(token.id);
+			return;
+		}
+		const key = this.cellKeyAt(world.x, world.y);
+		const token = this.controller.addToken(key);
+		if (!token) {
+			new Notice("Impossible de placer un pion ici : la case est déjà occupée sur ce calque. Déplacez la vue et réessayez.");
+			return;
+		}
+		this.controller.selectToken(token.id);
 	}
 
 	// ---- Backgrounds (one image per layer) ----
@@ -1541,6 +1609,12 @@ export class MapCanvas {
 		}
 	}
 
+	/** A wall point's drawn position — the live drag target while it's being dragged, else its committed position. */
+	private wallPointPosition(point: WallPoint): { x: number; y: number } {
+		if (this.draggingWallPoint?.point.id === point.id) return this.draggingWallPoint.currentWorld;
+		return { x: point.x, y: point.y };
+	}
+
 	/**
 	 * Committed wall segments (solid red for "opaque", dashed amber for "dim" — same colors the old
 	 * per-cell blocker badges used) plus each point's handle, drawn whenever the grid/cell overlay
@@ -1559,20 +1633,23 @@ export class MapCanvas {
 				const a = pointsById.get(segment.aId);
 				const b = pointsById.get(segment.bId);
 				if (!a || !b) continue;
+				const aPos = this.wallPointPosition(a);
+				const bPos = this.wallPointPosition(b);
 				ctx.save();
 				ctx.strokeStyle = segment.blockerType === "opaque" ? "#c0392b" : "#d99a2b";
 				ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
 				if (segment.blockerType === "dim") ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
 				ctx.beginPath();
-				ctx.moveTo(a.x, a.y);
-				ctx.lineTo(b.x, b.y);
+				ctx.moveTo(aPos.x, aPos.y);
+				ctx.lineTo(bPos.x, bPos.y);
 				ctx.stroke();
 				ctx.restore();
 			}
 			if (showHandles) {
 				for (const point of layer.wallPoints) {
+					const pos = this.wallPointPosition(point);
 					ctx.beginPath();
-					ctx.arc(point.x, point.y, pointRadius, 0, Math.PI * 2);
+					ctx.arc(pos.x, pos.y, pointRadius, 0, Math.PI * 2);
 					ctx.fillStyle = point.id === this.controller.selectedWallPointId ? "#e0a020" : "#c0392b";
 					ctx.fill();
 				}
@@ -1580,11 +1657,32 @@ export class MapCanvas {
 		}
 	}
 
-	/** Dashed preview line from the wall chain's tail point to the live (possibly snapped) pointer position. */
+	/**
+	 * Dashed preview of whatever the next wall-tool click would commit: either the chain's tail point
+	 * connected to the live (possibly snapped) pointer position, or — while a shape is armed and its
+	 * first corner already placed — the whole shape's outline spanning that corner and the pointer.
+	 */
 	private drawWallPreview(ctx: CanvasRenderingContext2D): void {
-		if (this.controller.mode !== "edit" || this.controller.activeTool !== "wall") return;
-		const tailId = this.controller.getWallChainTailId();
-		if (!tailId || !this.wallPreview) return;
+		if (this.controller.mode !== "edit" || this.controller.activeTool !== "wall" || !this.wallPreview) return;
+
+		const pendingShape = this.controller.pendingWallShape;
+		const firstCorner = pendingShape ? this.controller.getWallShapeFirstCorner() : null;
+		if (pendingShape && firstCorner) {
+			const corners = wallShapeCorners(pendingShape, firstCorner, this.wallPreview);
+			ctx.save();
+			ctx.strokeStyle = "#e0a020";
+			ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
+			ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
+			ctx.beginPath();
+			corners.forEach((c, i) => (i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y)));
+			ctx.closePath();
+			ctx.stroke();
+			ctx.restore();
+			return;
+		}
+
+		const tailId = pendingShape ? null : this.controller.getWallChainTailId();
+		if (!tailId) return;
 		const tail = this.controller.findWallPoint(tailId);
 		if (!tail) return;
 		ctx.save();
@@ -1656,10 +1754,11 @@ export class MapCanvas {
 		const data = this.controller.getData();
 		const selectedWallPoint = this.controller.getSelectedWallPoint();
 		if (selectedWallPoint) {
+			const pos = this.wallPointPosition(selectedWallPoint);
 			ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
 			ctx.strokeStyle = "#e0a020";
 			ctx.beginPath();
-			ctx.arc(selectedWallPoint.x, selectedWallPoint.y, this.wallPointHitRadius(), 0, Math.PI * 2);
+			ctx.arc(pos.x, pos.y, this.wallPointHitRadius(), 0, Math.PI * 2);
 			ctx.stroke();
 			return;
 		}

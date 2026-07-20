@@ -54,8 +54,6 @@ export class MapView extends TextFileView {
 		this.rootEl.empty();
 		this.toolbarComp = new Toolbar(this.rootEl, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller, {
 			recenter: () => this.canvasComp?.recenter(),
-			getCenterCellKey: () => this.canvasComp?.getCenterCellKey() ?? "0,0",
-			getCenterWorld: () => this.canvasComp?.getCenterWorld() ?? { x: 0, y: 0 },
 		});
 		const body = this.rootEl.createDiv({ cls: "map-manager-body" });
 		const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
