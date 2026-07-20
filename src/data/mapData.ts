@@ -130,7 +130,7 @@ export interface Layer {
 }
 
 export interface MapFileData {
-	version: 10;
+	version: 11;
 	gridType: GridType;
 	cellSize: number;
 	zoneTypes: ZoneType[];
@@ -148,7 +148,11 @@ export interface MapFileData {
 	maxZoom: number;
 	/** Fog of war, active in view mode only. */
 	fogEnabled: boolean;
-	/** Cell keys ever lit by a player's vision cone (not grid-type scoped, like tokens). */
+	/**
+	 * "Ever explored" fog memory, as coarse world-space bucket keys ("bx,by") — not grid cells.
+	 * Fog is traced by ray/path tracing rather than tested per grid cell (see MapCanvas), and this
+	 * memory grid is deliberately coarser than the visible grid and independent of grid type/shape.
+	 */
 	exploredCells: string[];
 }
 
@@ -193,7 +197,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 10,
+		version: 11,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		zoneTypes: defaults.zoneTypes.map((z) => ({ ...z })),
@@ -416,9 +420,12 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	const maxZoom = clampZoomSetting(typeof p.maxZoom === "number" ? p.maxZoom : defaults.maxZoom);
 
 	const fogEnabled = typeof p.fogEnabled === "boolean" ? p.fogEnabled : false;
-	const exploredCells = Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
+	// Pre-v11 files stored `exploredCells` as grid-cell keys (grid tracing); v11 switched to coarse
+	// world-space bucket keys (ray tracing), a different coordinate system, so old memory is dropped
+	// rather than misinterpreted — it simply gets re-explored as players move around.
+	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 10, gridType, cellSize, zoneTypes, tokenTemplates, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
+	return { version: 11, gridType, cellSize, zoneTypes, tokenTemplates, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

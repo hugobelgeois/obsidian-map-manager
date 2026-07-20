@@ -10,6 +10,8 @@ export interface MapManagerSettings {
 	embedHeight: number;
 	defaultMinZoom: number;
 	defaultMaxZoom: number;
+	/** Subtle animated flicker on the fog of war's vision edge (off by default — a continuous redraw loop while active). */
+	fogAnimations: boolean;
 }
 
 export const DEFAULT_ZONE_TYPES: ZoneType[] = [
@@ -36,4 +38,5 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	embedHeight: 500,
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
+	fogAnimations: false,
 };

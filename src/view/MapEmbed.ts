@@ -4,7 +4,6 @@ import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
-import { LayersPanel } from "../ui/LayersPanel";
 import { Toolbar } from "../ui/Toolbar";
 
 class MapEmbedChild extends MarkdownRenderChild {
@@ -62,8 +61,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	});
 	const body = host.createDiv({ cls: "map-manager-body" });
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
-	const layersPanel = new LayersPanel(canvasHost, controller);
-	const canvas = new MapCanvas(canvasHost, controller, app);
+	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings);
 	canvasRef = canvas;
 	const infoPanel = new InfoPanel(body, app, { assetsFolder: plugin.settings.assetsFolder }, controller);
 
@@ -71,7 +69,6 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		new MapEmbedChild(host, () => {
 			canvas.destroy();
 			toolbar.destroy();
-			layersPanel.destroy();
 			infoPanel.destroy();
 		})
 	);

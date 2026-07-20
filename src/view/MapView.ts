@@ -4,7 +4,6 @@ import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
-import { LayersPanel } from "../ui/LayersPanel";
 import { Toolbar } from "../ui/Toolbar";
 
 export const VIEW_TYPE_MAP = "map-manager-map-view";
@@ -14,7 +13,6 @@ export class MapView extends TextFileView {
 	private canvasComp: MapCanvas | null = null;
 	private toolbarComp: Toolbar | null = null;
 	private infoPanelComp: InfoPanel | null = null;
-	private layersPanelComp: LayersPanel | null = null;
 	private rootEl: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
@@ -61,19 +59,16 @@ export class MapView extends TextFileView {
 		});
 		const body = this.rootEl.createDiv({ cls: "map-manager-body" });
 		const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
-		this.layersPanelComp = new LayersPanel(canvasHost, this.controller);
-		this.canvasComp = new MapCanvas(canvasHost, this.controller, this.app);
+		this.canvasComp = new MapCanvas(canvasHost, this.controller, this.app, this.plugin.settings);
 		this.infoPanelComp = new InfoPanel(body, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller);
 	}
 
 	private destroyComponents(): void {
 		this.canvasComp?.destroy();
 		this.toolbarComp?.destroy();
-		this.layersPanelComp?.destroy();
 		this.infoPanelComp?.destroy();
 		this.canvasComp = null;
 		this.toolbarComp = null;
-		this.layersPanelComp = null;
 		this.infoPanelComp = null;
 	}
 

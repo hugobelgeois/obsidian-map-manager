@@ -99,6 +99,17 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName("Activer les animations")
+			.setDesc("Fait légèrement trembler le bord du brouillard de guerre (lumière vacillante), au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte.")
+			.addToggle((toggle) => {
+				toggle.setValue(settings.fogAnimations);
+				toggle.onChange(async (value) => {
+					settings.fogAnimations = value;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
 			.setName("Palette de zones par défaut")
 			.setDesc("Utilisée pour toute nouvelle carte. Chaque carte garde ensuite sa propre copie, modifiable indépendamment.")
 			.setHeading();
