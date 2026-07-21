@@ -13,6 +13,10 @@ node_modules
 # They should be uploaded to GitHub releases instead.
 main.js
 
+# Compiled portable public viewer bundle (npm run build) — built locally. Distributing it to the
+# external site is the site-export plugin's concern, not this repo's.
+map-manager-viewer.js
+
 # Exclude sourcemaps
 *.map
 

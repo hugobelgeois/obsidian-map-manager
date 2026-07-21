@@ -12,9 +12,11 @@ import {
 	Token,
 	TokenTemplate,
 	VisionBlockerType,
+	linkTabLabel,
 	makeLink,
 	splitLink,
 } from "../data/mapData";
+import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 import { HeadingSuggestModal } from "./HeadingSuggestModal";
@@ -45,23 +47,6 @@ const QUICK_TOKEN_ICONS = [
 	"🐎",
 	"❤️",
 ];
-
-function stripFrontmatter(raw: string): string {
-	return raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
-}
-
-function linkTabLabel(link: string): string {
-	const { path, subpath } = splitLink(link);
-	const basename = path.split("/").pop()?.replace(/\.md$/, "") ?? path;
-	return subpath ? `${basename} › ${subpath}` : basename;
-}
-
-function formatFrontmatterValue(value: unknown): string {
-	if (value === undefined || value === null) return "—";
-	if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
-	if (Array.isArray(value)) return value.map(formatFrontmatterValue).join(", ");
-	return JSON.stringify(value);
-}
 
 export class InfoPanel {
 	el: HTMLElement;

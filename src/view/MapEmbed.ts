@@ -1,7 +1,8 @@
-import { MarkdownPostProcessorContext, MarkdownRenderChild, TFile, debounce } from "obsidian";
+import { MarkdownPostProcessorContext, MarkdownRenderChild, Notice, TFile, debounce } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
-import { parseMapData, serializeMapData } from "../data/mapData";
+import { parseMapBlockSource, parseMapData, serializeMapData } from "../data/mapData";
+import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
@@ -14,12 +15,6 @@ class MapEmbedChild extends MarkdownRenderChild {
 	onunload(): void {
 		this.cleanup();
 	}
-}
-
-export function parseMapBlockSource(source: string): string {
-	const trimmed = source.trim();
-	const linkMatch = trimmed.match(/^!?\[\[([^\]|]+)(?:\|[^\]]*)?\]\]$/);
-	return linkMatch ? (linkMatch[1] ?? "").trim() : trimmed;
 }
 
 export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext): Promise<void> {
@@ -54,8 +49,19 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const controller = new MapController(data, save, "view");
 	let canvasRef: MapCanvas | null = null;
 
+	const publishView = async () => {
+		try {
+			const target = await publishPublicSnapshot(app, file, controller.getData());
+			new Notice(`Vue publique mise à jour : ${target.path}`);
+		} catch (e) {
+			console.error("Map Manager: échec de la publication de la vue publique", e);
+			new Notice("Échec de la publication de la vue publique.");
+		}
+	};
+
 	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder }, controller, {
 		recenter: () => canvasRef?.recenter(),
+		publish: () => void publishView(),
 	});
 	const body = host.createDiv({ cls: "map-manager-body" });
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });

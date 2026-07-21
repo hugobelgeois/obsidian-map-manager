@@ -7,6 +7,8 @@ import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 
 export interface ToolbarActions {
 	recenter: () => void;
+	/** Writes/updates the redacted `<basename>.json` next to the map file — see `publishPublicSnapshot`. */
+	publish: () => void;
 }
 
 export interface ToolbarDeps {
@@ -115,6 +117,12 @@ export class Toolbar {
 			// Fog runs even in grid type "none" (on its hidden square substrate — see MapCanvas),
 			// so the toggle/reset controls aren't restricted to celled grid types.
 			this.renderFogDropdown(this.el, data);
+
+			const publishGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
+			const publishBtn = publishGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(publishBtn, "upload");
+			setTooltip(publishBtn, "Publier la vue (met à jour le .json pour le site externe)");
+			publishBtn.onclick = () => this.actions.publish();
 		}
 
 		const recenterGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });

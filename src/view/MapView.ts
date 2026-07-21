@@ -1,7 +1,8 @@
-import { TextFileView, WorkspaceLeaf } from "obsidian";
+import { Notice, TextFileView, WorkspaceLeaf } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
+import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
@@ -54,11 +55,23 @@ export class MapView extends TextFileView {
 		this.rootEl.empty();
 		this.toolbarComp = new Toolbar(this.rootEl, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller, {
 			recenter: () => this.canvasComp?.recenter(),
+			publish: () => void this.publishView(),
 		});
 		const body = this.rootEl.createDiv({ cls: "map-manager-body" });
 		const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
 		this.canvasComp = new MapCanvas(canvasHost, this.controller, this.app, this.plugin.settings);
 		this.infoPanelComp = new InfoPanel(body, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller);
+	}
+
+	private async publishView(): Promise<void> {
+		if (!this.controller || !this.file) return;
+		try {
+			const target = await publishPublicSnapshot(this.app, this.file, this.controller.getData());
+			new Notice(`Vue publique mise à jour : ${target.path}`);
+		} catch (e) {
+			console.error("Map Manager: échec de la publication de la vue publique", e);
+			new Notice("Échec de la publication de la vue publique.");
+		}
 	}
 
 	private destroyComponents(): void {

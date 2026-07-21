@@ -43,6 +43,32 @@ export function makeLink(path: string, subpath?: string): string {
 	return subpath ? `${path}#${subpath}` : path;
 }
 
+/** Short display label for a link tab (e.g. an info panel's linked-notes tabs): "Note" or "Note › Heading". */
+export function linkTabLabel(link: string): string {
+	const { path, subpath } = splitLink(link);
+	const basename = path.split("/").pop()?.replace(/\.md$/, "") ?? path;
+	return subpath ? `${basename} › ${subpath}` : basename;
+}
+
+/**
+ * Extracts a `.map` file's vault path from a ` ```map ``` ` code block's raw source — either a
+ * bare path or a `[[wikilink]]` (same convention as Obsidian's own embeds). Shared with
+ * `src/view/customScript.ts`, which parses the same code block syntax client-side on the exported
+ * site (see `publicSnapshotPath` below for the JSON it then fetches) — pure so it stays usable
+ * there without any Obsidian dependency.
+ */
+export function parseMapBlockSource(source: string): string {
+	const trimmed = source.trim();
+	const linkMatch = trimmed.match(/^!?\[\[([^\]|]+)(?:\|[^\]]*)?\]\]$/);
+	return linkMatch ? (linkMatch[1] ?? "").trim() : trimmed;
+}
+
+/** Sibling `<basename>.json` path for a `.map` file's vault path — where `publishPublicSnapshot` writes, and where `customScript.ts` fetches from. */
+export function publicSnapshotPath(mapPath: string): string {
+	const withoutExt = mapPath.endsWith(".map") ? mapPath.slice(0, -".map".length) : mapPath;
+	return `${withoutExt}.json`;
+}
+
 export interface MapBackground {
 	path: string;
 	/**
@@ -524,3 +550,25 @@ export const GRID_TYPE_LABELS: Record<GridType, string> = {
 	"hex-flat": "Hexagone (face en bas)",
 	none: "Pas de grille",
 };
+
+/** Pre-rendered, link-stripped HTML for a linked note (or note section) — safe to inject directly, client-side. */
+export interface PublicNoteContent {
+	html: string;
+}
+
+export interface PublicTokenStat {
+	field: string;
+	value: string;
+}
+
+/**
+ * The shape of a `<map>.json` file (see `publishPublicSnapshot`) for a read-only, external
+ * (non-Obsidian) viewer — see `buildPublicSnapshot` (redaction) and `renderNoteSnapshot` (note
+ * content baking). `map` has everything hidden by fog already stripped out, and
+ * `notes`/`tokenStats` carry pre-resolved content so the viewer never needs vault access.
+ */
+export interface PublicMapSnapshot {
+	map: MapFileData;
+	notes: Record<string, PublicNoteContent>;
+	tokenStats: Record<string, PublicTokenStat[]>;
+}

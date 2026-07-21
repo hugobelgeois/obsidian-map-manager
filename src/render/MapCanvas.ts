@@ -1,24 +1,8 @@
 import { App, Menu, Notice } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { MapManagerSettings } from "../settings/types";
+import { DEFAULT_TOKEN_COLOR, Marker, Token, WallPoint, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
 import {
-	DEFAULT_TOKEN_COLOR,
-	DEFAULT_VISION_ANGLE,
-	DEFAULT_VISION_DIRECTION,
-	DEFAULT_VISION_RADIUS,
-	DEFAULT_VISION_RANGE,
-	Marker,
-	Token,
-	VisionBlockerType,
-	WallPoint,
-	hexKey,
-	isCellEmpty,
-	parseCellKey,
-	squareKey,
-} from "../data/mapData";
-import {
-	Point,
-	SQUARE_CELL_SCALE,
 	SnapCandidate,
 	ViewTransform,
 	clamp,
@@ -28,7 +12,6 @@ import {
 	hexCorners,
 	hexGridSnapCandidates,
 	hexWorldToCell,
-	raySegmentDistance,
 	screenToWorld,
 	segmentIntersection,
 	squareFootprintAnchor,
@@ -37,6 +20,18 @@ import {
 	wallShapeCorners,
 	worldToScreen,
 } from "../grid/gridMath";
+import {
+	ResolvedWallSegment,
+	VisionRays,
+	castVisionRays,
+	cellCenter as fogCellCenter,
+	cellVisualWidth as fogCellVisualWidth,
+	effectiveCellSize as fogEffectiveCellSize,
+	fogBucketSize as fogFogBucketSize,
+	footprintCenter as fogFootprintCenter,
+	isPointLit,
+	resolveWallSegments as fogResolveWallSegments,
+} from "../grid/fog";
 
 const DRAG_THRESHOLD = 4;
 /** Radius as a fraction of (cellVisualWidth * token.size): 0.475 → a diameter equal to 95% of the cell's width. */
@@ -51,20 +46,6 @@ const FOG_OPACITY_UNEXPLORED = 1;
 /** Fog opacity for ground that has been seen before, isn't currently lit, or sits beyond a "dim" blocker. */
 const FOG_OPACITY_EXPLORED = 0.55;
 
-/**
- * Rays cast per player token when tracing vision (ray/path tracing, not grid tracing) — fixed
- * angular resolution independent of zoom, grid type, or cell size. 180 gives a 2° step, smooth
- * enough for cone edges without the cost scaling with how many cells are on screen.
- */
-const FOG_RAY_COUNT = 180;
-/**
- * Size, in cell-widths, of the square buckets used only to persist "ever explored" ground.
- * Still coarser than the actual grid (and independent of grid type/shape) — exploration memory
- * doesn't need cell-level precision — but small enough to hug walls/blockers reasonably closely.
- * Lower = more precise (and more stored keys/cheaper-but-more-frequent bucket scan cells); this
- * was 3 and felt too blocky/imprecise.
- */
-const FOG_BUCKET_SCALE = 1.25;
 /**
  * Hard cap on how many fog-memory buckets get scanned per axis in one frame — see
  * `fogIterationBucketSize`. Keeps the scan (and its Path2D) bounded even when zoomed out so far
@@ -113,14 +94,6 @@ function lightenColor(hex: string, ratio: number): string {
 	return `rgb(${mix(match[1])}, ${mix(match[2])}, ${mix(match[3])})`;
 }
 
-/** Signed difference between two angles in degrees, normalized to [-180, 180]. */
-function angleDiffDeg(a: number, b: number): number {
-	let diff = (a - b) % 360;
-	if (diff > 180) diff -= 360;
-	if (diff < -180) diff += 360;
-	return diff;
-}
-
 /** Stable per-token phase offset (radians) so several tokens' fog tremble doesn't move in lockstep. */
 function tremblePhase(tokenId: string): number {
 	let hash = 0;
@@ -148,25 +121,8 @@ interface BackgroundEntry {
 	img: HTMLImageElement | null;
 }
 
-/** A `WallSegment` with its two endpoints resolved to world coordinates, for ray casting/flood-fill. */
-interface ResolvedWallSegment {
-	a: Point;
-	b: Point;
-	type: VisionBlockerType;
-}
-
-/** One ray's traced reach, in pixels from the token center, at a fixed angle (see `FOG_RAY_COUNT`). */
-interface RaySample {
-	/** Distance to the first blocker of any kind (or the vision's natural edge if none). */
-	clearEnd: number;
-	/** Distance to the first *opaque* blocker (or the natural edge) — reaches past a "dim" blocker. */
-	dimEnd: number;
-}
-
-/** A player token's traced vision for the current frame: 0..360° rays fanning out from its center. */
-interface PlayerVisionRays {
-	center: { x: number; y: number };
-	rays: RaySample[];
+/** A player token's traced vision for the current frame: 0..360° rays fanning out from its center (see `../grid/fog.ts`). */
+interface PlayerVisionRays extends VisionRays {
 	/** Stable per-token phase for the *cosmetic* fan-edge tremble (see `appendVisionFan`) — never affects `rays` itself. */
 	phase: number;
 }
@@ -621,8 +577,7 @@ export class MapCanvas {
 	 * has no visible cells but still uses square math for its hidden fog substrate (see `updateCell`).
 	 */
 	private effectiveCellSize(): number {
-		const data = this.controller.getData();
-		return data.gridType === "square" || data.gridType === "none" ? data.cellSize * SQUARE_CELL_SCALE : data.cellSize;
+		return fogEffectiveCellSize(this.controller.getData());
 	}
 
 	/**
@@ -633,7 +588,7 @@ export class MapCanvas {
 	 * "relative to the cell" regardless of grid type (tokens, vision range).
 	 */
 	private cellVisualWidth(): number {
-		return this.controller.getData().cellSize * SQUARE_CELL_SCALE;
+		return fogCellVisualWidth(this.controller.getData());
 	}
 
 	/** Grid type "none" is treated as "square" here — it has no visible cells, but fog still uses this square substrate. */
@@ -660,14 +615,7 @@ export class MapCanvas {
 	}
 
 	private cellCenter(key: string): { x: number; y: number } {
-		const data = this.controller.getData();
-		const { a, b } = parseCellKey(key);
-		const cellSize = this.effectiveCellSize();
-		if (data.gridType === "square") {
-			return { x: a * cellSize + cellSize / 2, y: b * cellSize + cellSize / 2 };
-		}
-		const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
-		return hexCellToWorldCenter(a, b, cellSize, orientation);
+		return fogCellCenter(this.controller.getData(), key);
 	}
 
 	// ---- Brush / fill tools ----
@@ -857,19 +805,7 @@ export class MapCanvas {
 
 	/** Every `WallSegment` (across visible layers) resolved to world-space endpoints, for ray casting and the fill tool's flood boundary. */
 	private resolveWallSegments(): ResolvedWallSegment[] {
-		const data = this.controller.getData();
-		const result: ResolvedWallSegment[] = [];
-		for (const layer of data.layers) {
-			if (!layer.visible) continue;
-			const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
-			for (const segment of layer.wallSegments) {
-				const a = pointsById.get(segment.aId);
-				const b = pointsById.get(segment.bId);
-				if (!a || !b) continue;
-				result.push({ a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y }, type: segment.blockerType });
-			}
-		}
-		return result;
+		return fogResolveWallSegments(this.controller.getData());
 	}
 
 	private handleClick(e: PointerEvent): void {
@@ -1190,12 +1126,8 @@ export class MapCanvas {
 	// ---- Fog of war (ray/path tracing — not tied to the visible grid) ----
 
 	/**
-	 * Traces `FOG_RAY_COUNT` rays outward from a player token's center (its omnidirectional radius
-	 * plus its directional cone, whichever reaches further at a given angle) against `wallSegments`
-	 * (see `resolveWallSegments`, computed once per frame and shared across every token). Each ray
-	 * analytically finds every wall segment it crosses within its reach, sorted by distance, rather
-	 * than marching in fixed steps and sampling a per-cell blocker — blocking no longer depends on
-	 * grid cell size/shape at all, only on the authored wall geometry.
+	 * Traces every ray outward from a player token's center against `wallSegments` — see
+	 * `castVisionRays` in `../grid/fog.ts` for the actual (canvas-agnostic) ray tracing.
 	 *
 	 * These reaches are the *true* vision extent: they gate what counts as lit for gameplay
 	 * (`isLitByCache`) and what gets permanently written to fog memory (`markExplored`). The
@@ -1207,50 +1139,8 @@ export class MapCanvas {
 	 * tremble is now applied only in `appendVisionFan`, purely to the drawn shape.
 	 */
 	private castRaysForToken(token: Token, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
-		const center = this.footprintCenter(token);
-		const radiusPx = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * this.cellVisualWidth();
-		const rangePx = (token.visionRange ?? DEFAULT_VISION_RANGE) * this.cellVisualWidth();
-		const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
-		const direction = token.visionDirection ?? DEFAULT_VISION_DIRECTION;
-		const phase = tremblePhase(token.id);
-
-		const rays: RaySample[] = [];
-		for (let i = 0; i < FOG_RAY_COUNT; i++) {
-			const angle = (360 / FOG_RAY_COUNT) * i;
-			const inCone = rangePx > 0 && (halfAngle >= 180 || Math.abs(angleDiffDeg(angle, direction)) <= halfAngle);
-			const reach = inCone ? Math.max(radiusPx, rangePx) : radiusPx;
-			if (reach <= 0) {
-				rays.push({ clearEnd: 0, dimEnd: 0 });
-				continue;
-			}
-			const rad = (angle * Math.PI) / 180;
-			const dx = Math.cos(rad);
-			const dy = Math.sin(rad);
-
-			const hits: { dist: number; type: VisionBlockerType }[] = [];
-			for (const seg of wallSegments) {
-				const dist = raySegmentDistance(center, dx, dy, reach, seg.a, seg.b);
-				if (dist !== null) hits.push({ dist, type: seg.type });
-			}
-			hits.sort((h1, h2) => h1.dist - h2.dist);
-
-			let clearEnd = reach;
-			let dimEnd = reach;
-			let dimHit = false;
-			for (const hit of hits) {
-				if (hit.type === "opaque") {
-					dimEnd = hit.dist;
-					if (!dimHit) clearEnd = hit.dist;
-					break;
-				}
-				if (!dimHit) {
-					dimHit = true;
-					clearEnd = hit.dist;
-				}
-			}
-			rays.push({ clearEnd, dimEnd });
-		}
-		return { center, rays, phase };
+		const { center, rays } = castVisionRays(this.controller.getData(), token, wallSegments);
+		return { center, rays, phase: tremblePhase(token.id) };
 	}
 
 	/**
@@ -1288,17 +1178,7 @@ export class MapCanvas {
 
 	/** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
 	private isLitByCache(cache: PlayerVisionRays[], worldX: number, worldY: number, useDim: boolean): boolean {
-		for (const { center, rays } of cache) {
-			const dx = worldX - center.x;
-			const dy = worldY - center.y;
-			const dist = Math.hypot(dx, dy);
-			let angle = (Math.atan2(dy, dx) * 180) / Math.PI;
-			if (angle < 0) angle += 360;
-			const idx = Math.round(angle / (360 / rays.length)) % rays.length;
-			const ray = rays[idx];
-			if (ray && dist <= (useDim ? ray.dimEnd : ray.clearEnd)) return true;
-		}
-		return false;
+		return isPointLit(cache, worldX, worldY, useDim);
 	}
 
 	/** World-space rectangle currently on screen, used to bound the fog-memory bucket scan. */
@@ -1309,7 +1189,7 @@ export class MapCanvas {
 	}
 
 	private fogBucketSize(): number {
-		return this.cellVisualWidth() * FOG_BUCKET_SCALE;
+		return fogFogBucketSize(this.controller.getData());
 	}
 
 	/**
@@ -1539,17 +1419,7 @@ export class MapCanvas {
 	 * simply centered (and enlarged) on its single anchor cell.
 	 */
 	private footprintCenter(token: Token): { x: number; y: number } {
-		const data = this.controller.getData();
-		if (data.gridType === "none") return { x: token.x ?? 0, y: token.y ?? 0 };
-		const size = token.size ?? 1;
-		const cellKey = token.cellKey ?? squareKey(0, 0);
-		if (data.gridType !== "square" || size <= 1) return this.cellCenter(cellKey);
-		const { a, b } = parseCellKey(cellKey);
-		const cellSize = this.effectiveCellSize();
-		return {
-			x: a * cellSize + (size * cellSize) / 2,
-			y: b * cellSize + (size * cellSize) / 2,
-		};
+		return fogFootprintCenter(this.controller.getData(), token);
 	}
 
 	private tokenRadius(token: Token): number {

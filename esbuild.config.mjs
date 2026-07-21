@@ -11,7 +11,7 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 
-const context = await esbuild.context({
+const pluginContext = await esbuild.context({
 	banner: {
 		js: banner,
 	},
@@ -41,9 +41,34 @@ const context = await esbuild.context({
 	minify: prod,
 });
 
+/**
+ * The portable, read-only public map viewer (src/view/customScript.ts) — zero Obsidian dependency,
+ * zero external imports, so it's a single drop-in file: this plugin's only job is to build it here;
+ * getting it into the site (e.g. via that site's generic "custom scripts" mechanism — a
+ * default-exported function, called client-side after the page mounts) is the site-export plugin's
+ * concern, not this one's. It scans the page for ```map``` code blocks and fetches/mounts each
+ * one's `<basename>.json` (see src/platform/publishPublicSnapshot.ts).
+ */
+const viewerContext = await esbuild.context({
+	banner: {
+		js: banner,
+	},
+	entryPoints: ["src/view/customScript.ts"],
+	bundle: true,
+	format: "esm",
+	target: "es2018",
+	logLevel: "info",
+	sourcemap: prod ? false : "inline",
+	treeShaking: true,
+	outfile: "map-manager-viewer.js",
+	minify: prod,
+});
+
 if (prod) {
-	await context.rebuild();
+	await pluginContext.rebuild();
+	await viewerContext.rebuild();
 	process.exit(0);
 } else {
-	await context.watch();
+	await pluginContext.watch();
+	await viewerContext.watch();
 }

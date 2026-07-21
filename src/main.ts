@@ -1,5 +1,6 @@
 import { Notice, Plugin, TFile, TFolder, normalizePath } from "obsidian";
-import { createDefaultMapData, MapDefaults, serializeMapData } from "./data/mapData";
+import { createDefaultMapData, MapDefaults, parseMapData, serializeMapData } from "./data/mapData";
+import { publishPublicSnapshot } from "./platform/publishPublicSnapshot";
 import { MapManagerSettingsTab } from "./settings/SettingsTab";
 import { DEFAULT_SETTINGS, MapManagerSettings } from "./settings/types";
 import { FileSuggestModal } from "./ui/FileSuggestModal";
@@ -48,6 +49,18 @@ export default class MapManagerPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "map-manager-publish-public-snapshot",
+			name: "Publier la vue publique de la carte active",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const isMap = file instanceof TFile && file.extension === "map";
+				if (checking) return isMap;
+				if (file instanceof TFile) void this.publishMap(file);
+				return true;
+			},
+		});
+
 		this.addSettingTab(new MapManagerSettingsTab(this.app, this));
 
 		this.registerEvent(
@@ -90,6 +103,18 @@ export default class MapManagerPlugin extends Plugin {
 		const data = createDefaultMapData(this.getMapDefaults());
 		const file: TFile = await this.app.vault.create(path, serializeMapData(data));
 		await this.app.workspace.getLeaf(true).openFile(file);
+	}
+
+	private async publishMap(file: TFile): Promise<void> {
+		try {
+			const raw = await this.app.vault.read(file);
+			const data = parseMapData(raw, this.getMapDefaults());
+			const target = await publishPublicSnapshot(this.app, file, data);
+			new Notice(`Vue publique mise à jour : ${target.path}`);
+		} catch (e) {
+			console.error("Map Manager: échec de la publication de la vue publique", e);
+			new Notice("Échec de la publication de la vue publique.");
+		}
 	}
 
 	async loadSettings(): Promise<void> {
