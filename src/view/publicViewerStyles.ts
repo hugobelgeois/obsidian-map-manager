@@ -52,13 +52,28 @@ export const PUBLIC_VIEWER_CSS = `
 	/* The docked panel reads as a sidebar, not page content — --background-secondary
 	   (the same tone used for the canvas-host area) rather than --background-primary-alt. */
 	background: var(--background-secondary, #1e1e1e);
+	transition: width 0.15s ease, flex-basis 0.15s ease;
 }
 .map-manager-public-infopanel.is-open {
-	flex: 0 0 300px;
-	width: 300px;
+	flex: 0 0 var(--map-manager-infopanel-width, 300px);
+	width: var(--map-manager-infopanel-width, 300px);
 	overflow-y: auto;
 	padding: 0.9em;
 	box-sizing: border-box;
+}
+.map-manager-public-infopanel-resize-handle {
+	flex: 0 0 0;
+	width: 0;
+	cursor: ew-resize;
+	position: relative;
+}
+.map-manager-public-infopanel-resize-handle.is-open {
+	flex: 0 0 5px;
+	width: 5px;
+}
+.map-manager-public-infopanel-resize-handle.is-open:hover,
+.map-manager-public-infopanel-resize-handle.is-open:active {
+	background: var(--interactive-accent, #4f9eff);
 }
 .map-manager-public-infopanel .map-manager-infopanel-empty {
 	display: none;

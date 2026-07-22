@@ -26,6 +26,10 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
 	return node;
 }
 
+const MIN_PANEL_WIDTH = 220;
+const MAX_PANEL_WIDTH = 640;
+const DEFAULT_PANEL_WIDTH = 300;
+
 /**
  * Read-only counterpart to `InfoPanel`: shows a selected case/pion/tampon's stamp, label, linked
  * notes (already rendered to static, link-neutralized HTML by `renderNoteSnapshot` — never fetched
@@ -33,21 +37,55 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
  */
 export class PublicInfoPanel {
 	el: HTMLElement;
+	private resizeHandleEl: HTMLElement;
+	private width = DEFAULT_PANEL_WIDTH;
 	private unsubscribe: () => void;
 	private activeLinkIndex = 0;
 	private activeTokenTabId: string | null = null;
 	private lastSelectionKey: string | null = null;
 
 	constructor(container: HTMLElement, private controller: PublicViewController) {
+		this.resizeHandleEl = el("div", "map-manager-public-infopanel-resize-handle");
+		container.appendChild(this.resizeHandleEl);
 		this.el = el("div", "map-manager-infopanel map-manager-public-infopanel");
 		container.appendChild(this.el);
+		this.applyWidth();
+		this.wireResizeHandle();
 		this.render();
 		this.unsubscribe = controller.onChange(() => this.render());
 	}
 
 	destroy(): void {
 		this.unsubscribe();
+		this.resizeHandleEl.remove();
 		this.el.remove();
+	}
+
+	private applyWidth(): void {
+		this.el.style.setProperty("--map-manager-infopanel-width", `${this.width}px`);
+	}
+
+	/** Drag-to-resize via the handle docked to the panel's left edge — see `InfoPanel.wireResizeHandle`. */
+	private wireResizeHandle(): void {
+		this.resizeHandleEl.onpointerdown = (e: PointerEvent) => {
+			e.preventDefault();
+			const startX = e.clientX;
+			const startWidth = this.width;
+			this.resizeHandleEl.setPointerCapture(e.pointerId);
+
+			const onMove = (moveEvent: PointerEvent) => {
+				const delta = moveEvent.clientX - startX;
+				this.width = Math.min(MAX_PANEL_WIDTH, Math.max(MIN_PANEL_WIDTH, startWidth - delta));
+				this.applyWidth();
+			};
+			const onUp = () => {
+				this.resizeHandleEl.releasePointerCapture(e.pointerId);
+				this.resizeHandleEl.removeEventListener("pointermove", onMove);
+				this.resizeHandleEl.removeEventListener("pointerup", onUp);
+			};
+			this.resizeHandleEl.addEventListener("pointermove", onMove);
+			this.resizeHandleEl.addEventListener("pointerup", onUp);
+		};
 	}
 
 	private render(): void {
@@ -55,10 +93,12 @@ export class PublicInfoPanel {
 		const selection = this.controller.selected;
 		if (!selection) {
 			this.el.classList.remove("is-open");
+			this.resizeHandleEl.classList.remove("is-open");
 			this.el.appendChild(el("div", "map-manager-infopanel-empty", "Cliquez sur une case ou un pion pour voir ses informations."));
 			return;
 		}
 		this.el.classList.add("is-open");
+		this.resizeHandleEl.classList.add("is-open");
 
 		const selectionKey = JSON.stringify(selection);
 		if (this.lastSelectionKey !== selectionKey) {
