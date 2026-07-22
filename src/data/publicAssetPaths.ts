@@ -1,13 +1,14 @@
 import { MapFileData } from "./mapData";
 
 /**
- * Vault-relative asset paths (backgrounds, token images) become site-root-absolute references —
- * the site-export plugin copies vault attachments under the Svelte project's `static/` folder,
- * which SvelteKit serves at the site root with the `static/` segment stripped, so "root-absolute"
- * and "path inside `static/`" are the same thing.
+ * Vault-relative asset paths (backgrounds, token images, note-embedded media) become site-root
+ * references — the site-export plugin copies every vault attachment into the Svelte project's
+ * `static/` folder *flattened by filename*, dropping the original vault subfolder, so the site
+ * reference is always `/<basename>`, never the full vault-relative path.
  */
-function toSiteAssetPath(vaultPath: string): string {
-	return vaultPath.startsWith("/") ? vaultPath : `/${vaultPath}`;
+export function toSiteAssetPath(vaultPath: string): string {
+	const basename = vaultPath.split("/").pop();
+	return `/${basename || vaultPath}`;
 }
 
 /**

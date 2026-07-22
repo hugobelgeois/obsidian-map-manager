@@ -1,5 +1,6 @@
-import { App, Component, MarkdownRenderer, TFile, resolveSubpath } from "obsidian";
+import { App, Component, FileSystemAdapter, MarkdownRenderer, TFile, resolveSubpath } from "obsidian";
 import { CELLED_GRID_TYPES, MapFileData, PublicMapSnapshot, PublicTokenStat, splitLink } from "../data/mapData";
+import { toSiteAssetPath } from "../data/publicAssetPaths";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 
 /** Every link reachable from a (already-redacted) map's surviving cells/markers/tokens. */
@@ -48,6 +49,44 @@ function sanitizeRenderedNote(container: HTMLElement): void {
 	}
 }
 
+/**
+ * Turns a resolved `app://<token>/<absolute-fs-path>?<cache-bust>` resource URL (what every local
+ * image/audio/video embed ends up with post-render, wikilink or plain `![]()` alike — both go
+ * through `adapter.getResourcePath`, so there's no `.internal-embed` wrapper to rely on for plain
+ * markdown images) back into a vault-relative path, by stripping the vault's own absolute base path
+ * off the front. `null` if `src` isn't a local resource URL or doesn't fall under the vault.
+ */
+function vaultRelativePathFromResourceUrl(app: App, src: string): string | null {
+	if (!src.startsWith("app://")) return null;
+	const adapter = app.vault.adapter;
+	if (!(adapter instanceof FileSystemAdapter)) return null;
+	let filePath: string;
+	try {
+		filePath = decodeURIComponent(new URL(src).pathname);
+	} catch {
+		return null;
+	}
+	if (/^\/[A-Za-z]:/.test(filePath)) filePath = filePath.slice(1);
+	const basePath = adapter.getBasePath().replace(/\\/g, "/");
+	const normalized = filePath.replace(/\\/g, "/");
+	if (!normalized.toLowerCase().startsWith(basePath.toLowerCase())) return null;
+	return normalized.slice(basePath.length).replace(/^\//, "");
+}
+
+/**
+ * Local image/audio/video embeds render as `<img src="app://...">` — a resource URL only valid
+ * inside this Obsidian instance — so rewrite every such `src` to the same site-root-absolute path
+ * used for backgrounds/tokens (`toSiteAssetPath`) before freezing the note's HTML into the export.
+ */
+function rewriteEmbeddedMedia(app: App, container: HTMLElement): void {
+	for (const media of Array.from(
+		container.querySelectorAll<HTMLImageElement | HTMLVideoElement | HTMLAudioElement | HTMLSourceElement>("img, video, audio, source")
+	)) {
+		const rel = vaultRelativePathFromResourceUrl(app, media.src);
+		if (rel) media.src = toSiteAssetPath(rel);
+	}
+}
+
 /** Resolves + renders one note link (with optional `#subpath`) to static, link-neutralized HTML. `null` if the note/section can't be found. */
 async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 	const { path, subpath } = splitLink(link);
@@ -76,6 +115,7 @@ async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 	} finally {
 		component.unload();
 	}
+	rewriteEmbeddedMedia(app, container);
 	neutralizeLinks(container);
 	sanitizeRenderedNote(container);
 	return container.outerHTML;

@@ -61,7 +61,7 @@ async function mountBlock(codeEl: Element): Promise<void> {
 	// is "auto" (which min-height alone leaves it as) — without this, the info panel's content
 	// dictates the whole box's height instead of scrolling within a fixed one, so it overflows the
 	// page rather than docking beside a properly bounded map area.
-	container.style.height = "480px";
+	container.style.height = "100%";
 	host.replaceWith(container);
 
 	if (!mapPath) {
