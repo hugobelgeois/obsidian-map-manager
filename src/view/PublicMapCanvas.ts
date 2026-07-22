@@ -1,6 +1,7 @@
 import { CellData, Marker, Token, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
 import { cellCenter, cellVisualWidth, effectiveCellSize, fogBucketSize, footprintCenter, isWorldPointExplored } from "../grid/fog";
 import {
+	ABS_MIN_ZOOM,
 	ViewTransform,
 	clamp,
 	getVisibleHexCells,
@@ -169,7 +170,8 @@ export class PublicMapCanvas {
 		const data = this.controller.snapshot.map;
 		const bounds = this.computeVisibleImageBounds();
 		if (bounds && bounds.w > 0 && bounds.h > 0) {
-			const zoom = clamp(Math.min(this.viewportW / bounds.w, this.viewportH / bounds.h), data.minZoom, data.maxZoom);
+			// Covers the viewport (larger ratio) so no empty space beyond the image is ever visible.
+			const zoom = clamp(Math.max(this.viewportW / bounds.w, this.viewportH / bounds.h), ABS_MIN_ZOOM, data.maxZoom);
 			this.transform = {
 				zoom,
 				panX: this.viewportW / 2 - (bounds.x + bounds.w / 2) * zoom,
@@ -208,11 +210,15 @@ export class PublicMapCanvas {
 
 	private getEffectiveMinZoom(): number {
 		const data = this.controller.snapshot.map;
-		if (this.viewportW === 0 || this.viewportH === 0) return data.minZoom;
+		if (this.viewportW === 0 || this.viewportH === 0) return ABS_MIN_ZOOM;
 		const bounds = this.computeVisibleImageBounds();
-		if (!bounds || bounds.w <= 0 || bounds.h <= 0) return data.minZoom;
-		const fitZoom = Math.min(this.viewportW / bounds.w, this.viewportH / bounds.h);
-		return clamp(fitZoom, data.minZoom, data.maxZoom);
+		if (!bounds || bounds.w <= 0 || bounds.h <= 0) return ABS_MIN_ZOOM;
+		// Never zoom out past the point where the image still covers the whole viewport (the larger
+		// of the two ratios) — the smaller ratio would let one axis "fit" while leaving empty space
+		// beyond the image on the other. The per-map `minZoom` setting must not clamp this *upward*
+		// past that either, or the map stops short of the image's edges.
+		const coverZoom = Math.max(this.viewportW / bounds.w, this.viewportH / bounds.h);
+		return clamp(coverZoom, ABS_MIN_ZOOM, data.maxZoom);
 	}
 
 	private clampPanToBounds(bounds: Bounds): void {
@@ -518,6 +524,7 @@ export class PublicMapCanvas {
 
 	private drawGridAndCells(ctx: CanvasRenderingContext2D, cellSize: number): void {
 		const data = this.controller.snapshot.map;
+		const zoneTypes = this.controller.snapshot.zoneTypes;
 		if (data.gridType === "none") return;
 		const gridColor = "rgba(127,127,127,0.4)";
 		const visibleLayers = data.layers.filter((l) => l.visible);
@@ -531,7 +538,7 @@ export class PublicMapCanvas {
 				const y = c.b * cellSize;
 				for (const layer of visibleLayers) {
 					const cell = layer.cellsByGridType[data.gridType][key];
-					if (cell?.zoneTypeId) drawZoneFill(ctx, data.zoneTypes, cell.zoneTypeId, () => ctx.rect(x, y, cellSize, cellSize));
+					if (cell?.zoneTypeId) drawZoneFill(ctx, zoneTypes, cell.zoneTypeId, () => ctx.rect(x, y, cellSize, cellSize));
 				}
 				ctx.strokeStyle = gridColor;
 				ctx.strokeRect(x, y, cellSize, cellSize);
@@ -555,7 +562,7 @@ export class PublicMapCanvas {
 			ctx.closePath();
 			for (const layer of visibleLayers) {
 				const cell = layer.cellsByGridType[data.gridType][key];
-				if (cell?.zoneTypeId) drawZoneFill(ctx, data.zoneTypes, cell.zoneTypeId, () => {});
+				if (cell?.zoneTypeId) drawZoneFill(ctx, zoneTypes, cell.zoneTypeId, () => {});
 			}
 			ctx.strokeStyle = gridColor;
 			ctx.stroke();

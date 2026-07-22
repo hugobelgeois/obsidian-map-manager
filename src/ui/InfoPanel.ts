@@ -17,12 +17,14 @@ import {
 	splitLink,
 } from "../data/mapData";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
+import { MapManagerSettings } from "../settings/types";
 import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 import { HeadingSuggestModal } from "./HeadingSuggestModal";
 
 export interface InfoPanelDeps {
 	assetsFolder: string;
+	settings: MapManagerSettings;
 }
 
 const QUICK_STAMPS = ["⚔️", "🏰", "💰", "🐉", "🌲", "⛰️", "🌊", "🔥", "⭐", "📍", "💀", "🏠"];
@@ -152,7 +154,7 @@ export class InfoPanel {
 		closeBtn.onclick = () => this.controller.selectCell(null);
 
 		if (this.controller.mode === "edit") {
-			this.renderEditMode(key, cell, data.zoneTypes);
+			this.renderEditMode(key, cell, this.deps.settings.defaultZoneTypes);
 		} else {
 			this.renderViewMode(cell);
 		}
@@ -323,8 +325,6 @@ export class InfoPanel {
 	// ---- Tokens (always editable, in both edit and view mode) ----
 
 	private renderTokenPanel(token: Token): void {
-		const data = this.controller.getData();
-
 		const iconField = this.el.createDiv({ cls: "map-manager-field" });
 		iconField.createEl("label", { text: "Icône" });
 		const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
@@ -404,13 +404,13 @@ export class InfoPanel {
 		const templateSelect = templateField.createEl("select");
 		const noneOpt = templateSelect.createEl("option", { text: "— aucun —" });
 		noneOpt.value = "";
-		for (const t of data.tokenTemplates) {
+		for (const t of this.deps.settings.defaultTokenTemplates) {
 			const opt = templateSelect.createEl("option", { text: t.name });
 			opt.value = t.id;
 			if (token.templateId === t.id) opt.selected = true;
 		}
 		templateSelect.onchange = () => this.controller.updateToken(token.id, (t) => (t.templateId = templateSelect.value || undefined));
-		if (data.tokenTemplates.length === 0) {
+		if (this.deps.settings.defaultTokenTemplates.length === 0) {
 			templateField.createDiv({ cls: "map-manager-view-empty", text: "Aucun modèle défini (Réglages du plugin)." });
 		}
 
@@ -531,8 +531,7 @@ export class InfoPanel {
 
 	private renderTokenStats(token: Token): void {
 		if (!token.templateId) return;
-		const data = this.controller.getData();
-		const template: TokenTemplate | undefined = data.tokenTemplates.find((t) => t.id === token.templateId);
+		const template: TokenTemplate | undefined = this.deps.settings.defaultTokenTemplates.find((t) => t.id === token.templateId);
 		if (!template || template.fields.length === 0) return;
 
 		const table = this.el.createDiv({ cls: "map-manager-token-stats" });

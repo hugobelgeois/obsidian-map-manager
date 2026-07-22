@@ -128,8 +128,8 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Palette de zones par défaut")
-			.setDesc("Utilisée pour toute nouvelle carte. Chaque carte garde ensuite sa propre copie, modifiable indépendamment.")
+			.setName("Palette de zones (types de terrain)")
+			.setDesc("Partagée par toutes les cartes : toute modification ici (nom, couleur, ajout, suppression) se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte.")
 			.setHeading();
 
 		for (const zone of settings.defaultZoneTypes) {
@@ -168,7 +168,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Modèles de statistiques de pion")
 			.setDesc(
-				"Chaque modèle liste les propriétés (frontmatter YAML) de la note liée à afficher sur le pion, séparées par des virgules. Utilisée pour toute nouvelle carte ; chaque carte garde ensuite sa propre copie."
+				"Chaque modèle liste les propriétés (frontmatter YAML) de la note liée à afficher sur le pion, séparées par des virgules. Partagée par toutes les cartes, en direct : toute modification ici se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte."
 			)
 			.setHeading();
 

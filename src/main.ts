@@ -9,6 +9,7 @@ import { renderMapEmbed } from "./view/MapEmbed";
 
 export default class MapManagerPlugin extends Plugin {
 	settings: MapManagerSettings;
+	private settingsChangeListeners: Set<() => void> = new Set();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -82,11 +83,15 @@ export default class MapManagerPlugin extends Plugin {
 		return {
 			gridType: this.settings.defaultGridType,
 			cellSize: this.settings.defaultCellSize,
-			zoneTypes: this.settings.defaultZoneTypes.map((z) => ({ ...z })),
-			tokenTemplates: this.settings.defaultTokenTemplates.map((t) => ({ ...t, fields: [...t.fields] })),
 			minZoom: this.settings.defaultMinZoom,
 			maxZoom: this.settings.defaultMaxZoom,
 		};
+	}
+
+	/** Notifies every open map (view or embed) that plugin settings changed, so zone types / token templates — read live, not copied per-map — refresh immediately. See `MapController.refresh`. */
+	onSettingsChanged(cb: () => void): () => void {
+		this.settingsChangeListeners.add(cb);
+		return () => this.settingsChangeListeners.delete(cb);
 	}
 
 	private async createNewMap(targetFolder?: TFolder): Promise<void> {
@@ -109,7 +114,7 @@ export default class MapManagerPlugin extends Plugin {
 		try {
 			const raw = await this.app.vault.read(file);
 			const data = parseMapData(raw, this.getMapDefaults());
-			const target = await publishPublicSnapshot(this.app, file, data);
+			const target = await publishPublicSnapshot(this.app, file, data, this.settings);
 			new Notice(`Vue publique mise à jour : ${target.path}`);
 		} catch (e) {
 			console.error("Map Manager: échec de la publication de la vue publique", e);
@@ -124,5 +129,6 @@ export default class MapManagerPlugin extends Plugin {
 
 	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
+		for (const cb of this.settingsChangeListeners) cb();
 	}
 }

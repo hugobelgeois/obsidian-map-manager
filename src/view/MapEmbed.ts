@@ -48,12 +48,13 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	);
 
 	const controller = new MapController(data, save, "view");
-	const unsubscribeAutoPublish = wireAutoPublish(app, file, controller, plugin.settings.autoPublishDelaySeconds);
+	const unsubscribeAutoPublish = wireAutoPublish(app, file, controller, plugin.settings);
+	const unsubscribeSettings = plugin.onSettingsChanged(() => controller.refresh());
 	let canvasRef: MapCanvas | null = null;
 
 	const publishView = async () => {
 		try {
-			const target = await publishPublicSnapshot(app, file, controller.getData());
+			const target = await publishPublicSnapshot(app, file, controller.getData(), plugin.settings);
 			new Notice(`Vue publique mise à jour : ${target.path}`);
 		} catch (e) {
 			console.error("Map Manager: échec de la publication de la vue publique", e);
@@ -61,7 +62,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		}
 	};
 
-	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder }, controller, {
+	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder, settings: plugin.settings }, controller, {
 		recenter: () => canvasRef?.recenter(),
 		publish: () => void publishView(),
 	});
@@ -69,7 +70,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
 	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings);
 	canvasRef = canvas;
-	const infoPanel = new InfoPanel(body, app, { assetsFolder: plugin.settings.assetsFolder }, controller);
+	const infoPanel = new InfoPanel(body, app, { assetsFolder: plugin.settings.assetsFolder, settings: plugin.settings }, controller);
 
 	ctx.addChild(
 		new MapEmbedChild(host, () => {
@@ -77,6 +78,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			toolbar.destroy();
 			infoPanel.destroy();
 			unsubscribeAutoPublish();
+			unsubscribeSettings();
 		})
 	);
 }

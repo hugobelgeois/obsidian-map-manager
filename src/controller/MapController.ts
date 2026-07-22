@@ -684,6 +684,11 @@ export class MapController {
 		return () => this.listeners.delete(cb);
 	}
 
+	/** Forces every mounted UI piece to re-render without touching `data` — used to reflect a live plugin-settings change (zone types, token templates). */
+	refresh(): void {
+		this.notify();
+	}
+
 	private notify(): void {
 		for (const cb of this.listeners) cb();
 	}

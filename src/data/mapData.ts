@@ -173,11 +173,9 @@ export interface Layer {
 }
 
 export interface MapFileData {
-	version: 12;
+	version: 13;
 	gridType: GridType;
 	cellSize: number;
-	zoneTypes: ZoneType[];
-	tokenTemplates: TokenTemplate[];
 	layers: Layer[];
 	activeLayerId: string;
 	/**
@@ -202,8 +200,6 @@ export interface MapFileData {
 export interface MapDefaults {
 	gridType: GridType;
 	cellSize: number;
-	zoneTypes: ZoneType[];
-	tokenTemplates: TokenTemplate[];
 	minZoom: number;
 	maxZoom: number;
 }
@@ -242,11 +238,9 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 12,
+		version: 13,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
-		zoneTypes: defaults.zoneTypes.map((z) => ({ ...z })),
-		tokenTemplates: defaults.tokenTemplates.map((t) => ({ ...t, fields: [...t.fields] })),
 		layers: [layer],
 		activeLayerId: layer.id,
 		tokens: [],
@@ -263,14 +257,6 @@ export function getActiveLayer(data: MapFileData): Layer {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
-}
-
-function isZoneType(value: unknown): value is ZoneType {
-	return isRecord(value) && typeof value.id === "string" && typeof value.name === "string" && typeof value.color === "string";
-}
-
-function isTokenTemplate(value: unknown): value is TokenTemplate {
-	return isRecord(value) && typeof value.id === "string" && typeof value.name === "string" && Array.isArray(value.fields) && value.fields.every(isString);
 }
 
 function isString(value: unknown): value is string {
@@ -441,10 +427,6 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 
 	const gridType: GridType = isString(p.gridType) && (GRID_TYPES as string[]).includes(p.gridType) ? (p.gridType as GridType) : defaults.gridType;
 	const cellSize = typeof p.cellSize === "number" && p.cellSize > 0 ? p.cellSize : defaults.cellSize;
-	const zoneTypes: ZoneType[] = Array.isArray(p.zoneTypes) ? p.zoneTypes.filter(isZoneType) : defaults.zoneTypes.map((z) => ({ ...z }));
-	const tokenTemplates: TokenTemplate[] = Array.isArray(p.tokenTemplates)
-		? p.tokenTemplates.filter(isTokenTemplate)
-		: defaults.tokenTemplates.map((t) => ({ ...t, fields: [...t.fields] }));
 
 	const version = typeof p.version === "number" ? p.version : 0;
 	// Files saved before v3 stored background offsets in pixels; convert them to grid cells.
@@ -496,7 +478,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 12, gridType, cellSize, zoneTypes, tokenTemplates, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
+	return { version: 13, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {
@@ -565,10 +547,15 @@ export interface PublicTokenStat {
  * The shape of a `<map>.json` file (see `publishPublicSnapshot`) for a read-only, external
  * (non-Obsidian) viewer — see `buildPublicSnapshot` (redaction) and `renderNoteSnapshot` (note
  * content baking). `map` has everything hidden by fog already stripped out, and
- * `notes`/`tokenStats` carry pre-resolved content so the viewer never needs vault access.
+ * `notes`/`tokenStats`/`zoneTypes` carry pre-resolved content so the viewer never needs vault or
+ * plugin-settings access. `zoneTypes` is a frozen-at-publish-time copy of `settings.defaultZoneTypes`
+ * (zone types are no longer part of `MapFileData` itself — see CLAUDE.md's "Settings" section).
+ * `tokenTemplates` needs no equivalent field: `tokenStats` already carries pre-resolved field/value
+ * pairs per token, so the public viewer never needs to look a template up.
  */
 export interface PublicMapSnapshot {
 	map: MapFileData;
 	notes: Record<string, PublicNoteContent>;
 	tokenStats: Record<string, PublicTokenStat[]>;
+	zoneTypes: ZoneType[];
 }

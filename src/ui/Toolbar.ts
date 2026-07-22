@@ -2,6 +2,7 @@ import { App, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
+import { MapManagerSettings } from "../settings/types";
 import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 
@@ -13,6 +14,7 @@ export interface ToolbarActions {
 
 export interface ToolbarDeps {
 	assetsFolder: string;
+	settings: MapManagerSettings;
 }
 
 function buildGridIcon(svg: SVGSVGElement, gridType: GridType): void {
@@ -412,7 +414,7 @@ export class Toolbar {
 			keepZoneOpt.value = "keep";
 			const clearZoneOpt = zoneSelect.createEl("option", { text: "Zone : aucune" });
 			clearZoneOpt.value = "clear";
-			for (const z of data.zoneTypes) {
+			for (const z of this.deps.settings.defaultZoneTypes) {
 				const opt = zoneSelect.createEl("option", { text: `Zone : ${z.name}` });
 				opt.value = z.id;
 			}

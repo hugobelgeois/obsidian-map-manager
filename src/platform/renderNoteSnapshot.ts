@@ -1,5 +1,5 @@
 import { App, Component, FileSystemAdapter, MarkdownRenderer, TFile, resolveSubpath } from "obsidian";
-import { CELLED_GRID_TYPES, MapFileData, PublicMapSnapshot, PublicTokenStat, splitLink } from "../data/mapData";
+import { CELLED_GRID_TYPES, MapFileData, PublicMapSnapshot, PublicTokenStat, TokenTemplate, ZoneType, splitLink } from "../data/mapData";
 import { toSiteAssetPath } from "../data/publicAssetPaths";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 
@@ -122,11 +122,11 @@ async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 }
 
 /** Same resolution `InfoPanel.renderTokenStats` uses, frozen into plain values for a token with no vault access. */
-function resolveTokenStats(app: App, data: MapFileData): Record<string, PublicTokenStat[]> {
+function resolveTokenStats(app: App, data: MapFileData, tokenTemplates: TokenTemplate[]): Record<string, PublicTokenStat[]> {
 	const stats: Record<string, PublicTokenStat[]> = {};
 	for (const token of data.tokens) {
 		if (!token.templateId) continue;
-		const template = data.tokenTemplates.find((t) => t.id === token.templateId);
+		const template = tokenTemplates.find((t) => t.id === token.templateId);
 		if (!template || template.fields.length === 0) continue;
 
 		let frontmatter: Record<string, unknown> | undefined;
@@ -142,14 +142,21 @@ function resolveTokenStats(app: App, data: MapFileData): Record<string, PublicTo
 
 /**
  * Bakes every linked note's rendered content and every pion's stat-block values that survive
- * redaction into a `PublicMapSnapshot`, so the exported viewer never needs vault/metadataCache
- * access. `redactedMap` must already have hidden content stripped — see `buildPublicSnapshot`.
+ * redaction into a `PublicMapSnapshot`, so the exported viewer never needs vault/metadataCache/
+ * plugin-settings access. `redactedMap` must already have hidden content stripped — see
+ * `buildPublicSnapshot`. `zoneTypes`/`tokenTemplates` come from live plugin settings (read once,
+ * at publish time — see `PublicMapSnapshot`), since they're no longer part of `MapFileData` itself.
  */
-export async function renderNoteSnapshot(app: App, redactedMap: MapFileData): Promise<PublicMapSnapshot> {
+export async function renderNoteSnapshot(
+	app: App,
+	redactedMap: MapFileData,
+	zoneTypes: ZoneType[],
+	tokenTemplates: TokenTemplate[]
+): Promise<PublicMapSnapshot> {
 	const notes: PublicMapSnapshot["notes"] = {};
 	for (const link of collectLinks(redactedMap)) {
 		const html = await renderNoteHtml(app, link);
 		if (html !== null) notes[link] = { html };
 	}
-	return { map: redactedMap, notes, tokenStats: resolveTokenStats(app, redactedMap) };
+	return { map: redactedMap, notes, tokenStats: resolveTokenStats(app, redactedMap, tokenTemplates), zoneTypes };
 }

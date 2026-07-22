@@ -16,6 +16,7 @@ export class MapView extends TextFileView {
 	private toolbarComp: Toolbar | null = null;
 	private infoPanelComp: InfoPanel | null = null;
 	private unsubscribeAutoPublish: (() => void) | null = null;
+	private unsubscribeSettings: (() => void) | null = null;
 	private rootEl: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
@@ -44,7 +45,8 @@ export class MapView extends TextFileView {
 		this.destroyComponents();
 		const parsed = parseMapData(data, this.plugin.getMapDefaults());
 		this.controller = new MapController(parsed, () => this.requestSave());
-		if (this.file) this.unsubscribeAutoPublish = wireAutoPublish(this.app, this.file, this.controller, this.plugin.settings.autoPublishDelaySeconds);
+		if (this.file) this.unsubscribeAutoPublish = wireAutoPublish(this.app, this.file, this.controller, this.plugin.settings);
+		this.unsubscribeSettings = this.plugin.onSettingsChanged(() => this.controller?.refresh());
 		this.mountComponents();
 	}
 
@@ -56,20 +58,31 @@ export class MapView extends TextFileView {
 	private mountComponents(): void {
 		if (!this.controller) return;
 		this.rootEl.empty();
-		this.toolbarComp = new Toolbar(this.rootEl, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller, {
-			recenter: () => this.canvasComp?.recenter(),
-			publish: () => void this.publishView(),
-		});
+		this.toolbarComp = new Toolbar(
+			this.rootEl,
+			this.app,
+			{ assetsFolder: this.plugin.settings.assetsFolder, settings: this.plugin.settings },
+			this.controller,
+			{
+				recenter: () => this.canvasComp?.recenter(),
+				publish: () => void this.publishView(),
+			}
+		);
 		const body = this.rootEl.createDiv({ cls: "map-manager-body" });
 		const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
 		this.canvasComp = new MapCanvas(canvasHost, this.controller, this.app, this.plugin.settings);
-		this.infoPanelComp = new InfoPanel(body, this.app, { assetsFolder: this.plugin.settings.assetsFolder }, this.controller);
+		this.infoPanelComp = new InfoPanel(
+			body,
+			this.app,
+			{ assetsFolder: this.plugin.settings.assetsFolder, settings: this.plugin.settings },
+			this.controller
+		);
 	}
 
 	private async publishView(): Promise<void> {
 		if (!this.controller || !this.file) return;
 		try {
-			const target = await publishPublicSnapshot(this.app, this.file, this.controller.getData());
+			const target = await publishPublicSnapshot(this.app, this.file, this.controller.getData(), this.plugin.settings);
 			new Notice(`Vue publique mise à jour : ${target.path}`);
 		} catch (e) {
 			console.error("Map Manager: échec de la publication de la vue publique", e);
@@ -82,10 +95,12 @@ export class MapView extends TextFileView {
 		this.toolbarComp?.destroy();
 		this.infoPanelComp?.destroy();
 		this.unsubscribeAutoPublish?.();
+		this.unsubscribeSettings?.();
 		this.canvasComp = null;
 		this.toolbarComp = null;
 		this.infoPanelComp = null;
 		this.unsubscribeAutoPublish = null;
+		this.unsubscribeSettings = null;
 	}
 
 	async onClose(): Promise<void> {
