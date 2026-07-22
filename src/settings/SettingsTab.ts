@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MapManagerPlugin from "../main";
-import { GRID_TYPE_LABELS, GRID_TYPES, GridType } from "../data/mapData";
+import { DEFAULT_TOKEN_TAB_NAMES, GRID_TYPE_LABELS, GRID_TYPES, GridType } from "../data/mapData";
 import { generateId } from "../utils";
 
 export class MapManagerSettingsTab extends PluginSettingTab {
@@ -168,7 +168,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Modèles de statistiques de pion")
 			.setDesc(
-				"Chaque modèle liste les propriétés (frontmatter YAML) de la note liée à afficher sur le pion, séparées par des virgules. Partagée par toutes les cartes, en direct : toute modification ici se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte."
+				"Chaque modèle liste les propriétés (frontmatter YAML) de la note liée à afficher sur le pion, séparées par des virgules, ainsi que les onglets par défaut proposés à un pion joueur utilisant ce modèle (ex. \"statistiques, inventaire, histoire\"), tant qu'il n'a pas personnalisé ses propres onglets. Partagée par toutes les cartes, en direct : toute modification ici se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte."
 			)
 			.setHeading();
 
@@ -190,6 +190,18 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 							.split(",")
 							.map((f) => f.trim())
 							.filter((f) => f.length > 0);
+						await this.plugin.saveSettings();
+					});
+				})
+				.addText((text) => {
+					text.setValue((template.defaultTabNames ?? []).join(", "));
+					text.setPlaceholder(`Onglets par défaut (ex. ${DEFAULT_TOKEN_TAB_NAMES.join(", ")})`);
+					text.onChange(async (value) => {
+						const names = value
+							.split(",")
+							.map((n) => n.trim())
+							.filter((n) => n.length > 0);
+						template.defaultTabNames = names.length > 0 ? names : undefined;
 						await this.plugin.saveSettings();
 					});
 				})

@@ -8,6 +8,8 @@ export interface MapManagerSettings {
 	defaultTokenTemplates: TokenTemplate[];
 	assetsFolder: string;
 	embedHeight: number;
+	/** Info panel width in pixels, dragged via its resize handle (see InfoPanel) — shared globally across every open map. */
+	infoPanelWidth: number;
 	defaultMinZoom: number;
 	defaultMaxZoom: number;
 	/** Subtle animated flicker on the fog of war's vision edge (off by default — a continuous redraw loop while active). */
@@ -38,6 +40,7 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	defaultTokenTemplates: DEFAULT_TOKEN_TEMPLATES.map((t) => ({ ...t, fields: [...t.fields] })),
 	assetsFolder: "Map Assets",
 	embedHeight: 500,
+	infoPanelWidth: 280,
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
 	fogAnimations: false,

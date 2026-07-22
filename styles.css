@@ -266,10 +266,27 @@
 }
 
 .map-manager-infopanel.is-open {
-	flex: 0 0 280px;
-	width: 280px;
+	flex: 0 0 var(--map-manager-infopanel-width, 280px);
+	width: var(--map-manager-infopanel-width, 280px);
 	overflow-y: auto;
 	padding: 0.75em;
+}
+
+.map-manager-infopanel-resize-handle {
+	flex: 0 0 0;
+	width: 0;
+	cursor: ew-resize;
+	position: relative;
+}
+
+.map-manager-infopanel-resize-handle.is-open {
+	flex: 0 0 5px;
+	width: 5px;
+}
+
+.map-manager-infopanel-resize-handle.is-open:hover,
+.map-manager-infopanel-resize-handle.is-open:active {
+	background: var(--interactive-accent);
 }
 
 .map-manager-infopanel-empty {
@@ -513,4 +530,35 @@
 
 .map-manager-token-stat-value {
 	font-weight: 600;
+}
+
+.map-manager-token-tabs-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3em;
+	margin-bottom: 0.5em;
+}
+
+.map-manager-token-tab-row {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.3em;
+	padding: 0.3em;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s, 4px);
+}
+
+.map-manager-token-tab-row.is-active {
+	border-color: var(--interactive-accent);
+}
+
+.map-manager-token-tab-name {
+	flex: 1 1 80px;
+	min-width: 60px;
+}
+
+.map-manager-token-tab-link {
+	flex: 1 1 auto;
+	min-width: 0;
 }

@@ -196,7 +196,7 @@ export class MapCanvas {
 			menu.addItem((item) => item.setTitle("Placer un tampon ici").setIcon("map-pin").onClick(() => this.addMarkerAt(px, py)));
 			hasItem = true;
 		}
-		if (this.controller.mode === "view") {
+		if (this.controller.mode === "edit") {
 			menu.addItem((item) => item.setTitle("Placer un pion ici").setIcon("user").onClick(() => this.addTokenAt(px, py)));
 			hasItem = true;
 		}
@@ -221,14 +221,20 @@ export class MapCanvas {
 		this.lastPointer = { x: e.clientX, y: e.clientY };
 		this.canvas.setPointerCapture(e.pointerId);
 
-		// Tokens are only interactive in view mode; edit mode is for the map's structure (grid, zones, layers, markers, brush/fill).
-		if (this.controller.mode === "view") {
-			const hit = this.findTokenAtScreenPoint(px, py);
-			if (hit) {
-				this.draggingToken = { token: hit, currentWorld: screenToWorld(px, py, this.transform) };
+		// Tokens are selectable in both modes, but only draggable/movable in view mode — edit mode
+		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
+		// selects the token instead of letting the click fall through to panning/tools.
+		const tokenHit = this.findTokenAtScreenPoint(px, py);
+		if (tokenHit) {
+			if (this.controller.mode === "view") {
+				this.draggingToken = { token: tokenHit, currentWorld: screenToWorld(px, py, this.transform) };
+			} else {
+				this.controller.selectToken(tokenHit.id);
+				this.toolConsumedClick = true;
 			}
 			return;
 		}
+		if (this.controller.mode === "view") return;
 
 		const data = this.controller.getData();
 		if (data.gridType === "none") {
@@ -858,7 +864,7 @@ export class MapCanvas {
 		this.controller.selectMarker(marker.id);
 	}
 
-	/** Places a token at a specific screen point (view-mode right-click menu) rather than the viewport center. */
+	/** Places a token at a specific screen point (edit-mode right-click menu) rather than the viewport center. */
 	private addTokenAt(px: number, py: number): void {
 		const world = screenToWorld(px, py, this.transform);
 		if (this.controller.getData().gridType === "none") {

@@ -10,11 +10,16 @@ import {
 	Marker,
 	TOKEN_SIZES,
 	Token,
+	TokenTab,
 	TokenTemplate,
 	VisionBlockerType,
+	findStatsTab,
+	generateLocalId,
+	getTokenTabs,
 	linkTabLabel,
 	makeLink,
 	splitLink,
+	tokenStatsSourceLink,
 } from "../data/mapData";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 import { MapManagerSettings } from "../settings/types";
@@ -25,7 +30,12 @@ import { HeadingSuggestModal } from "./HeadingSuggestModal";
 export interface InfoPanelDeps {
 	assetsFolder: string;
 	settings: MapManagerSettings;
+	/** Persists a new panel width (px) after a resize-handle drag — see `MIN_PANEL_WIDTH`/`MAX_PANEL_WIDTH`. */
+	onResizePanel?: (width: number) => void;
 }
+
+const MIN_PANEL_WIDTH = 220;
+const MAX_PANEL_WIDTH = 640;
 
 const QUICK_STAMPS = ["⚔️", "🏰", "💰", "🐉", "🌲", "⛰️", "🌊", "🔥", "⭐", "📍", "💀", "🏠"];
 const QUICK_TOKEN_ICONS = [
@@ -52,10 +62,14 @@ const QUICK_TOKEN_ICONS = [
 
 export class InfoPanel {
 	el: HTMLElement;
+	private resizeHandleEl: HTMLElement;
 	private unsubscribe: () => void;
 	private renderComponents: Component[] = [];
 	private activeLinkIndex = 0;
 	private lastRenderedKey: string | null = null;
+	/** Reset whenever the selected token changes — see `resetTokenTabStateIfNeeded`. */
+	private activeTokenTabId: string | null = null;
+	private lastRenderedTokenId: string | null = null;
 	/**
 	 * While a slider (or its paired number input) is being dragged/typed into, we still push
 	 * every intermediate value to the controller (so the map updates live), but we must NOT
@@ -65,7 +79,10 @@ export class InfoPanel {
 	private suppressRerender = false;
 
 	constructor(container: HTMLElement, private app: App, private deps: InfoPanelDeps, private controller: MapController) {
+		this.resizeHandleEl = container.createDiv({ cls: "map-manager-infopanel-resize-handle" });
 		this.el = container.createDiv({ cls: "map-manager-infopanel" });
+		this.applyWidth();
+		this.wireResizeHandle();
 		this.render();
 		this.unsubscribe = this.controller.onChange(() => {
 			if (this.suppressRerender) return;
@@ -78,19 +95,54 @@ export class InfoPanel {
 		this.clearRenderComponents();
 	}
 
+	private setOpen(open: boolean): void {
+		this.el.toggleClass("is-open", open);
+		this.resizeHandleEl.toggleClass("is-open", open);
+	}
+
+	private applyWidth(): void {
+		const width = this.deps.settings.infoPanelWidth || 280;
+		this.el.style.setProperty("--map-manager-infopanel-width", `${width}px`);
+	}
+
+	private wireResizeHandle(): void {
+		this.resizeHandleEl.onpointerdown = (e: PointerEvent) => {
+			e.preventDefault();
+			const startX = e.clientX;
+			const startWidth = this.deps.settings.infoPanelWidth || 280;
+			this.resizeHandleEl.setPointerCapture(e.pointerId);
+
+			const onMove = (moveEvent: PointerEvent) => {
+				const delta = moveEvent.clientX - startX;
+				const width = Math.min(MAX_PANEL_WIDTH, Math.max(MIN_PANEL_WIDTH, startWidth - delta));
+				this.deps.settings.infoPanelWidth = width;
+				this.applyWidth();
+			};
+			const onUp = () => {
+				this.resizeHandleEl.releasePointerCapture(e.pointerId);
+				this.resizeHandleEl.removeEventListener("pointermove", onMove);
+				this.resizeHandleEl.removeEventListener("pointerup", onUp);
+				this.deps.onResizePanel?.(this.deps.settings.infoPanelWidth || 280);
+			};
+			this.resizeHandleEl.addEventListener("pointermove", onMove);
+			this.resizeHandleEl.addEventListener("pointerup", onUp);
+		};
+	}
+
 	private clearRenderComponents(): void {
 		for (const c of this.renderComponents) c.unload();
 		this.renderComponents = [];
 	}
 
 	private render(): void {
+		this.applyWidth();
 		this.clearRenderComponents();
 		this.el.empty();
 
 		if (this.controller.selectedTokenId) {
 			const found = this.controller.findToken(this.controller.selectedTokenId);
 			if (found) {
-				this.el.addClass("is-open");
+				this.setOpen(true);
 				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
 				header.createEl("h4", { text: "Pion" });
 				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
@@ -104,7 +156,7 @@ export class InfoPanel {
 		if (this.controller.selectedMarkerId) {
 			const found = this.controller.findMarker(this.controller.selectedMarkerId);
 			if (found) {
-				this.el.addClass("is-open");
+				this.setOpen(true);
 				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
 				header.createEl("h4", { text: "Tampon" });
 				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
@@ -122,7 +174,7 @@ export class InfoPanel {
 		if (this.controller.selectedWallPointId) {
 			const found = this.controller.findWallPoint(this.controller.selectedWallPointId);
 			if (found) {
-				this.el.addClass("is-open");
+				this.setOpen(true);
 				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
 				header.createEl("h4", { text: "Point de mur" });
 				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
@@ -136,11 +188,11 @@ export class InfoPanel {
 		const key = this.controller.selectedCellKey;
 		const data = this.controller.getData();
 		if (!key || data.gridType === "none") {
-			this.el.removeClass("is-open");
+			this.setOpen(false);
 			this.el.createDiv({ cls: "map-manager-infopanel-empty", text: "Cliquez sur une case ou un pion pour voir ou modifier ses informations." });
 			return;
 		}
-		this.el.addClass("is-open");
+		this.setOpen(true);
 		if (this.lastRenderedKey !== key) {
 			this.activeLinkIndex = 0;
 			this.lastRenderedKey = key;
@@ -322,9 +374,16 @@ export class InfoPanel {
 		deleteBtn.onclick = () => this.controller.removeWallPoint(pointId);
 	}
 
-	// ---- Tokens (always editable, in both edit and view mode) ----
+	// ---- Tokens (full edit panel in edit mode; reduced read-mostly panel in view mode) ----
 
 	private renderTokenPanel(token: Token): void {
+		this.resetTokenTabStateIfNeeded(token);
+
+		if (this.controller.mode === "view") {
+			this.renderTokenViewPanel(token);
+			return;
+		}
+
 		const iconField = this.el.createDiv({ cls: "map-manager-field" });
 		iconField.createEl("label", { text: "Icône" });
 		const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
@@ -382,23 +441,6 @@ export class InfoPanel {
 		colorInput.value = token.color ?? DEFAULT_TOKEN_COLOR;
 		colorInput.onchange = () => this.controller.updateToken(token.id, (t) => (t.color = colorInput.value));
 
-		const linkField = this.el.createDiv({ cls: "map-manager-field" });
-		linkField.createEl("label", { text: "Note liée" });
-		if (token.link) {
-			const pill = linkField.createDiv({ cls: "map-manager-link-pill" });
-			const a = pill.createEl("a", { text: linkTabLabel(token.link), href: "#" });
-			const linkValue = token.link;
-			a.onclick = (e) => {
-				e.preventDefault();
-				void this.app.workspace.openLinkText(linkValue, "", false);
-			};
-			const remove = pill.createEl("span", { text: "×", cls: "map-manager-link-remove" });
-			remove.onclick = () => this.controller.updateToken(token.id, (t) => (t.link = undefined));
-		} else {
-			const pickBtn = linkField.createEl("button", { text: "Lier une note", cls: "map-manager-btn" });
-			pickBtn.onclick = () => this.pickLink((link) => this.controller.updateToken(token.id, (t) => (t.link = link)));
-		}
-
 		const templateField = this.el.createDiv({ cls: "map-manager-field" });
 		templateField.createEl("label", { text: "Modèle de statistiques" });
 		const templateSelect = templateField.createEl("select");
@@ -414,15 +456,154 @@ export class InfoPanel {
 			templateField.createDiv({ cls: "map-manager-view-empty", text: "Aucun modèle défini (Réglages du plugin)." });
 		}
 
-		this.renderTokenStats(token);
-		if (token.link) {
-			const contentEl = this.el.createDiv({ cls: "map-manager-view-content" });
-			void this.renderLinkContent(token.link, contentEl);
-		}
+		this.renderTokenTabsEditor(token);
 
 		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 		const deleteBtn = footer.createEl("button", { text: "Supprimer le pion", cls: "map-manager-btn map-manager-btn-danger" });
 		deleteBtn.onclick = () => this.controller.removeToken(token.id);
+	}
+
+	/**
+	 * View mode only shows what a player needs mid-session: their vision direction (player tokens
+	 * only, so they can turn to face somewhere) and their tabs' read-only content (stats/inventory/
+	 * story/... — see `renderTokenTabsReadOnly`, which applies to both player and entity tokens).
+	 * Everything else (icon/image/name/category/size/color/template picker/delete) is edit-only.
+	 */
+	private renderTokenViewPanel(token: Token): void {
+		if ((token.category ?? "entity") === "player") {
+			const wrap = this.el.createDiv({ cls: "map-manager-field" });
+			const row = wrap.createDiv({ cls: "map-manager-vision-row" });
+			this.makeSliderField(row, "Direction (°, 0=est, horaire)", token.visionDirection ?? DEFAULT_VISION_DIRECTION, 0, 360, (v) =>
+				this.controller.updateToken(token.id, (t) => (t.visionDirection = ((v % 360) + 360) % 360))
+			);
+		}
+
+		this.renderTokenTabsReadOnly(token);
+	}
+
+	// ---- Token tabs (Statistiques/Inventaire/Histoire by default, customizable per token, any category) ----
+
+	private resetTokenTabStateIfNeeded(token: Token): void {
+		if (this.lastRenderedTokenId !== token.id) {
+			this.activeTokenTabId = null;
+			this.lastRenderedTokenId = token.id;
+		}
+	}
+
+	/** Resolves the tab to preview below the tab strip, falling back to the first tab and normalizing the tracked id. */
+	private resolveActiveTab(tabs: TokenTab[]): TokenTab | undefined {
+		if (!tabs.some((t) => t.id === this.activeTokenTabId)) this.activeTokenTabId = tabs[0]?.id ?? null;
+		return tabs.find((t) => t.id === this.activeTokenTabId);
+	}
+
+	/** Materializes the (possibly still-lazy default) tab list onto the token, then applies `mutator` to the tab matching `tabId`. */
+	private updateTokenTabs(token: Token, currentTabs: TokenTab[], tabId: string, mutator: (tab: TokenTab) => void): void {
+		this.controller.updateToken(token.id, (t) => {
+			const next = currentTabs.map((tab) => ({ ...tab }));
+			const target = next.find((tab) => tab.id === tabId);
+			if (target) mutator(target);
+			t.tabs = next;
+			t.link = undefined;
+		});
+	}
+
+	private renderTokenTabsEditor(token: Token): void {
+		const tabs = getTokenTabs(token, this.deps.settings.defaultTokenTemplates);
+		const statsTabId = findStatsTab(tabs)?.id;
+
+		const section = this.el.createDiv({ cls: "map-manager-field" });
+		section.createEl("label", { text: "Onglets" });
+
+		const list = section.createDiv({ cls: "map-manager-token-tabs-list" });
+		for (const tab of tabs) {
+			const row = list.createDiv({ cls: "map-manager-token-tab-row" });
+			if (tab.id === this.activeTokenTabId) row.addClass("is-active");
+
+			const selectBtn = row.createEl("button", { text: tab.id === this.activeTokenTabId ? "●" : "○", cls: "map-manager-btn map-manager-btn-icon" });
+			selectBtn.title = "Afficher cet onglet ci-dessous";
+			selectBtn.onclick = () => {
+				this.activeTokenTabId = tab.id;
+				this.render();
+			};
+
+			const nameInput = row.createEl("input", { type: "text", cls: "map-manager-token-tab-name" });
+			nameInput.value = tab.name;
+			nameInput.onchange = () => this.updateTokenTabs(token, tabs, tab.id, (t) => (t.name = nameInput.value || tab.name));
+
+			if (tab.link) {
+				const pill = row.createDiv({ cls: "map-manager-link-pill map-manager-token-tab-link" });
+				const a = pill.createEl("a", { text: linkTabLabel(tab.link), href: "#" });
+				const linkValue = tab.link;
+				a.onclick = (e) => {
+					e.preventDefault();
+					void this.app.workspace.openLinkText(linkValue, "", false);
+				};
+				const remove = pill.createEl("span", { text: "×", cls: "map-manager-link-remove" });
+				remove.onclick = () => this.updateTokenTabs(token, tabs, tab.id, (t) => (t.link = undefined));
+			} else {
+				const pickBtn = row.createEl("button", { text: "Lier une note", cls: "map-manager-btn" });
+				pickBtn.onclick = () => this.pickLink((link) => this.updateTokenTabs(token, tabs, tab.id, (t) => (t.link = link)));
+			}
+
+			const removeBtn = row.createEl("button", { text: "🗑", cls: "map-manager-btn map-manager-btn-icon" });
+			removeBtn.title = "Supprimer cet onglet";
+			removeBtn.onclick = () => {
+				const next = tabs.filter((t) => t.id !== tab.id);
+				if (this.activeTokenTabId === tab.id) this.activeTokenTabId = next[0]?.id ?? null;
+				this.controller.updateToken(token.id, (t) => {
+					t.tabs = next;
+					t.link = undefined;
+				});
+			};
+		}
+
+		const addBtn = section.createEl("button", { text: "Ajouter un onglet", cls: "map-manager-btn" });
+		addBtn.onclick = () => {
+			const newTab: TokenTab = { id: generateLocalId("tab"), name: `Onglet ${tabs.length + 1}` };
+			this.activeTokenTabId = newTab.id;
+			this.controller.updateToken(token.id, (t) => {
+				t.tabs = [...tabs, newTab];
+				t.link = undefined;
+			});
+		};
+
+		const activeTab = this.resolveActiveTab(tabs);
+		if (!activeTab) return;
+
+		if (activeTab.id === statsTabId) this.renderTokenStats(token);
+
+		if (activeTab.link) {
+			const contentEl = this.el.createDiv({ cls: "map-manager-view-content" });
+			void this.renderLinkContent(activeTab.link, contentEl);
+		}
+	}
+
+	private renderTokenTabsReadOnly(token: Token): void {
+		const tabs = getTokenTabs(token, this.deps.settings.defaultTokenTemplates);
+		if (tabs.length === 0) return;
+		const activeTab = this.resolveActiveTab(tabs);
+		if (!activeTab) return;
+
+		// The stats table (from the "Statistiques" tab's note) stays visible no matter which tab
+		// is active — it's the character's vitals, not tab-specific content.
+		this.renderTokenStats(token);
+
+		const tabBar = this.el.createDiv({ cls: "map-manager-view-tabs" });
+		for (const tab of tabs) {
+			const btn = tabBar.createEl("button", { text: tab.name, cls: "map-manager-tab" });
+			if (tab.id === activeTab.id) btn.addClass("is-active");
+			btn.onclick = () => {
+				this.activeTokenTabId = tab.id;
+				this.render();
+			};
+		}
+
+		if (activeTab.link) {
+			const contentEl = this.el.createDiv({ cls: "map-manager-view-content" });
+			void this.renderLinkContent(activeTab.link, contentEl);
+		} else {
+			this.el.createDiv({ cls: "map-manager-view-empty", text: "Aucune note liée à cet onglet." });
+		}
 	}
 
 	private pickVaultTokenImage(token: Token): void {
@@ -536,8 +717,9 @@ export class InfoPanel {
 
 		const table = this.el.createDiv({ cls: "map-manager-token-stats" });
 		let frontmatter: Record<string, unknown> | undefined;
-		if (token.link) {
-			const { path } = splitLink(token.link);
+		const statsLink = tokenStatsSourceLink(token, this.deps.settings.defaultTokenTemplates);
+		if (statsLink) {
+			const { path } = splitLink(statsLink);
 			const file = this.app.metadataCache.getFirstLinkpathDest(path, "") ?? this.app.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
 		}

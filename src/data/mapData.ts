@@ -87,9 +87,49 @@ export interface TokenTemplate {
 	id: string;
 	name: string;
 	fields: string[];
+	/** Default tab names for a player token using this template (see `getTokenTabs`) — falls back to `DEFAULT_TOKEN_TAB_NAMES` when unset/empty. */
+	defaultTabNames?: string[];
 }
 
 export type TokenCategory = "player" | "entity";
+
+/** One note tab on a player token (see `getTokenTabs`) — e.g. "Statistiques"/"Inventaire"/"Histoire", freely renamed/added/removed per token. */
+export interface TokenTab {
+	id: string;
+	name: string;
+	link?: string;
+}
+
+/** Fallback default tab names for a token with no template, or whose template doesn't customize them — see `getTokenTabs`. */
+export const DEFAULT_TOKEN_TAB_NAMES: readonly string[] = ["Statistiques", "Inventaire", "Histoire"];
+
+/**
+ * A token's note tabs (any category — player or entity). `token.tabs` is left `undefined` until
+ * someone actually edits a tab (rename/link/add/remove) — until then this returns the token's
+ * template's configured default tab names (Settings → "Modèles de statistiques de pion" →
+ * `defaultTabNames`), or `DEFAULT_TOKEN_TAB_NAMES` if the token has no template or its template
+ * doesn't customize them, seeded with the token's legacy single `link` (if any) on the first tab,
+ * so pre-existing tokens don't lose their note.
+ * Once `token.tabs` is set (even to `[]`, e.g. every tab was deleted), it's authoritative.
+ */
+export function getTokenTabs(token: Token, templates: TokenTemplate[]): TokenTab[] {
+	if (token.tabs !== undefined) return token.tabs;
+	const template = templates.find((t) => t.id === token.templateId);
+	const names = template?.defaultTabNames && template.defaultTabNames.length > 0 ? template.defaultTabNames : DEFAULT_TOKEN_TAB_NAMES;
+	const tabs: TokenTab[] = names.map((name, i) => ({ id: `default-${i}`, name }));
+	if (token.link && tabs[0]) tabs[0] = { ...tabs[0], link: token.link };
+	return tabs;
+}
+
+/** The tab treated as the stats source for `renderTokenStats`/the public snapshot (matched by name, not a fixed id, so it survives the tab being deleted and re-added). */
+export function findStatsTab(tabs: TokenTab[]): TokenTab | undefined {
+	return tabs.find((t) => t.name.trim().toLowerCase() === "statistiques");
+}
+
+/** Link to resolve a token's stat-block frontmatter from: its "Statistiques" tab, regardless of category. */
+export function tokenStatsSourceLink(token: Token, templates: TokenTemplate[]): string | undefined {
+	return findStatsTab(getTokenTabs(token, templates))?.link;
+}
 
 export interface Token {
 	id: string;
@@ -100,8 +140,11 @@ export interface Token {
 	y?: number;
 	icon: string;
 	label?: string;
+	/** Legacy single note link, from before per-tab links — superseded by `tabs` (see `getTokenTabs`), which seeds its first tab from this on first use. */
 	link?: string;
 	templateId?: string;
+	/** Note tabs (Statistiques/Inventaire/Histoire by default), any token category — see `getTokenTabs`. */
+	tabs?: TokenTab[];
 	/** How many cells wide/tall the token occupies (square grids only; 1 = a single cell). Defaults to 1. */
 	size?: number;
 	/** Border color (hex string). Defaults to a neutral dark gray when unset. */
@@ -319,6 +362,16 @@ function isTokenCategory(value: unknown): value is TokenCategory {
 	return value === "player" || value === "entity";
 }
 
+function parseTokenTab(value: unknown): TokenTab | null {
+	if (!isRecord(value) || !isString(value.id) || !isString(value.name)) return null;
+	return { id: value.id, name: value.name, link: isString(value.link) ? value.link : undefined };
+}
+
+function parseTokenTabArray(raw: unknown): TokenTab[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	return raw.map(parseTokenTab).filter((t): t is TokenTab => t !== null);
+}
+
 function parseToken(value: unknown): Token | null {
 	if (!isRecord(value) || !isString(value.id) || !isString(value.icon)) return null;
 	return {
@@ -330,6 +383,7 @@ function parseToken(value: unknown): Token | null {
 		label: isString(value.label) ? value.label : undefined,
 		link: isString(value.link) ? value.link : undefined,
 		templateId: isString(value.templateId) ? value.templateId : undefined,
+		tabs: parseTokenTabArray(value.tabs),
 		size: typeof value.size === "number" && value.size > 0 ? value.size : undefined,
 		color: isString(value.color) ? value.color : undefined,
 		category: isTokenCategory(value.category) ? value.category : undefined,

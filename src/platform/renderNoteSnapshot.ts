@@ -1,9 +1,19 @@
 import { App, Component, FileSystemAdapter, MarkdownRenderer, TFile, resolveSubpath } from "obsidian";
-import { CELLED_GRID_TYPES, MapFileData, PublicMapSnapshot, PublicTokenStat, TokenTemplate, ZoneType, splitLink } from "../data/mapData";
+import {
+	CELLED_GRID_TYPES,
+	MapFileData,
+	PublicMapSnapshot,
+	PublicTokenStat,
+	TokenTemplate,
+	ZoneType,
+	getTokenTabs,
+	splitLink,
+	tokenStatsSourceLink,
+} from "../data/mapData";
 import { toSiteAssetPath } from "../data/publicAssetPaths";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 
-/** Every link reachable from a (already-redacted) map's surviving cells/markers/tokens. */
+/** Every link reachable from a (already-redacted, already tab-materialized — see `materializeTokenTabs`) map's surviving cells/markers/tokens. */
 function collectLinks(data: MapFileData): Set<string> {
 	const links = new Set<string>();
 	for (const layer of data.layers) {
@@ -17,9 +27,19 @@ function collectLinks(data: MapFileData): Set<string> {
 		}
 	}
 	for (const token of data.tokens) {
-		if (token.link) links.add(token.link);
+		for (const tab of token.tabs ?? []) if (tab.link) links.add(tab.link);
 	}
 	return links;
+}
+
+/**
+ * Freezes every token's (possibly still-lazy) tab list — see `getTokenTabs` — onto the token
+ * itself, resolving `TokenTemplate.defaultTabNames` now while `tokenTemplates` (live plugin
+ * settings) is still available. The exported site has neither vault nor settings access, so by the
+ * time this snapshot is written, `token.tabs` must already be concrete for every token.
+ */
+function materializeTokenTabs(data: MapFileData, tokenTemplates: TokenTemplate[]): MapFileData {
+	return { ...data, tokens: data.tokens.map((token) => ({ ...token, tabs: getTokenTabs(token, tokenTemplates) })) };
 }
 
 /** Un-navigable version of Obsidian's rendered internal/external links — keeps the text, drops the ability to click through. */
@@ -130,8 +150,9 @@ function resolveTokenStats(app: App, data: MapFileData, tokenTemplates: TokenTem
 		if (!template || template.fields.length === 0) continue;
 
 		let frontmatter: Record<string, unknown> | undefined;
-		if (token.link) {
-			const { path } = splitLink(token.link);
+		const statsLink = tokenStatsSourceLink(token, tokenTemplates);
+		if (statsLink) {
+			const { path } = splitLink(statsLink);
 			const file = app.metadataCache.getFirstLinkpathDest(path, "") ?? app.vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) frontmatter = app.metadataCache.getFileCache(file)?.frontmatter;
 		}
@@ -153,10 +174,11 @@ export async function renderNoteSnapshot(
 	zoneTypes: ZoneType[],
 	tokenTemplates: TokenTemplate[]
 ): Promise<PublicMapSnapshot> {
+	const map = materializeTokenTabs(redactedMap, tokenTemplates);
 	const notes: PublicMapSnapshot["notes"] = {};
-	for (const link of collectLinks(redactedMap)) {
+	for (const link of collectLinks(map)) {
 		const html = await renderNoteHtml(app, link);
 		if (html !== null) notes[link] = { html };
 	}
-	return { map: redactedMap, notes, tokenStats: resolveTokenStats(app, redactedMap, tokenTemplates), zoneTypes };
+	return { map, notes, tokenStats: resolveTokenStats(app, map, tokenTemplates), zoneTypes };
 }

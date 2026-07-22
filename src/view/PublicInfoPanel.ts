@@ -1,4 +1,4 @@
-import { CellData, MapFileData, Marker, TOKEN_SIZES, Token, linkTabLabel } from "../data/mapData";
+import { CellData, MapFileData, Marker, TOKEN_SIZES, Token, getTokenTabs, linkTabLabel } from "../data/mapData";
 import { PublicViewController } from "./PublicViewController";
 
 function findCell(data: MapFileData, key: string): CellData | undefined {
@@ -35,6 +35,7 @@ export class PublicInfoPanel {
 	el: HTMLElement;
 	private unsubscribe: () => void;
 	private activeLinkIndex = 0;
+	private activeTokenTabId: string | null = null;
 	private lastSelectionKey: string | null = null;
 
 	constructor(container: HTMLElement, private controller: PublicViewController) {
@@ -62,6 +63,7 @@ export class PublicInfoPanel {
 		const selectionKey = JSON.stringify(selection);
 		if (this.lastSelectionKey !== selectionKey) {
 			this.activeLinkIndex = 0;
+			this.activeTokenTabId = null;
 			this.lastSelectionKey = selectionKey;
 		}
 
@@ -139,23 +141,60 @@ export class PublicInfoPanel {
 		this.el.appendChild(icon);
 
 		const meta = el("div", "map-manager-field");
-		const category = (token.category ?? "entity") === "player" ? "Joueur" : "Entité";
 		const size = TOKEN_SIZES.includes(token.size ?? 1) ? (token.size ?? 1) : 1;
-		meta.textContent = `${category} — ${size}×${size} case${size > 1 ? "s" : ""}`;
+		meta.textContent = `${(token.category ?? "entity") === "player" ? "Joueur" : "Entité"} — ${size}×${size} case${size > 1 ? "s" : ""}`;
 		this.el.appendChild(meta);
 
-		const stats = this.controller.snapshot.tokenStats[token.id];
-		if (stats && stats.length > 0) {
-			const table = el("div", "map-manager-token-stats");
-			for (const stat of stats) {
-				const row = el("div", "map-manager-token-stat-row");
-				row.appendChild(el("span", "map-manager-token-stat-key", stat.field));
-				row.appendChild(el("span", "map-manager-token-stat-value", stat.value));
-				table.appendChild(row);
-			}
-			this.el.appendChild(table);
-		}
+		this.renderTokenTabs(token);
+	}
 
-		if (token.link) this.renderLinks([token.link]);
+	private renderTokenStatsTable(stats: { field: string; value: string }[] | undefined): void {
+		if (!stats || stats.length === 0) return;
+		const table = el("div", "map-manager-token-stats");
+		for (const stat of stats) {
+			const row = el("div", "map-manager-token-stat-row");
+			row.appendChild(el("span", "map-manager-token-stat-key", stat.field));
+			row.appendChild(el("span", "map-manager-token-stat-value", stat.value));
+			table.appendChild(row);
+		}
+		this.el.appendChild(table);
+	}
+
+	/**
+	 * A token's Statistiques/Inventaire/Histoire (or customized) tabs, any category — read-only
+	 * counterpart to `InfoPanel.renderTokenTabsReadOnly`. `token.tabs` is always concrete by the
+	 * time it reaches this snapshot — `renderNoteSnapshot.materializeTokenTabs` resolves the
+	 * template-based defaults at publish time, so no template lookup (the second `getTokenTabs`
+	 * argument) is ever needed here — the exported site has no plugin settings to read one from.
+	 */
+	private renderTokenTabs(token: Token): void {
+		const tabs = getTokenTabs(token, []);
+		if (tabs.length === 0) return;
+		if (!tabs.some((t) => t.id === this.activeTokenTabId)) this.activeTokenTabId = tabs[0]?.id ?? null;
+		const activeTab = tabs.find((t) => t.id === this.activeTokenTabId) ?? tabs[0];
+		if (!activeTab) return;
+
+		// The stats table stays visible no matter which tab is active — it's the character's
+		// vitals, not tab-specific content.
+		this.renderTokenStatsTable(this.controller.snapshot.tokenStats[token.id]);
+
+		const tabBar = el("div", "map-manager-view-tabs");
+		for (const tab of tabs) {
+			const btn = el("button", "map-manager-tab", tab.name) as HTMLButtonElement;
+			if (tab.id === activeTab.id) btn.classList.add("is-active");
+			btn.onclick = () => {
+				this.activeTokenTabId = tab.id;
+				this.render();
+			};
+			tabBar.appendChild(btn);
+		}
+		this.el.appendChild(tabBar);
+
+		const content = el("div", "map-manager-view-content");
+		const html = activeTab.link ? this.controller.snapshot.notes[activeTab.link]?.html : undefined;
+		// eslint-disable-next-line @microsoft/sdl/no-inner-html -- pre-rendered and sanitized by renderNoteSnapshot.ts before export; nothing user-controlled reaches this assignment.
+		if (html !== undefined) content.innerHTML = html;
+		else content.appendChild(el("div", "map-manager-view-empty", "Aucune note liée à cet onglet."));
+		this.el.appendChild(content);
 	}
 }

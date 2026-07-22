@@ -74,7 +74,14 @@ export class MapView extends TextFileView {
 		this.infoPanelComp = new InfoPanel(
 			body,
 			this.app,
-			{ assetsFolder: this.plugin.settings.assetsFolder, settings: this.plugin.settings },
+			{
+				assetsFolder: this.plugin.settings.assetsFolder,
+				settings: this.plugin.settings,
+				onResizePanel: (width) => {
+					this.plugin.settings.infoPanelWidth = width;
+					void this.plugin.saveSettings();
+				},
+			},
 			this.controller
 		);
 	}

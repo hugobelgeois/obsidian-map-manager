@@ -70,7 +70,19 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
 	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings);
 	canvasRef = canvas;
-	const infoPanel = new InfoPanel(body, app, { assetsFolder: plugin.settings.assetsFolder, settings: plugin.settings }, controller);
+	const infoPanel = new InfoPanel(
+		body,
+		app,
+		{
+			assetsFolder: plugin.settings.assetsFolder,
+			settings: plugin.settings,
+			onResizePanel: (width) => {
+				plugin.settings.infoPanelWidth = width;
+				void plugin.saveSettings();
+			},
+		},
+		controller
+	);
 
 	ctx.addChild(
 		new MapEmbedChild(host, () => {
