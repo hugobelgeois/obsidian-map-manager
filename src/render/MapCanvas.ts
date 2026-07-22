@@ -1,5 +1,5 @@
 import { App, Menu, Notice } from "obsidian";
-import { MapController } from "../controller/MapController";
+import { MapController, MapMode } from "../controller/MapController";
 import { MapManagerSettings } from "../settings/types";
 import { DEFAULT_TOKEN_COLOR, Marker, Token, WallPoint, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
 import {
@@ -35,6 +35,8 @@ import {
 } from "../grid/fog";
 
 const DRAG_THRESHOLD = 4;
+/** How long a "ping" ring (see `triggerPing`) expands and fades before disappearing, in ms. */
+const PING_DURATION_MS = 1200;
 /** Radius as a fraction of (cellVisualWidth * token.size): 0.475 → a diameter equal to 95% of the cell's width. */
 const TOKEN_SIZE_RATIO = 0.475;
 /** Below this on-screen cell size (in px), the grid/cell overlay auto-hides until zoomed back in. */
@@ -128,6 +130,28 @@ interface PlayerVisionRays extends VisionRays {
 	phase: number;
 }
 
+export interface MapCanvasOptions {
+	/**
+	 * Marks this instance as a passive mirror of another (interactive) MapCanvas showing the same
+	 * MapController — see `MapPlayerMirrorView`/`mirrorRegistry`. A mirror never attaches its own
+	 * pointer/wheel input; instead of managing pan/zoom locally, `render()` re-derives its own pan
+	 * from the last camera pushed via `setMirrorCamera` (the source's zoom and the world point at the
+	 * center of *its* viewport — see `getViewCenter()` for why raw panX/panY can't be copied as-is
+	 * across differently sized canvases). That camera is deliberately *not* re-read from the source on
+	 * every render: the source's `getViewCenter()` depends on its own current viewport size, which
+	 * also shifts for reasons that have nothing to do with the GM actually panning/zooming — e.g. its
+	 * InfoPanel opening and narrowing the canvas. Re-reading it on every mirror render (which happens
+	 * on any shared-controller change, like a selection) would drag the mirror's view along with that.
+	 */
+	isMirror?: boolean;
+	/** Forces fog to always render regardless of `data.fogEnabled`/mode — the player mirror shows fog even while the source window has it toggled off. */
+	forceFog?: boolean;
+	/** Called whenever pan/zoom changes from user input (wheel, drag-pan, recenter). Panning/zooming never touches `MapController` (no `notify()`), so a mirror wouldn't otherwise learn about it. */
+	onViewportChange?: () => void;
+	/** Called with the world position of a plain click (see `triggerPing`) so a mirror can show the same ping ring — a click isn't a `MapController` mutation either. */
+	onPing?: (x: number, y: number) => void;
+}
+
 export class MapCanvas {
 	private canvas: HTMLCanvasElement;
 	private ctx: CanvasRenderingContext2D;
@@ -135,6 +159,8 @@ export class MapCanvas {
 	private transform: ViewTransform = { zoom: 1, panX: 0, panY: 0 };
 	private viewportW = 0;
 	private viewportH = 0;
+	/** Mirror-only: the source's last-pushed world-space camera — see `setMirrorCamera` and the note on `MapCanvasOptions.isMirror`. */
+	private mirrorCamera: { zoom: number; x: number; y: number } | null = null;
 
 	private bgImages: Map<string, BackgroundEntry> = new Map();
 	/** Keyed by token id (not path), since several tokens could share the same image. */
@@ -153,6 +179,11 @@ export class MapCanvas {
 	private fogBlurCtx: CanvasRenderingContext2D;
 	/** Non-null while the fog-tremble animation loop (settings.fogAnimations) is actively re-rendering every frame. */
 	private animationFrameId: number | null = null;
+
+	/** The "look here" ring shown after a plain click (`triggerPing`) — world position and when it started, or `null` once it's finished expanding/fading. */
+	private activePing: { x: number; y: number; startedAt: number } | null = null;
+	/** Non-null while `activePing`'s expand/fade animation is actively re-rendering every frame. */
+	private pingAnimationFrameId: number | null = null;
 
 	private dragging = false;
 	private dragMoved = false;
@@ -332,6 +363,7 @@ export class MapCanvas {
 			this.transform.panX += dx;
 			this.transform.panY += dy;
 			this.render();
+			this.options.onViewportChange?.();
 		}
 	};
 
@@ -339,6 +371,25 @@ export class MapCanvas {
 		if (!this.dragging) return;
 		this.dragging = false;
 		if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
+
+		// A plain click on empty space (no edit tool armed, and not landing on a token/marker —
+		// those already have their own selection/info-panel feedback, a ping would be redundant)
+		// pings that spot for players. Checked before `toolConsumedClick`/`painting` below, since a
+		// token click in edit mode also flips `toolConsumedClick` (it's not just for brush/fill/wall
+		// placement). Re-does the same hit-tests as `onPointerDown` rather than reading
+		// `draggingToken`/`draggingMarker`, since edit mode never sets those for a token click.
+		if (!this.dragMoved && this.controller.activeTool === "none") {
+			const rect = this.canvas.getBoundingClientRect();
+			const px = e.clientX - rect.left;
+			const py = e.clientY - rect.top;
+			const hitToken = this.findTokenAtScreenPoint(px, py);
+			const hitMarker = this.controller.getData().gridType === "none" ? this.findMarkerAtScreenPoint(px, py) : null;
+			if (!hitToken && !hitMarker) {
+				const world = screenToWorld(px, py, this.transform);
+				this.triggerPing(world.x, world.y);
+				this.options.onPing?.(world.x, world.y);
+			}
+		}
 
 		if (this.toolConsumedClick) {
 			this.toolConsumedClick = false;
@@ -422,10 +473,29 @@ export class MapCanvas {
 		this.transform.panX += px - screenAfter.x;
 		this.transform.panY += py - screenAfter.y;
 		this.render();
+		this.options.onViewportChange?.();
 	};
 
-	constructor(private container: HTMLElement, private controller: MapController, private app: App, private settings: MapManagerSettings) {
+	private get isMirror(): boolean {
+		return !!this.options.isMirror;
+	}
+
+	/**
+	 * A mirror always renders as if in "view" mode, regardless of the GM's own shared
+	 * `controller.mode` — otherwise the player window's fog/cover-zoom/cell-visibility/edit-tool
+	 * overlays would depend on whatever mode the GM's own tab happens to be in (and the GM would have
+	 * to switch their own tab to "Vue" just to make the player window look right). All rendering
+	 * decisions below should read this instead of `this.controller.mode` directly; input-handling
+	 * code (which a mirror never runs — see the constructor) is unaffected and still reads the real
+	 * shared mode.
+	 */
+	private effectiveMode(): MapMode {
+		return this.isMirror ? "view" : this.controller.mode;
+	}
+
+	constructor(private container: HTMLElement, private controller: MapController, private app: App, private settings: MapManagerSettings, private options: MapCanvasOptions = {}) {
 		this.canvas = container.createEl("canvas", { cls: "map-manager-canvas" });
+		if (this.isMirror) this.canvas.addClass("is-mirror-canvas");
 		const ctx = this.canvas.getContext("2d");
 		if (!ctx) throw new Error("Canvas 2D context unavailable");
 		this.ctx = ctx;
@@ -441,12 +511,14 @@ export class MapCanvas {
 		if (!fogBlurCtx) throw new Error("Canvas 2D context unavailable");
 		this.fogBlurCtx = fogBlurCtx;
 
-		this.canvas.addEventListener("pointerdown", this.onPointerDown);
-		this.canvas.addEventListener("pointermove", this.onPointerMove);
-		this.canvas.addEventListener("pointerup", this.onPointerUp);
-		this.canvas.addEventListener("pointercancel", this.onPointerCancel);
-		this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
-		this.canvas.addEventListener("contextmenu", this.onContextMenu);
+		if (!this.isMirror) {
+			this.canvas.addEventListener("pointerdown", this.onPointerDown);
+			this.canvas.addEventListener("pointermove", this.onPointerMove);
+			this.canvas.addEventListener("pointerup", this.onPointerUp);
+			this.canvas.addEventListener("pointercancel", this.onPointerCancel);
+			this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
+			this.canvas.addEventListener("contextmenu", this.onContextMenu);
+		}
 
 		this.resizeObserver = new ResizeObserver(() => this.resize());
 		this.resizeObserver.observe(container);
@@ -468,7 +540,7 @@ export class MapCanvas {
 			// View mode covers the viewport (larger ratio) so no empty space beyond the image is ever
 			// visible; edit mode fits the whole image on screen (smaller ratio) so nothing is cropped.
 			const zoom =
-				this.controller.mode === "view"
+				this.effectiveMode() === "view"
 					? clamp(Math.max(this.viewportW / bounds.w, this.viewportH / bounds.h), ABS_MIN_ZOOM, data.maxZoom)
 					: clamp(Math.min(this.viewportW / bounds.w, this.viewportH / bounds.h), data.minZoom, data.maxZoom);
 			this.transform = {
@@ -486,6 +558,51 @@ export class MapCanvas {
 		this.applyFraming();
 		this.hasAutoFramed = true;
 		this.render();
+		this.options.onViewportChange?.();
+	}
+
+	/**
+	 * The world point currently at the center of *this* canvas's own viewport, plus its zoom — the
+	 * aspect-ratio-independent camera description a mirror canvas re-derives its own pan from (see
+	 * `setMirrorCamera`). Raw `panX`/`panY` can't be copied as-is: they anchor world (0,0) to *this*
+	 * canvas's own top-left corner, so the same values on a differently-sized canvas shift the content
+	 * away from that canvas's own center instead of keeping it centered.
+	 */
+	getViewCenter(): { zoom: number; x: number; y: number } {
+		const center = screenToWorld(this.viewportW / 2, this.viewportH / 2, this.transform);
+		return { zoom: this.transform.zoom, x: center.x, y: center.y };
+	}
+
+	/**
+	 * Mirror-only: sets the camera to display, pushed by the caller (`MapPlayerMirrorView`) only when
+	 * the source's camera actually changed (its `onViewportChange`) plus once at mount — never read on
+	 * a schedule, for exactly the reason explained on `MapCanvasOptions.isMirror`.
+	 */
+	setMirrorCamera(view: { zoom: number; x: number; y: number }): void {
+		this.mirrorCamera = view;
+		this.render();
+	}
+
+	/**
+	 * Shows an expanding, fading ring at a world position for `PING_DURATION_MS` — "look here",
+	 * triggered by a plain click (see `onPointerUp`) and echoed to a player mirror via
+	 * `MapCanvasOptions.onPing`/`MirrorSource.onPing` (also called directly on a mirror's own canvas
+	 * once it receives that echo — see `MapPlayerMirrorView`).
+	 */
+	triggerPing(x: number, y: number): void {
+		this.activePing = { x, y, startedAt: performance.now() };
+		if (this.pingAnimationFrameId !== null) return;
+		const tick = () => {
+			if (!this.activePing || performance.now() - this.activePing.startedAt >= PING_DURATION_MS) {
+				this.activePing = null;
+				this.pingAnimationFrameId = null;
+				this.render();
+				return;
+			}
+			this.render();
+			this.pingAnimationFrameId = requestAnimationFrame(tick);
+		};
+		this.pingAnimationFrameId = requestAnimationFrame(tick);
 	}
 
 	/**
@@ -522,7 +639,7 @@ export class MapCanvas {
 
 	private getEffectiveMinZoom(): number {
 		// Edit mode: zooming out is unrestricted.
-		if (this.controller.mode !== "view") return ABS_MIN_ZOOM;
+		if (this.effectiveMode() !== "view") return ABS_MIN_ZOOM;
 		const data = this.controller.getData();
 		if (this.viewportW === 0 || this.viewportH === 0) return ABS_MIN_ZOOM;
 		const bounds = this.computeVisibleImageBounds();
@@ -560,13 +677,16 @@ export class MapCanvas {
 
 	destroy(): void {
 		if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
+		if (this.pingAnimationFrameId !== null) cancelAnimationFrame(this.pingAnimationFrameId);
 		this.resizeObserver.disconnect();
-		this.canvas.removeEventListener("pointerdown", this.onPointerDown);
-		this.canvas.removeEventListener("pointermove", this.onPointerMove);
-		this.canvas.removeEventListener("pointerup", this.onPointerUp);
-		this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
-		this.canvas.removeEventListener("wheel", this.onWheel);
-		this.canvas.removeEventListener("contextmenu", this.onContextMenu);
+		if (!this.isMirror) {
+			this.canvas.removeEventListener("pointerdown", this.onPointerDown);
+			this.canvas.removeEventListener("pointermove", this.onPointerMove);
+			this.canvas.removeEventListener("pointerup", this.onPointerUp);
+			this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
+			this.canvas.removeEventListener("wheel", this.onWheel);
+			this.canvas.removeEventListener("contextmenu", this.onContextMenu);
+		}
 		this.unsubscribe();
 		this.canvas.remove();
 	}
@@ -949,7 +1069,7 @@ export class MapCanvas {
 	private cellsCurrentlyVisible(): boolean {
 		if (this.controller.getData().gridType === "none") return false;
 		const fitsOnScreen = this.cellVisualWidth() * this.transform.zoom >= MIN_CELL_PIXELS;
-		return fitsOnScreen && (this.controller.mode === "edit" || this.controller.showCells);
+		return fitsOnScreen && (this.effectiveMode() === "edit" || this.controller.showCells);
 	}
 
 	/**
@@ -962,6 +1082,7 @@ export class MapCanvas {
 	 * doesn't depend on a visible grid, only on vision blockers and player tokens.
 	 */
 	private fogCurrentlyVisible(): boolean {
+		if (this.options.forceFog) return true;
 		const data = this.controller.getData();
 		return data.fogEnabled && this.controller.mode === "view";
 	}
@@ -997,7 +1118,7 @@ export class MapCanvas {
 	}
 
 	private updateCursor(): void {
-		const tool = this.controller.mode === "edit" ? this.controller.activeTool : "none";
+		const tool = this.effectiveMode() === "edit" ? this.controller.activeTool : "none";
 		this.canvas.toggleClass("is-brush-tool", tool === "brush");
 		this.canvas.toggleClass("is-fill-tool", tool === "fill");
 		this.canvas.toggleClass("is-wall-tool", tool === "wall");
@@ -1009,7 +1130,7 @@ export class MapCanvas {
 		this.ensureBackgroundsLoaded();
 		this.ensureTokenImagesLoaded();
 
-		if (!this.hasAutoFramed) {
+		if (!this.isMirror && !this.hasAutoFramed) {
 			const loadedBounds = this.computeVisibleImageBounds();
 			if (loadedBounds && loadedBounds.w > 0 && loadedBounds.h > 0) {
 				this.applyFraming();
@@ -1017,9 +1138,26 @@ export class MapCanvas {
 			}
 		}
 
-		const imageBounds = this.controller.mode === "view" ? this.computeVisibleImageBounds() : null;
+		const imageBounds = this.effectiveMode() === "view" ? this.computeVisibleImageBounds() : null;
 		const minZoom = this.getEffectiveMinZoom();
-		this.transform.zoom = clamp(this.transform.zoom, minZoom, this.controller.getData().maxZoom);
+		if (this.isMirror && this.mirrorCamera) {
+			// A mirror re-derives its own pan/zoom from the source's last-pushed world-space camera
+			// (center + zoom, see `setMirrorCamera`) rather than copying raw panX/panY — those are
+			// meaningless across differently sized canvases (screenX = worldX*zoom + panX is anchored
+			// to *this* canvas's own top-left, not a shared center). Its zoom is never allowed below
+			// its OWN cover zoom (computed from its own viewport/aspect ratio) even if the source is
+			// zoomed out further — otherwise a mirror with a different aspect ratio than the source
+			// could show empty space beyond the image edges once the source hits its own minimum zoom.
+			const source = this.mirrorCamera;
+			const zoom = clamp(Math.max(source.zoom, minZoom), minZoom, this.controller.getData().maxZoom);
+			this.transform = {
+				zoom,
+				panX: this.viewportW / 2 - source.x * zoom,
+				panY: this.viewportH / 2 - source.y * zoom,
+			};
+		} else if (!this.isMirror) {
+			this.transform.zoom = clamp(this.transform.zoom, minZoom, this.controller.getData().maxZoom);
+		}
 		if (imageBounds) this.clampPanToBounds(imageBounds);
 
 		const dpr = window.devicePixelRatio || 1;
@@ -1082,6 +1220,7 @@ export class MapCanvas {
 		this.drawTokens(ctx);
 		if (cellsVisible || noGrid || this.controller.selectedWallPointId) this.drawSelection(ctx);
 		this.drawWallPreview(ctx);
+		if (this.activePing) this.drawPing(ctx);
 
 		ctx.restore();
 		this.syncFogAnimationLoop();
@@ -1512,7 +1651,7 @@ export class MapCanvas {
 	private drawWalls(ctx: CanvasRenderingContext2D): void {
 		const data = this.controller.getData();
 		if (!this.cellsCurrentlyVisible() && data.gridType !== "none") return;
-		const showHandles = this.controller.mode === "edit" && (this.controller.activeTool === "wall" || this.controller.selectedWallPointId !== null);
+		const showHandles = this.effectiveMode() === "edit" && (this.controller.activeTool === "wall" || this.controller.selectedWallPointId !== null);
 		const pointRadius = Math.max(2, this.wallPointHitRadius() * 0.35);
 		for (const layer of data.layers) {
 			if (!layer.visible) continue;
@@ -1551,7 +1690,7 @@ export class MapCanvas {
 	 * first corner already placed — the whole shape's outline spanning that corner and the pointer.
 	 */
 	private drawWallPreview(ctx: CanvasRenderingContext2D): void {
-		if (this.controller.mode !== "edit" || this.controller.activeTool !== "wall" || !this.wallPreview) return;
+		if (this.effectiveMode() !== "edit" || this.controller.activeTool !== "wall" || !this.wallPreview) return;
 
 		const pendingShape = this.controller.pendingWallShape;
 		const firstCorner = pendingShape ? this.controller.getWallShapeFirstCorner() : null;
@@ -1581,6 +1720,29 @@ export class MapCanvas {
 		ctx.moveTo(tail.x, tail.y);
 		ctx.lineTo(this.wallPreview.x, this.wallPreview.y);
 		ctx.stroke();
+		ctx.restore();
+	}
+
+	/** An expanding, fading ring at `activePing`'s position — see `triggerPing`. */
+	private drawPing(ctx: CanvasRenderingContext2D): void {
+		if (!this.activePing) return;
+		const t = clamp((performance.now() - this.activePing.startedAt) / PING_DURATION_MS, 0, 1);
+		const maxRadius = this.cellVisualWidth() * 2.2;
+		const alpha = 1 - t;
+		ctx.save();
+		ctx.lineWidth = Math.max(2, 4 / this.transform.zoom);
+		ctx.strokeStyle = `rgba(255, 205, 45, ${alpha})`;
+		ctx.beginPath();
+		ctx.arc(this.activePing.x, this.activePing.y, maxRadius * t, 0, Math.PI * 2);
+		ctx.stroke();
+		// A second, smaller ring lagging behind the first for a "ripple" feel.
+		const innerT = Math.max(0, t - 0.3);
+		if (innerT > 0) {
+			ctx.strokeStyle = `rgba(255, 205, 45, ${alpha * 0.7})`;
+			ctx.beginPath();
+			ctx.arc(this.activePing.x, this.activePing.y, maxRadius * innerT, 0, Math.PI * 2);
+			ctx.stroke();
+		}
 		ctx.restore();
 	}
 

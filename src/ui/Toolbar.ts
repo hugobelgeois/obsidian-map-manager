@@ -10,6 +10,8 @@ export interface ToolbarActions {
 	recenter: () => void;
 	/** Writes/updates the redacted `<basename>.json` next to the map file — see `publishPublicSnapshot`. */
 	publish: () => void;
+	/** Switches this window to "Vue" (GMs run live sessions from there) and pops open a read-only mirror of the map in a new OS window, for dragging onto a second monitor — see `openPlayerWindow`. */
+	openPlayerWindow: () => void;
 }
 
 export interface ToolbarDeps {
@@ -130,6 +132,11 @@ export class Toolbar {
 		const recenterGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
 		const resetBtn = recenterGroup.createEl("button", { text: "Recentrer", cls: "map-manager-btn" });
 		resetBtn.onclick = () => this.actions.recenter();
+
+		const playerWindowBtn = recenterGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(playerWindowBtn, "monitor");
+		setTooltip(playerWindowBtn, "Ouvrir la vue joueur dans une nouvelle fenêtre (à glisser sur un second écran)");
+		playerWindowBtn.onclick = () => this.actions.openPlayerWindow();
 	}
 
 	/** Clicking the active grid icon opens a dropdown of the other grid types below it; picking one applies and closes it. */

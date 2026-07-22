@@ -1,4 +1,4 @@
-import { App, Component, MarkdownRenderer, TFile, resolveSubpath } from "obsidian";
+import { App, Component, MarkdownRenderer, TFile, resolveSubpath, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import {
 	CellData,
@@ -32,6 +32,8 @@ export interface InfoPanelDeps {
 	settings: MapManagerSettings;
 	/** Persists a new panel width (px) after a resize-handle drag — see `MIN_PANEL_WIDTH`/`MAX_PANEL_WIDTH`. */
 	onResizePanel?: (width: number) => void;
+	/** Called whenever this panel scrolls — lets a player mirror's InfoPanel (see `setScrollTop`) follow along. Not a `MapController` field: pushing it through `notify()` on every scroll tick would rebuild every subscribed panel's whole DOM mid-scroll. */
+	onScroll?: (scrollTop: number) => void;
 }
 
 const MIN_PANEL_WIDTH = 220;
@@ -65,11 +67,6 @@ export class InfoPanel {
 	private resizeHandleEl: HTMLElement;
 	private unsubscribe: () => void;
 	private renderComponents: Component[] = [];
-	private activeLinkIndex = 0;
-	private lastRenderedKey: string | null = null;
-	/** Reset whenever the selected token changes — see `resetTokenTabStateIfNeeded`. */
-	private activeTokenTabId: string | null = null;
-	private lastRenderedTokenId: string | null = null;
 	/**
 	 * While a slider (or its paired number input) is being dragged/typed into, we still push
 	 * every intermediate value to the controller (so the map updates live), but we must NOT
@@ -83,6 +80,7 @@ export class InfoPanel {
 		this.el = container.createDiv({ cls: "map-manager-infopanel" });
 		this.applyWidth();
 		this.wireResizeHandle();
+		this.el.addEventListener("scroll", this.onScroll);
 		this.render();
 		this.unsubscribe = this.controller.onChange(() => {
 			if (this.suppressRerender) return;
@@ -92,7 +90,19 @@ export class InfoPanel {
 
 	destroy(): void {
 		this.unsubscribe();
+		this.el.removeEventListener("scroll", this.onScroll);
 		this.clearRenderComponents();
+		this.resizeHandleEl.remove();
+		this.el.remove();
+	}
+
+	private onScroll = (): void => {
+		this.deps.onScroll?.(this.el.scrollTop);
+	};
+
+	/** Applied by a player mirror's InfoPanel to follow the GM's scroll — see `InfoPanelDeps.onScroll`. */
+	setScrollTop(value: number): void {
+		this.el.scrollTop = value;
 	}
 
 	private setOpen(open: boolean): void {
@@ -134,6 +144,20 @@ export class InfoPanel {
 		this.renderComponents = [];
 	}
 
+	/** Header shared by every selection type (token/marker/wall point/cell): a title, an "eye" toggle that mirrors this whole panel onto a player window (see `MapController.showInfoToPlayers`/`MapPlayerMirrorView`), and a close button. */
+	private renderPanelHeader(title: string, onClose: () => void): void {
+		const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
+		header.createEl("h4", { text: title });
+		const actions = header.createDiv({ cls: "map-manager-infopanel-header-actions" });
+		const eyeBtn = actions.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(eyeBtn, this.controller.showInfoToPlayers ? "eye" : "eye-off");
+		setTooltip(eyeBtn, this.controller.showInfoToPlayers ? "Masquer ce panneau sur la fenêtre joueur" : "Afficher ce panneau sur la fenêtre joueur");
+		eyeBtn.toggleClass("is-active", this.controller.showInfoToPlayers);
+		eyeBtn.onclick = () => this.controller.toggleShowInfoToPlayers();
+		const closeBtn = actions.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
+		closeBtn.onclick = onClose;
+	}
+
 	private render(): void {
 		this.applyWidth();
 		this.clearRenderComponents();
@@ -143,10 +167,7 @@ export class InfoPanel {
 			const found = this.controller.findToken(this.controller.selectedTokenId);
 			if (found) {
 				this.setOpen(true);
-				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
-				header.createEl("h4", { text: "Pion" });
-				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
-				closeBtn.onclick = () => this.controller.selectToken(null);
+				this.renderPanelHeader("Pion", () => this.controller.selectToken(null));
 
 				this.renderTokenPanel(found);
 				return;
@@ -157,10 +178,7 @@ export class InfoPanel {
 			const found = this.controller.findMarker(this.controller.selectedMarkerId);
 			if (found) {
 				this.setOpen(true);
-				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
-				header.createEl("h4", { text: "Tampon" });
-				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
-				closeBtn.onclick = () => this.controller.selectMarker(null);
+				this.renderPanelHeader("Tampon", () => this.controller.selectMarker(null));
 
 				if (this.controller.mode === "edit") {
 					this.renderMarkerEditPanel(found);
@@ -175,10 +193,7 @@ export class InfoPanel {
 			const found = this.controller.findWallPoint(this.controller.selectedWallPointId);
 			if (found) {
 				this.setOpen(true);
-				const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
-				header.createEl("h4", { text: "Point de mur" });
-				const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
-				closeBtn.onclick = () => this.controller.selectWallPoint(null);
+				this.renderPanelHeader("Point de mur", () => this.controller.selectWallPoint(null));
 
 				this.renderWallPointPanel(found.id);
 				return;
@@ -193,17 +208,10 @@ export class InfoPanel {
 			return;
 		}
 		this.setOpen(true);
-		if (this.lastRenderedKey !== key) {
-			this.activeLinkIndex = 0;
-			this.lastRenderedKey = key;
-		}
 
 		const cell: CellData = this.controller.getActiveLayer().cellsByGridType[data.gridType][key] ?? {};
 
-		const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
-		header.createEl("h4", { text: `Case ${key}` });
-		const closeBtn = header.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
-		closeBtn.onclick = () => this.controller.selectCell(null);
+		this.renderPanelHeader(`Case ${key}`, () => this.controller.selectCell(null));
 
 		if (this.controller.mode === "edit") {
 			this.renderEditMode(key, cell, this.deps.settings.defaultZoneTypes);
@@ -286,20 +294,17 @@ export class InfoPanel {
 			return;
 		}
 
-		if (this.activeLinkIndex >= links.length) this.activeLinkIndex = 0;
+		if (this.controller.activeInfoLinkIndex >= links.length) this.controller.activeInfoLinkIndex = 0;
 
 		const tabs = this.el.createDiv({ cls: "map-manager-view-tabs" });
 		links.forEach((link, i) => {
 			const tab = tabs.createEl("button", { text: linkTabLabel(link), cls: "map-manager-tab" });
-			if (i === this.activeLinkIndex) tab.addClass("is-active");
-			tab.onclick = () => {
-				this.activeLinkIndex = i;
-				this.render();
-			};
+			if (i === this.controller.activeInfoLinkIndex) tab.addClass("is-active");
+			tab.onclick = () => this.controller.setActiveInfoLinkIndex(i);
 		});
 
 		const contentEl = this.el.createDiv({ cls: "map-manager-view-content" });
-		const activeLink = links[this.activeLinkIndex];
+		const activeLink = links[this.controller.activeInfoLinkIndex];
 		if (activeLink) void this.renderLinkContent(activeLink, contentEl);
 	}
 
@@ -377,8 +382,6 @@ export class InfoPanel {
 	// ---- Tokens (full edit panel in edit mode; reduced read-mostly panel in view mode) ----
 
 	private renderTokenPanel(token: Token): void {
-		this.resetTokenTabStateIfNeeded(token);
-
 		if (this.controller.mode === "view") {
 			this.renderTokenViewPanel(token);
 			return;
@@ -483,17 +486,10 @@ export class InfoPanel {
 
 	// ---- Token tabs (Statistiques/Inventaire/Histoire by default, customizable per token, any category) ----
 
-	private resetTokenTabStateIfNeeded(token: Token): void {
-		if (this.lastRenderedTokenId !== token.id) {
-			this.activeTokenTabId = null;
-			this.lastRenderedTokenId = token.id;
-		}
-	}
-
-	/** Resolves the tab to preview below the tab strip, falling back to the first tab and normalizing the tracked id. */
+	/** Resolves the tab to preview below the tab strip, falling back to the first tab and normalizing the tracked id (`MapController.activeInfoTabId` is reset to `null` whenever the selection itself changes — see `MapController.selectToken`). */
 	private resolveActiveTab(tabs: TokenTab[]): TokenTab | undefined {
-		if (!tabs.some((t) => t.id === this.activeTokenTabId)) this.activeTokenTabId = tabs[0]?.id ?? null;
-		return tabs.find((t) => t.id === this.activeTokenTabId);
+		if (!tabs.some((t) => t.id === this.controller.activeInfoTabId)) this.controller.activeInfoTabId = tabs[0]?.id ?? null;
+		return tabs.find((t) => t.id === this.controller.activeInfoTabId);
 	}
 
 	/** Materializes the (possibly still-lazy default) tab list onto the token, then applies `mutator` to the tab matching `tabId`. */
@@ -517,14 +513,14 @@ export class InfoPanel {
 		const list = section.createDiv({ cls: "map-manager-token-tabs-list" });
 		for (const tab of tabs) {
 			const row = list.createDiv({ cls: "map-manager-token-tab-row" });
-			if (tab.id === this.activeTokenTabId) row.addClass("is-active");
+			if (tab.id === this.controller.activeInfoTabId) row.addClass("is-active");
 
-			const selectBtn = row.createEl("button", { text: tab.id === this.activeTokenTabId ? "●" : "○", cls: "map-manager-btn map-manager-btn-icon" });
+			const selectBtn = row.createEl("button", {
+				text: tab.id === this.controller.activeInfoTabId ? "●" : "○",
+				cls: "map-manager-btn map-manager-btn-icon",
+			});
 			selectBtn.title = "Afficher cet onglet ci-dessous";
-			selectBtn.onclick = () => {
-				this.activeTokenTabId = tab.id;
-				this.render();
-			};
+			selectBtn.onclick = () => this.controller.setActiveInfoTab(tab.id);
 
 			const nameInput = row.createEl("input", { type: "text", cls: "map-manager-token-tab-name" });
 			nameInput.value = tab.name;
@@ -549,7 +545,7 @@ export class InfoPanel {
 			removeBtn.title = "Supprimer cet onglet";
 			removeBtn.onclick = () => {
 				const next = tabs.filter((t) => t.id !== tab.id);
-				if (this.activeTokenTabId === tab.id) this.activeTokenTabId = next[0]?.id ?? null;
+				if (this.controller.activeInfoTabId === tab.id) this.controller.activeInfoTabId = next[0]?.id ?? null;
 				this.controller.updateToken(token.id, (t) => {
 					t.tabs = next;
 					t.link = undefined;
@@ -560,7 +556,7 @@ export class InfoPanel {
 		const addBtn = section.createEl("button", { text: "Ajouter un onglet", cls: "map-manager-btn" });
 		addBtn.onclick = () => {
 			const newTab: TokenTab = { id: generateLocalId("tab"), name: `Onglet ${tabs.length + 1}` };
-			this.activeTokenTabId = newTab.id;
+			this.controller.activeInfoTabId = newTab.id;
 			this.controller.updateToken(token.id, (t) => {
 				t.tabs = [...tabs, newTab];
 				t.link = undefined;
@@ -592,10 +588,7 @@ export class InfoPanel {
 		for (const tab of tabs) {
 			const btn = tabBar.createEl("button", { text: tab.name, cls: "map-manager-tab" });
 			if (tab.id === activeTab.id) btn.addClass("is-active");
-			btn.onclick = () => {
-				this.activeTokenTabId = tab.id;
-				this.render();
-			};
+			btn.onclick = () => this.controller.setActiveInfoTab(tab.id);
 		}
 
 		if (activeTab.link) {

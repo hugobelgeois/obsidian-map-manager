@@ -248,6 +248,11 @@
 	cursor: grabbing;
 }
 
+.map-manager-canvas.is-mirror-canvas,
+.map-manager-canvas.is-mirror-canvas:active {
+	cursor: default;
+}
+
 .map-manager-canvas.is-brush-tool {
 	cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26"><text x="0" y="20" font-size="20">🖌️</text></svg>') 2 22, crosshair;
 }
@@ -302,6 +307,12 @@
 
 .map-manager-infopanel-header h4 {
 	margin: 0;
+}
+
+.map-manager-infopanel-header-actions {
+	display: flex;
+	align-items: center;
+	gap: 0.3em;
 }
 
 .map-manager-field {

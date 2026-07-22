@@ -1,10 +1,12 @@
 import { Notice, Plugin, TFile, TFolder, normalizePath } from "obsidian";
 import { createDefaultMapData, MapDefaults, parseMapData, serializeMapData } from "./data/mapData";
+import { openPlayerWindow } from "./platform/openPlayerWindow";
 import { publishPublicSnapshot } from "./platform/publishPublicSnapshot";
 import { MapManagerSettingsTab } from "./settings/SettingsTab";
 import { DEFAULT_SETTINGS, MapManagerSettings } from "./settings/types";
 import { FileSuggestModal } from "./ui/FileSuggestModal";
 import { MapView, VIEW_TYPE_MAP } from "./view/MapView";
+import { MapPlayerMirrorView, VIEW_TYPE_MAP_PLAYER_MIRROR } from "./view/MapPlayerMirrorView";
 import { renderMapEmbed } from "./view/MapEmbed";
 
 export default class MapManagerPlugin extends Plugin {
@@ -15,6 +17,7 @@ export default class MapManagerPlugin extends Plugin {
 		await this.loadSettings();
 
 		this.registerView(VIEW_TYPE_MAP, (leaf) => new MapView(leaf, this));
+		this.registerView(VIEW_TYPE_MAP_PLAYER_MIRROR, (leaf) => new MapPlayerMirrorView(leaf, this));
 		this.registerExtensions(["map"], VIEW_TYPE_MAP);
 		this.registerMarkdownCodeBlockProcessor("map", (source, el, ctx) => renderMapEmbed(this, source, el, ctx));
 
@@ -58,6 +61,18 @@ export default class MapManagerPlugin extends Plugin {
 				const isMap = file instanceof TFile && file.extension === "map";
 				if (checking) return isMap;
 				if (file instanceof TFile) void this.publishMap(file);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "map-manager-open-player-window",
+			name: "Ouvrir la vue joueur dans une nouvelle fenêtre",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				const isMap = file instanceof TFile && file.extension === "map";
+				if (checking) return isMap;
+				if (file instanceof TFile) void openPlayerWindow(this.app, file);
 				return true;
 			},
 		});

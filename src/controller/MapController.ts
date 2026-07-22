@@ -30,6 +30,18 @@ export class MapController {
 	mode: MapMode;
 	/** Whether the grid/cell overlay is shown in view mode (edit mode always shows it). Session-only, not persisted. */
 	showCells = true;
+	/** Whether the InfoPanel (whatever is currently selected) also renders on a player mirror window — see InfoPanel's "eye" button and `MapPlayerMirrorView`. Session-only, not persisted. */
+	showInfoToPlayers = false;
+	/**
+	 * Which InfoPanel tab is currently previewed for the selected token (by tab id) — shared on the
+	 * controller (rather than kept private to one InfoPanel instance) so a player mirror's InfoPanel
+	 * follows the GM's tab clicks live, same as the selection itself. Reset to `null` (falls back to
+	 * the first tab, see InfoPanel's `resolveActiveTab`) whenever the selection changes — see
+	 * `selectToken`/`selectCell`/`selectMarker`/`selectWallPoint`. Session-only, not persisted.
+	 */
+	activeInfoTabId: string | null = null;
+	/** Same idea as `activeInfoTabId`, for a cell/marker's linked-note tabs (by index). */
+	activeInfoLinkIndex = 0;
 
 	/**
 	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
@@ -79,6 +91,21 @@ export class MapController {
 		this.notify();
 	}
 
+	toggleShowInfoToPlayers(): void {
+		this.showInfoToPlayers = !this.showInfoToPlayers;
+		this.notify();
+	}
+
+	setActiveInfoTab(tabId: string): void {
+		this.activeInfoTabId = tabId;
+		this.notify();
+	}
+
+	setActiveInfoLinkIndex(index: number): void {
+		this.activeInfoLinkIndex = index;
+		this.notify();
+	}
+
 	getData(): MapFileData {
 		return this.data;
 	}
@@ -92,6 +119,20 @@ export class MapController {
 		mutator(this.data);
 		this.notify();
 		if (options.save !== false) this.onSave(this.data);
+	}
+
+	/**
+	 * Swaps in a whole new document loaded from disk after another open window saved a change to
+	 * the same file — never calls `onSave` (that would just echo the write back). Undo/redo are
+	 * cleared: their snapshots predate the external change, so undoing into them would silently
+	 * discard whatever the other window just did.
+	 */
+	replaceData(newData: MapFileData): void {
+		this.data = newData;
+		this.exploredSetCache = null;
+		this.undoStack = [];
+		this.redoStack = [];
+		this.notify();
 	}
 
 	// ---- Undo/redo ----
@@ -142,12 +183,19 @@ export class MapController {
 
 	// ---- Selection ----
 
+	/** Whatever InfoPanel tab was being previewed belongs to the *previous* selection — see `activeInfoTabId`. */
+	private resetInfoTabState(): void {
+		this.activeInfoTabId = null;
+		this.activeInfoLinkIndex = 0;
+	}
+
 	selectCell(key: string | null): void {
 		if (this.selectedCellKey === key && this.selectedTokenId === null && this.selectedMarkerId === null && this.selectedWallPointId === null) return;
 		this.selectedCellKey = key;
 		this.selectedTokenId = null;
 		this.selectedMarkerId = null;
 		this.selectedWallPointId = null;
+		this.resetInfoTabState();
 		this.notify();
 	}
 
@@ -157,6 +205,7 @@ export class MapController {
 		this.selectedCellKey = null;
 		this.selectedMarkerId = null;
 		this.selectedWallPointId = null;
+		this.resetInfoTabState();
 		this.notify();
 	}
 
@@ -166,6 +215,7 @@ export class MapController {
 		this.selectedCellKey = null;
 		this.selectedTokenId = null;
 		this.selectedWallPointId = null;
+		this.resetInfoTabState();
 		this.notify();
 	}
 
@@ -175,6 +225,7 @@ export class MapController {
 		this.selectedCellKey = null;
 		this.selectedTokenId = null;
 		this.selectedMarkerId = null;
+		this.resetInfoTabState();
 		this.notify();
 	}
 

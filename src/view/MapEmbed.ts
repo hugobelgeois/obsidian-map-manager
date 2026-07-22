@@ -2,6 +2,8 @@ import { MarkdownPostProcessorContext, MarkdownRenderChild, Notice, TFile, debou
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapBlockSource, parseMapData, serializeMapData } from "../data/mapData";
+import { registerMirrorSource } from "../platform/mirrorRegistry";
+import { openPlayerWindow } from "../platform/openPlayerWindow";
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
@@ -52,6 +54,21 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const unsubscribeSettings = plugin.onSettingsChanged(() => controller.refresh());
 	let canvasRef: MapCanvas | null = null;
 
+	// Reloads from disk when another open window (e.g. the GM's own tab, or another popped-out
+	// player window) saved a change to this same file — no-op if the file already matches what we
+	// hold in memory (an echo of our own debounced `save`).
+	const handleExternalModify = async (changed: TFile) => {
+		if (changed.path !== file.path) return;
+		const raw = await app.vault.read(file);
+		const current = serializeMapData(controller.getData());
+		if (raw === current) return;
+		const parsed = parseMapData(raw, plugin.getMapDefaults());
+		controller.replaceData(parsed);
+	};
+	const modifyRef = app.vault.on("modify", (f) => {
+		if (f instanceof TFile) void handleExternalModify(f);
+	});
+
 	const publishView = async () => {
 		try {
 			const target = await publishPublicSnapshot(app, file, controller.getData(), plugin.settings);
@@ -65,11 +82,41 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder, settings: plugin.settings }, controller, {
 		recenter: () => canvasRef?.recenter(),
 		publish: () => void publishView(),
+		openPlayerWindow: () => {
+			controller.setMode("view");
+			void openPlayerWindow(app, file);
+		},
 	});
 	const body = host.createDiv({ cls: "map-manager-body" });
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
-	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings);
+	const viewportListeners = new Set<() => void>();
+	const pingListeners = new Set<(x: number, y: number) => void>();
+	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings, {
+		onViewportChange: () => {
+			for (const cb of viewportListeners) cb();
+		},
+		onPing: (x, y) => {
+			for (const cb of pingListeners) cb(x, y);
+		},
+	});
 	canvasRef = canvas;
+	const scrollListeners = new Set<(scrollTop: number) => void>();
+	const unregisterMirror = registerMirrorSource(file.path, {
+		controller,
+		getView: () => canvas.getViewCenter(),
+		onViewportChange: (cb) => {
+			viewportListeners.add(cb);
+			return () => viewportListeners.delete(cb);
+		},
+		onScrollChange: (cb) => {
+			scrollListeners.add(cb);
+			return () => scrollListeners.delete(cb);
+		},
+		onPing: (cb) => {
+			pingListeners.add(cb);
+			return () => pingListeners.delete(cb);
+		},
+	});
 	const infoPanel = new InfoPanel(
 		body,
 		app,
@@ -79,6 +126,9 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			onResizePanel: (width) => {
 				plugin.settings.infoPanelWidth = width;
 				void plugin.saveSettings();
+			},
+			onScroll: (scrollTop) => {
+				for (const cb of scrollListeners) cb(scrollTop);
 			},
 		},
 		controller
@@ -91,6 +141,8 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			infoPanel.destroy();
 			unsubscribeAutoPublish();
 			unsubscribeSettings();
+			unregisterMirror();
+			app.vault.offref(modifyRef);
 		})
 	);
 }
