@@ -12,6 +12,8 @@ export interface MapManagerSettings {
 	defaultMaxZoom: number;
 	/** Subtle animated flicker on the fog of war's vision edge (off by default — a continuous redraw loop while active). */
 	fogAnimations: boolean;
+	/** Seconds of inactivity after a map edit before `<map>.json` (see `publishPublicSnapshot`) is regenerated automatically — see `wireAutoPublish`. `0` disables auto-publishing entirely. */
+	autoPublishDelaySeconds: number;
 }
 
 export const DEFAULT_ZONE_TYPES: ZoneType[] = [
@@ -39,4 +41,5 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
 	fogAnimations: false,
+	autoPublishDelaySeconds: 10,
 };

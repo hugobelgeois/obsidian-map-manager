@@ -138,7 +138,7 @@ export class PublicMapCanvas {
 		this.render();
 	}
 
-	/** Zooms in/out (`factor` > 1 zooms in) around the viewport's center — used by `PublicToolbar`'s +/− buttons. */
+	/** Zooms in/out (`factor` > 1 zooms in) around the viewport's center — exposed on `PublicMapViewerHandle.canvas` for a host that wants its own zoom controls. */
 	zoomBy(factor: number): void {
 		const data = this.controller.snapshot.map;
 		const cx = this.viewportW / 2;

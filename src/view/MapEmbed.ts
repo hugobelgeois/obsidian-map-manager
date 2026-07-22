@@ -2,6 +2,7 @@ import { MarkdownPostProcessorContext, MarkdownRenderChild, Notice, TFile, debou
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapBlockSource, parseMapData, serializeMapData } from "../data/mapData";
+import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
@@ -47,6 +48,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	);
 
 	const controller = new MapController(data, save, "view");
+	const unsubscribeAutoPublish = wireAutoPublish(app, file, controller, plugin.settings.autoPublishDelaySeconds);
 	let canvasRef: MapCanvas | null = null;
 
 	const publishView = async () => {
@@ -74,6 +76,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			canvas.destroy();
 			toolbar.destroy();
 			infoPanel.destroy();
+			unsubscribeAutoPublish();
 		})
 	);
 }

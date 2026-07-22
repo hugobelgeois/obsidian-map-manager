@@ -64,6 +64,11 @@ async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 	}
 
 	const container = document.createElement("div");
+	// Obsidian's standard class for rendered-markdown content (embeds, popovers, etc.) — kept on the
+	// exported HTML itself (outerHTML, not just innerHTML) so the site-export plugin's own note
+	// styling — which already targets this class for every other exported note — picks this up
+	// too, instead of only our own approximate stylesheet (see publicViewerStyles.ts).
+	container.className = "markdown-rendered";
 	const component = new Component();
 	component.load();
 	try {
@@ -73,7 +78,7 @@ async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 	}
 	neutralizeLinks(container);
 	sanitizeRenderedNote(container);
-	return container.innerHTML;
+	return container.outerHTML;
 }
 
 /** Same resolution `InfoPanel.renderTokenStats` uses, frozen into plain values for a token with no vault access. */

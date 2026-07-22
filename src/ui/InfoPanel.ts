@@ -396,10 +396,7 @@ export class InfoPanel {
 			remove.onclick = () => this.controller.updateToken(token.id, (t) => (t.link = undefined));
 		} else {
 			const pickBtn = linkField.createEl("button", { text: "Lier une note", cls: "map-manager-btn" });
-			pickBtn.onclick = () => {
-				const files = this.app.vault.getMarkdownFiles();
-				new FileSuggestModal(this.app, files, (file) => this.controller.updateToken(token.id, (t) => (t.link = makeLink(file.path))), "Lier une note...").open();
-			};
+			pickBtn.onclick = () => this.pickLink((link) => this.controller.updateToken(token.id, (t) => (t.link = link)));
 		}
 
 		const templateField = this.el.createDiv({ cls: "map-manager-field" });

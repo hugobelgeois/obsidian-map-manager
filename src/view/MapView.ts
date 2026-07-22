@@ -2,6 +2,7 @@ import { Notice, TextFileView, WorkspaceLeaf } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
+import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
@@ -14,6 +15,7 @@ export class MapView extends TextFileView {
 	private canvasComp: MapCanvas | null = null;
 	private toolbarComp: Toolbar | null = null;
 	private infoPanelComp: InfoPanel | null = null;
+	private unsubscribeAutoPublish: (() => void) | null = null;
 	private rootEl: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
@@ -42,6 +44,7 @@ export class MapView extends TextFileView {
 		this.destroyComponents();
 		const parsed = parseMapData(data, this.plugin.getMapDefaults());
 		this.controller = new MapController(parsed, () => this.requestSave());
+		if (this.file) this.unsubscribeAutoPublish = wireAutoPublish(this.app, this.file, this.controller, this.plugin.settings.autoPublishDelaySeconds);
 		this.mountComponents();
 	}
 
@@ -78,9 +81,11 @@ export class MapView extends TextFileView {
 		this.canvasComp?.destroy();
 		this.toolbarComp?.destroy();
 		this.infoPanelComp?.destroy();
+		this.unsubscribeAutoPublish?.();
 		this.canvasComp = null;
 		this.toolbarComp = null;
 		this.infoPanelComp = null;
+		this.unsubscribeAutoPublish = null;
 	}
 
 	async onClose(): Promise<void> {

@@ -56,7 +56,12 @@ async function mountBlock(codeEl: Element): Promise<void> {
 	const host = codeEl.closest("pre") ?? codeEl;
 	const container = document.createElement("div");
 	container.className = MOUNT_CLASS;
-	container.style.minHeight = "480px";
+	// A *definite* height (not just min-height) is required here: `.map-manager-public-root` inside
+	// is `height: 100%`, and percentage heights don't resolve against an ancestor whose own height
+	// is "auto" (which min-height alone leaves it as) — without this, the info panel's content
+	// dictates the whole box's height instead of scrolling within a fixed one, so it overflows the
+	// page rather than docking beside a properly bounded map area.
+	container.style.height = "480px";
 	host.replaceWith(container);
 
 	if (!mapPath) {

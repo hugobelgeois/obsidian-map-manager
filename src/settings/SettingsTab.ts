@@ -110,6 +110,24 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName("Délai de republication automatique de la vue publique")
+			.setDesc(
+				"Après ce délai d'inactivité (en secondes) suivant une modification d'une carte, son <carte>.json (vue publique pour le site externe) est régénéré automatiquement — plus besoin de cliquer sur « Publier la vue » à chaque fois. 0 désactive la republication automatique."
+			)
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "0";
+				text.setValue(String(settings.autoPublishDelaySeconds));
+				text.onChange(async (value) => {
+					const n = parseFloat(value);
+					if (!Number.isNaN(n) && n >= 0) {
+						settings.autoPublishDelaySeconds = n;
+						await this.plugin.saveSettings();
+					}
+				});
+			});
+
+		new Setting(containerEl)
 			.setName("Palette de zones par défaut")
 			.setDesc("Utilisée pour toute nouvelle carte. Chaque carte garde ensuite sa propre copie, modifiable indépendamment.")
 			.setHeading();
