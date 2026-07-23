@@ -743,6 +743,7 @@ export class InfoPanel {
 	}
 
 	private async renderLinkContent(link: string, container: HTMLElement): Promise<void> {
+		container.addClass("markdown-rendered");
 		const { path, subpath } = splitLink(link);
 		const file = this.app.metadataCache.getFirstLinkpathDest(path, "") ?? this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) {
@@ -767,5 +768,16 @@ export class InfoPanel {
 		component.load();
 		this.renderComponents.push(component);
 		await MarkdownRenderer.render(this.app, markdown, container, file.path, component);
+
+		// MarkdownRenderer.render doesn't wire up navigation on its own outside a real leaf/view —
+		// same reason the "linked notes" pills above call `openLinkText` manually — so a link
+		// inside the rendered note's own body needs the same explicit handling here.
+		container.addEventListener("click", (evt) => {
+			const anchor = (evt.target as HTMLElement).closest("a.internal-link");
+			if (!anchor) return;
+			evt.preventDefault();
+			const href = anchor.getAttribute("data-href") ?? anchor.getAttribute("href");
+			if (href) void this.app.workspace.openLinkText(href, file.path, evt.ctrlKey || evt.metaKey);
+		});
 	}
 }

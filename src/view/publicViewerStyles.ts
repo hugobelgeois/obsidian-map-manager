@@ -192,10 +192,16 @@ export const PUBLIC_VIEWER_CSS = `
 	border-top: 1px solid var(--background-modifier-border, #d8d5cf);
 	margin: 1em 0;
 }
-.map-manager-public-infopanel .map-manager-view-content a {
-	color: inherit;
-	text-decoration: none;
-	cursor: default;
+.map-manager-public-infopanel .map-manager-view-content a.internal-link,
+.map-manager-public-infopanel .map-manager-view-content a.external-link {
+	color: var(--link-color, var(--interactive-accent, #705dcf));
+	text-decoration: var(--link-decoration, underline);
+	cursor: pointer;
+}
+.map-manager-public-infopanel .map-manager-view-content a.internal-link:hover,
+.map-manager-public-infopanel .map-manager-view-content a.external-link:hover {
+	color: var(--link-color-hover, var(--interactive-accent-hover, #8875e8));
+	text-decoration: var(--link-decoration-hover, underline);
 }
 .map-manager-public-infopanel .map-manager-view-content code {
 	font-family: var(--font-monospace, ui-monospace, SFMono-Regular, Menlo, monospace);
@@ -231,6 +237,13 @@ export const PUBLIC_VIEWER_CSS = `
 	   here too, instead of this falling back to a surface color that may
 	   clash with or blend into the panel background. */
 	background: var(--table-header-background, var(--background-secondary));
+}
+.map-manager-public-infopanel .map-manager-view-content tr:nth-child(even) td {
+	/* Same rule (and variable) as markdown.css's .markdown-rendered tr:nth-child(even) td —
+	   that site-wide rule only targets .markdown-rendered, which this baked note content
+	   never carries (it's rendered under .map-manager-view-content instead), so without this
+	   the zebra-striping a theme defines for ordinary tables never showed up here. */
+	background: var(--table-row-even-background, transparent);
 }
 .map-manager-public-infopanel .map-manager-token-stats {
 	margin-bottom: 0.75em;

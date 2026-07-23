@@ -121,13 +121,15 @@ export class Toolbar {
 			// Fog runs even in grid type "none" (on its hidden square substrate — see MapCanvas),
 			// so the toggle/reset controls aren't restricted to celled grid types.
 			this.renderFogDropdown(this.el, data);
-
-			const publishGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
-			const publishBtn = publishGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-			setIcon(publishBtn, "upload");
-			setTooltip(publishBtn, "Publier la vue (met à jour le .json pour le site externe)");
-			publishBtn.onclick = () => this.actions.publish();
 		}
+
+		// Publishing reads whatever fog/exploration state is currently on the map, so it's useful from
+		// either mode — not just "Vue", where a GM runs live sessions.
+		const publishGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
+		const publishBtn = publishGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(publishBtn, "upload");
+		setTooltip(publishBtn, "Publier la vue (met à jour le .json pour le site externe)");
+		publishBtn.onclick = () => this.actions.publish();
 
 		const recenterGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
 		const resetBtn = recenterGroup.createEl("button", { text: "Recentrer", cls: "map-manager-btn" });
@@ -334,7 +336,6 @@ export class Toolbar {
 			};
 		};
 
-		makeZoomInput("min", data.minZoom, (v) => this.controller.update((d) => (d.minZoom = v)));
 		makeZoomInput("max", data.maxZoom, (v) => this.controller.update((d) => (d.maxZoom = v)));
 	}
 

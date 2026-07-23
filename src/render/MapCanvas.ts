@@ -374,11 +374,12 @@ export class MapCanvas {
 
 		// A plain click on empty space (no edit tool armed, and not landing on a token/marker —
 		// those already have their own selection/info-panel feedback, a ping would be redundant)
-		// pings that spot for players. Checked before `toolConsumedClick`/`painting` below, since a
+		// pings that spot for players — view mode only, since in edit mode a plain click is just
+		// deselecting/panning. Checked before `toolConsumedClick`/`painting` below, since a
 		// token click in edit mode also flips `toolConsumedClick` (it's not just for brush/fill/wall
 		// placement). Re-does the same hit-tests as `onPointerDown` rather than reading
 		// `draggingToken`/`draggingMarker`, since edit mode never sets those for a token click.
-		if (!this.dragMoved && this.controller.activeTool === "none") {
+		if (!this.dragMoved && this.controller.mode === "view" && this.controller.activeTool === "none") {
 			const rect = this.canvas.getBoundingClientRect();
 			const px = e.clientX - rect.left;
 			const py = e.clientY - rect.top;

@@ -10,7 +10,7 @@ import {
 	splitLink,
 	tokenStatsSourceLink,
 } from "../data/mapData";
-import { toSiteAssetPath } from "../data/publicAssetPaths";
+import { toSiteAssetPath, toSiteNotePath } from "../data/publicAssetPaths";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 
 /** Every link reachable from a (already-redacted, already tab-materialized — see `materializeTokenTabs`) map's surviving cells/markers/tokens. */
@@ -42,9 +42,29 @@ function materializeTokenTabs(data: MapFileData, tokenTemplates: TokenTemplate[]
 	return { ...data, tokens: data.tokens.map((token) => ({ ...token, tabs: getTokenTabs(token, tokenTemplates) })) };
 }
 
-/** Un-navigable version of Obsidian's rendered internal/external links — keeps the text, drops the ability to click through. */
-function neutralizeLinks(container: HTMLElement): void {
+/**
+ * Resolves every rendered internal-link anchor to its target note's page on the exported site (see
+ * `toSiteNotePath`), so a link in a linked note's body navigates the visitor there, same as it
+ * would inside Obsidian. External links are left clickable too, but forced to open in a new tab so
+ * they don't navigate the visitor away from the map. Only a link with nowhere to resolve to (the
+ * target note doesn't exist, or it's some other kind of anchor entirely) falls back to keeping the
+ * text without the ability to click through.
+ */
+function rewriteLinksForSite(app: App, container: HTMLElement, sourcePath: string): void {
 	for (const anchor of Array.from(container.querySelectorAll("a"))) {
+		if (anchor.classList.contains("internal-link")) {
+			const raw = anchor.getAttribute("data-href") ?? anchor.getAttribute("href") ?? "";
+			const { path, subpath } = splitLink(raw);
+			const target = app.metadataCache.getFirstLinkpathDest(path, sourcePath);
+			if (target) {
+				anchor.setAttribute("href", `${toSiteNotePath(target.path)}${subpath ? `#${subpath}` : ""}`);
+				continue;
+			}
+		} else if (anchor.classList.contains("external-link")) {
+			anchor.setAttribute("target", "_blank");
+			anchor.setAttribute("rel", "noopener noreferrer");
+			continue;
+		}
 		const span = document.createElement("span");
 		span.className = anchor.className.replace(/\b(internal-link|external-link)\b/g, "").trim();
 		while (anchor.firstChild) span.appendChild(anchor.firstChild);
@@ -107,7 +127,7 @@ function rewriteEmbeddedMedia(app: App, container: HTMLElement): void {
 	}
 }
 
-/** Resolves + renders one note link (with optional `#subpath`) to static, link-neutralized HTML. `null` if the note/section can't be found. */
+/** Resolves + renders one note link (with optional `#subpath`) to static HTML with site-navigable links (see `rewriteLinksForSite`). `null` if the note/section can't be found. */
 async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 	const { path, subpath } = splitLink(link);
 	const file = app.metadataCache.getFirstLinkpathDest(path, "") ?? app.vault.getAbstractFileByPath(path);
@@ -136,7 +156,7 @@ async function renderNoteHtml(app: App, link: string): Promise<string | null> {
 		component.unload();
 	}
 	rewriteEmbeddedMedia(app, container);
-	neutralizeLinks(container);
+	rewriteLinksForSite(app, container, file.path);
 	sanitizeRenderedNote(container);
 	return container.outerHTML;
 }
