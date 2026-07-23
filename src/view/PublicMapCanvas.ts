@@ -32,12 +32,15 @@ export interface PublicMapCanvasOptions {
  * Default asset resolution: takes just the *basename* of the stored path (dropping any
  * subfolder) and serves it from the site root — matching the site-export plugin's actual asset
  * layout, which copies vault attachments into `static/` flattened (a file at vault path
- * `Images/geography.jpg` ends up at `/geography.jpg`, not `/Images/geography.jpg`). Override via
- * `PublicMapCanvasOptions.resolveAssetUrl` if that convention ever changes.
+ * `Images/geography.jpg` ends up at `/geography.jpg`, not `/Images/geography.jpg`). Prefixed with
+ * `window.MAP_MANAGER_VIEWER_BASE_URL` (default `"/"`), matching `resolveVaultRootUrl` in
+ * `customScript.ts`. Override via `PublicMapCanvasOptions.resolveAssetUrl` if that convention ever
+ * changes.
  */
 export function defaultResolveAssetUrl(path: string): string {
 	const basename = path.split("/").pop() || path;
-	return encodeURI(`/${basename}`);
+	const base = window.MAP_MANAGER_VIEWER_BASE_URL || "/";
+	return encodeURI(base.endsWith("/") ? `${base}${basename}` : `${base}/${basename}`);
 }
 
 interface ImageEntry {
