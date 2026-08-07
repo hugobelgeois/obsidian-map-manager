@@ -1,5 +1,5 @@
 import { Notice, Plugin, TFile, TFolder, normalizePath } from "obsidian";
-import { createDefaultMapData, MapDefaults, parseMapData, serializeMapData } from "./data/mapData";
+import { createDefaultMapData, MapDefaults, parseMapData, publicSnapshotPath, serializeMapData } from "./data/mapData";
 import { openPlayerWindow } from "./platform/openPlayerWindow";
 import { publishPublicSnapshot } from "./platform/publishPublicSnapshot";
 import { MapManagerSettingsTab } from "./settings/SettingsTab";
@@ -92,6 +92,16 @@ export default class MapManagerPlugin extends Plugin {
 				});
 			})
 		);
+
+		// Keeps a `.map` file's published public snapshot (see `publishPublicSnapshot`) sitting next
+		// to it under a rename/move, same as `publicSnapshotPath` always expects — otherwise renaming
+		// the map leaves an orphaned `<old-name>.json` behind and the new name has no snapshot until
+		// the next "Publier la vue".
+		this.registerEvent(
+			this.app.vault.on("rename", (file, oldPath) => {
+				if (file instanceof TFile && file.extension === "map") void this.renameAssociatedSnapshot(file, oldPath);
+			})
+		);
 	}
 
 	getMapDefaults(): MapDefaults {
@@ -125,6 +135,21 @@ export default class MapManagerPlugin extends Plugin {
 		await this.app.workspace.getLeaf(true).openFile(file);
 	}
 
+	/** See the `"rename"` listener in `onload` above. No-op if the map was never published (no snapshot to move) or something's already sitting at the destination path. */
+	private async renameAssociatedSnapshot(file: TFile, oldPath: string): Promise<void> {
+		const oldSnapshotPath = publicSnapshotPath(oldPath);
+		const newSnapshotPath = publicSnapshotPath(file.path);
+		if (oldSnapshotPath === newSnapshotPath) return;
+		const snapshotFile = this.app.vault.getAbstractFileByPath(oldSnapshotPath);
+		if (!(snapshotFile instanceof TFile)) return;
+		if (this.app.vault.getAbstractFileByPath(newSnapshotPath)) return;
+		try {
+			await this.app.fileManager.renameFile(snapshotFile, newSnapshotPath);
+		} catch (e) {
+			console.error("Map Manager: échec du renommage de l'export JSON associé", e);
+		}
+	}
+
 	private async publishMap(file: TFile): Promise<void> {
 		try {
 			const raw = await this.app.vault.read(file);
@@ -138,8 +163,13 @@ export default class MapManagerPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		const loaded = (await this.loadData()) as Partial<MapManagerSettings> | null;
+		const loaded = (await this.loadData()) as (Partial<MapManagerSettings> & { fogAnimations?: boolean }) | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+		// Pre-combo-box settings stored a plain boolean here; map it onto the new mode so users who
+		// had the (old, single) animation turned on don't silently lose it after this update.
+		if (loaded && loaded.fogAnimationMode === undefined && loaded.fogAnimations !== undefined) {
+			this.settings.fogAnimationMode = loaded.fogAnimations ? "simple" : "none";
+		}
 	}
 
 	async saveSettings(): Promise<void> {

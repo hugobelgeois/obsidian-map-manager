@@ -1,7 +1,8 @@
 import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode } from "../controller/MapController";
-import { MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Marker, Token, WallPoint, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
+import { FogAnimationMode, MapManagerSettings } from "../settings/types";
+import { DEFAULT_TOKEN_COLOR, Marker, Token, TokenCategory, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
+import { drawTokenFacingArrow } from "./drawing";
 import {
 	ABS_MIN_ZOOM,
 	SnapCandidate,
@@ -13,6 +14,7 @@ import {
 	hexCorners,
 	hexGridSnapCandidates,
 	hexWorldToCell,
+	projectOntoSegment,
 	screenToWorld,
 	segmentIntersection,
 	squareFootprintAnchor,
@@ -65,11 +67,18 @@ const FOG_TREMBLE_SCREEN_PX = 4;
 const FOG_MEMORY_TREMBLE_SCREEN_PX = 10;
 /** Angular speed (rad/s) of the tremble's sine wave. */
 const FOG_TREMBLE_SPEED = 1.6;
+/**
+ * World-unit wavelength of the "advanced" memory-frontier tremble's spatial noise (see
+ * `organicJitter2D`) — roughly the size of one independently-drifting "zone" of fog. Tiles much
+ * closer together than this move almost identically (no seam at their shared edge); tiles farther
+ * apart than this drift increasingly out of sync.
+ */
+const FOG_ORGANIC_WAVELENGTH = 260;
 /** Fixed screen-pixel blur radius for the fog buffer (see `drawFog`) — independent of zoom or the LOD tile size. */
 const FOG_BLUR_SCREEN_PX = 22;
 /** Fixed screen-pixel overdraw margin on the offscreen fog buffer — see `renderFogLayer`. Comfortably larger than `FOG_BLUR_SCREEN_PX`. */
 const FOG_OVERDRAW_PX = FOG_BLUR_SCREEN_PX * 3;
-/** Fog animations (the tremble, and the render loop driving it) are force-disabled at or past this zoom — see `fogAnimationsActive`. */
+/** Fog animations (the tremble, and the render loop driving it) are force-disabled at or past this zoom — see `activeFogAnimationMode`. */
 const FOG_ANIMATION_MIN_ZOOM = 0.5;
 
 /** Axial neighbor offsets (orientation-agnostic — pointy vs. flat only changes pixel<->hex conversion, not adjacency). */
@@ -88,6 +97,8 @@ const FILL_LIMIT = 4000;
 const WALL_POINT_HIT_RATIO = 0.2;
 /** Fixed screen-pixel radius within which a placed wall point snaps to a grid corner/midpoint/edge. */
 const WALL_SNAP_SCREEN_PX = 14;
+/** Fixed screen-pixel tolerance for clicking on/near an existing wall segment's line — selecting it, or double-clicking to insert a mid-point (see `findWallSegmentAtScreenPoint`). */
+const WALL_SEGMENT_HIT_SCREEN_PX = 8;
 
 /** Mixes a #rrggbb color toward white by `ratio` (0 = unchanged, 1 = white). Used for the selected-token border. */
 function lightenColor(hex: string, ratio: number): string {
@@ -102,6 +113,29 @@ function tremblePhase(tokenId: string): number {
 	let hash = 0;
 	for (let i = 0; i < tokenId.length; i++) hash = (hash * 31 + tokenId.charCodeAt(i)) | 0;
 	return (hash % 1000) / 1000;
+}
+
+/**
+ * Smooth 2D pseudo-noise sampled at a world position and time, each axis roughly in [-1, 1] —
+ * used only in "advanced" fog animation mode, for the memory frontier's per-tile drift (`drawFog`).
+ *
+ * This is deliberately a sum of a couple of *mismatched* sine waves (different spatial wavelengths,
+ * different speeds, unrelated phase offsets) rather than either a single shared offset ("simple"
+ * mode's `sharedJitterX`/`sharedJitterY`) or fully independent per-tile random phase. A single
+ * offset moves the whole frontier as one rigid block — not what "advanced" asks for. Fully
+ * independent per-tile randomness was tried first and looked like flickering static: neighboring
+ * tiles got uncorrelated offsets, so gaps of raw unexplored-opacity fog flashed open between them
+ * every frame as their offsets drifted apart. Because this function is continuous in `worldX`/
+ * `worldY`, two points closer together than `FOG_ORGANIC_WAVELENGTH` come out nearly identical (no
+ * seam at a shared tile edge), while points farther apart drift independently and out of phase —
+ * which is what actually reads as "separate zones of fog, each alive on its own" instead of either
+ * a single rigid shift or noise.
+ */
+function organicJitter2D(worldX: number, worldY: number, time: number): { x: number; y: number } {
+	const k = (2 * Math.PI) / FOG_ORGANIC_WAVELENGTH;
+	const x = Math.sin(worldX * k + time * 0.5) * 0.55 + Math.sin(worldY * k * 1.7 - time * 0.33 + 1.3) * 0.45;
+	const y = Math.sin(worldY * k * 1.3 + time * 0.41 + 2.1) * 0.55 + Math.sin(worldX * k * 0.8 - time * 0.27 + 0.7) * 0.45;
+	return { x, y };
 }
 
 interface DraggingToken {
@@ -177,7 +211,7 @@ export class MapCanvas {
 	/** Second pass: `fogCanvas`'s crisp content, blurred under a plain (unscaled) transform — see `renderFogLayer`. */
 	private fogBlurCanvas: HTMLCanvasElement = document.createElement("canvas");
 	private fogBlurCtx: CanvasRenderingContext2D;
-	/** Non-null while the fog-tremble animation loop (settings.fogAnimations) is actively re-rendering every frame. */
+	/** Non-null while the fog-tremble animation loop (settings.fogAnimationMode) is actively re-rendering every frame. */
 	private animationFrameId: number | null = null;
 
 	/** The "look here" ring shown after a plain click (`triggerPing`) — world position and when it started, or `null` once it's finished expanding/fading. */
@@ -190,6 +224,8 @@ export class MapCanvas {
 	private draggingToken: DraggingToken | null = null;
 	private draggingMarker: DraggingMarker | null = null;
 	private draggingWallPoint: DraggingWallPoint | null = null;
+	/** Set in onPointerDown when a plain click lands on a wall segment's line (away from either endpoint) — segments have no drag of their own, so this just waits to see whether onPointerUp should select it (a click) or leave it to pan as normal (a drag past the threshold). See `onPointerUp`. */
+	private pendingWallSegmentId: string | null = null;
 	/** True while the brush tool is actively painting cells under a held-down drag. */
 	private painting = false;
 	private lastPaintedKey: string | null = null;
@@ -222,15 +258,15 @@ export class MapCanvas {
 
 		const menu = new Menu();
 		let hasItem = false;
-		// Markers are freeform (grid type "none" only, see `Marker`), so only offer to place one there.
+		// Markers are freeform (grid type "none" only, see `Marker`), map-structure objects — edit mode only.
 		if (this.controller.mode === "edit" && this.controller.getData().gridType === "none") {
 			menu.addItem((item) => item.setTitle("Placer un tampon ici").setIcon("map-pin").onClick(() => this.addMarkerAt(px, py)));
 			hasItem = true;
 		}
-		if (this.controller.mode === "edit") {
-			menu.addItem((item) => item.setTitle("Placer un pion ici").setIcon("user").onClick(() => this.addTokenAt(px, py)));
-			hasItem = true;
-		}
+		// Tokens can be dropped in both modes — a GM adding a monster/NPC mid-session (view mode)
+		// needs this as much as one building the map out (edit mode).
+		menu.addItem((item) => item.setTitle("Placer un pion ici").setIcon("user").onClick(() => this.addTokenAt(px, py)));
+		hasItem = true;
 		// Nothing to offer (e.g. edit mode on a celled grid) — let the browser's own context menu show.
 		if (!hasItem) return;
 		e.preventDefault();
@@ -251,6 +287,12 @@ export class MapCanvas {
 		this.pointerDownAt = { x: e.clientX, y: e.clientY };
 		this.lastPointer = { x: e.clientX, y: e.clientY };
 		this.canvas.setPointerCapture(e.pointerId);
+
+		// Only the primary (left) button hits tokens/markers/wall points/segments or drives
+		// brush/fill/wall tool actions below — any other button (middle-click to pan while a tool
+		// like "wall" is active, in particular) falls straight through to the plain drag-to-pan
+		// handled in onPointerMove's final `else` branch, same as a left-click on empty space.
+		if (e.button !== 0) return;
 
 		// Tokens are selectable in both modes, but only draggable/movable in view mode — edit mode
 		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
@@ -279,11 +321,17 @@ export class MapCanvas {
 		// Wall points are draggable/selectable regardless of the active tool (like tokens/markers
 		// above), unless the wall tool itself is active — in that case the click instead goes through
 		// `resolveWallPlacement`/`commitWallPoint` below, which does its own hit-test as part of
-		// closing a shape onto an existing point.
+		// closing a shape onto an existing point. Wall segments are click-selectable the same way
+		// (there's no independent drag for a segment — it moves via its endpoint points).
 		if (this.controller.activeTool !== "wall") {
 			const hitPoint = this.findWallPointAtScreenPoint(px, py);
 			if (hitPoint) {
 				this.draggingWallPoint = { point: hitPoint, currentWorld: screenToWorld(px, py, this.transform) };
+				return;
+			}
+			const hitSegment = this.findWallSegmentAtScreenPoint(px, py);
+			if (hitSegment) {
+				this.pendingWallSegmentId = hitSegment.id;
 				return;
 			}
 		}
@@ -372,14 +420,15 @@ export class MapCanvas {
 		this.dragging = false;
 		if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
 
-		// A plain click on empty space (no edit tool armed, and not landing on a token/marker —
+		// A plain left-click on empty space (no edit tool armed, and not landing on a token/marker —
 		// those already have their own selection/info-panel feedback, a ping would be redundant)
 		// pings that spot for players — view mode only, since in edit mode a plain click is just
 		// deselecting/panning. Checked before `toolConsumedClick`/`painting` below, since a
 		// token click in edit mode also flips `toolConsumedClick` (it's not just for brush/fill/wall
 		// placement). Re-does the same hit-tests as `onPointerDown` rather than reading
 		// `draggingToken`/`draggingMarker`, since edit mode never sets those for a token click.
-		if (!this.dragMoved && this.controller.mode === "view" && this.controller.activeTool === "none") {
+		// Right-click is excluded — that's `onContextMenu`'s job (placing a token there), not a ping.
+		if (!this.dragMoved && e.button === 0 && this.controller.mode === "view" && this.controller.activeTool === "none") {
 			const rect = this.canvas.getBoundingClientRect();
 			const px = e.clientX - rect.left;
 			const py = e.clientY - rect.top;
@@ -447,7 +496,19 @@ export class MapCanvas {
 			return;
 		}
 
-		if (!this.dragMoved) this.handleClick(e);
+		if (this.pendingWallSegmentId) {
+			const segmentId = this.pendingWallSegmentId;
+			this.pendingWallSegmentId = null;
+			// A drag past the threshold that merely started on top of a segment's line is just a pan
+			// (already applied live in onPointerMove's default branch, since nothing above consumed
+			// it) — only a plain click selects the segment.
+			if (!this.dragMoved) this.controller.selectWallSegment(segmentId);
+			return;
+		}
+
+		// Left-click only: right-click on empty cell space is left to `onContextMenu` (placing a
+		// token/marker) rather than toggling the cell's info panel open/closed.
+		if (!this.dragMoved && e.button === 0) this.handleClick(e);
 	};
 
 	private onPointerCancel = () => {
@@ -455,11 +516,33 @@ export class MapCanvas {
 		this.draggingToken = null;
 		this.draggingMarker = null;
 		this.draggingWallPoint = null;
+		this.pendingWallSegmentId = null;
 		if (this.painting) this.controller.endHistoryGroup();
 		this.painting = false;
 		this.lastPaintedKey = null;
 		this.paintedInStroke = new Set();
 		this.toolConsumedClick = false;
+	};
+
+	/**
+	 * Double-clicking a wall segment's line (away from an existing point) inserts a new point right
+	 * there, splitting the segment in two — lets a straight wall line be reshaped without redrawing
+	 * it. Gated the same way as dragging/selecting an existing point (`onPointerDown` above): only
+	 * in edit mode, and not while the wall tool itself is armed, since there each click already means
+	 * something else (placing/continuing a chain).
+	 */
+	private onDoubleClick = (e: MouseEvent) => {
+		if (this.controller.mode !== "edit" || this.controller.activeTool === "wall") return;
+		const rect = this.canvas.getBoundingClientRect();
+		const px = e.clientX - rect.left;
+		const py = e.clientY - rect.top;
+		if (this.findWallPointAtScreenPoint(px, py)) return;
+		const segment = this.findWallSegmentAtScreenPoint(px, py);
+		if (!segment) return;
+		e.preventDefault();
+		const world = this.snapWorldToGrid(screenToWorld(px, py, this.transform));
+		const newPointId = this.controller.insertWallPointOnSegment(segment.id, world.x, world.y);
+		if (newPointId) this.controller.selectWallPoint(newPointId);
 	};
 
 	private onWheel = (e: WheelEvent) => {
@@ -517,6 +600,7 @@ export class MapCanvas {
 			this.canvas.addEventListener("pointermove", this.onPointerMove);
 			this.canvas.addEventListener("pointerup", this.onPointerUp);
 			this.canvas.addEventListener("pointercancel", this.onPointerCancel);
+			this.canvas.addEventListener("dblclick", this.onDoubleClick);
 			this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
 			this.canvas.addEventListener("contextmenu", this.onContextMenu);
 		}
@@ -685,6 +769,7 @@ export class MapCanvas {
 			this.canvas.removeEventListener("pointermove", this.onPointerMove);
 			this.canvas.removeEventListener("pointerup", this.onPointerUp);
 			this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
+			this.canvas.removeEventListener("dblclick", this.onDoubleClick);
 			this.canvas.removeEventListener("wheel", this.onWheel);
 			this.canvas.removeEventListener("contextmenu", this.onContextMenu);
 		}
@@ -907,6 +992,60 @@ export class MapCanvas {
 		return null;
 	}
 
+	/** Closest committed `WallSegment` whose line passes within `WALL_SEGMENT_HIT_SCREEN_PX` of the screen point, or `null` — used both to select a segment (for its own type editor) and to insert a mid-point on it (see the `dblclick` handler). */
+	private findWallSegmentAtScreenPoint(px: number, py: number): WallSegment | null {
+		const world = screenToWorld(px, py, this.transform);
+		const data = this.controller.getData();
+		const tolerance = WALL_SEGMENT_HIT_SCREEN_PX / this.transform.zoom;
+		for (let li = data.layers.length - 1; li >= 0; li--) {
+			const layer = data.layers[li];
+			if (!layer?.visible) continue;
+			const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
+			for (let i = layer.wallSegments.length - 1; i >= 0; i--) {
+				const segment = layer.wallSegments[i];
+				if (!segment) continue;
+				const a = pointsById.get(segment.aId);
+				const b = pointsById.get(segment.bId);
+				if (!a || !b) continue;
+				const proj = projectOntoSegment(world.x, world.y, a, b);
+				if (Math.hypot(world.x - proj.x, world.y - proj.y) <= tolerance) return segment;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Nearest point on any existing wall segment's line within `WALL_SEGMENT_HIT_SCREEN_PX`, or
+	 * `null` — lets a wall-tool click land squarely on another wall (a T-junction the point-crossing
+	 * reconciliation in `MapController.addWallSegment` then treats as "joined a wall") instead of a
+	 * fraction of a pixel off it. Used by `resolveWallPlacement`, both for the live preview and the
+	 * actual commit — the join itself only happens once `commitWallPoint` runs; this is just where
+	 * the point gets snapped to.
+	 */
+	private snapToWallSegmentLine(px: number, py: number): { x: number; y: number } | null {
+		const world = screenToWorld(px, py, this.transform);
+		const data = this.controller.getData();
+		const tolerance = WALL_SEGMENT_HIT_SCREEN_PX / this.transform.zoom;
+		let best: { x: number; y: number } | null = null;
+		let bestDist = tolerance;
+		for (const layer of data.layers) {
+			if (!layer.visible) continue;
+			const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
+			for (const segment of layer.wallSegments) {
+				const a = pointsById.get(segment.aId);
+				const b = pointsById.get(segment.bId);
+				if (!a || !b) continue;
+				const proj = projectOntoSegment(world.x, world.y, a, b);
+				const dist = Math.hypot(world.x - proj.x, world.y - proj.y);
+				if (dist <= bestDist) {
+					best = proj;
+					bestDist = dist;
+				}
+			}
+		}
+		return best;
+	}
+
 	/** Snaps a world point onto a nearby grid corner/edge-midpoint/edge (see `squareGridSnapCandidates`/`hexGridSnapCandidates`), or returns it unchanged if none is close enough (or there's no grid). Used both when placing a new wall point and when dragging an existing one. */
 	private snapWorldToGrid(world: { x: number; y: number }): { x: number; y: number } {
 		const data = this.controller.getData();
@@ -933,12 +1072,15 @@ export class MapCanvas {
 
 	/**
 	 * Resolves where a wall-tool click at `(px, py)` should actually place its point: snapping onto
-	 * an existing point first (closes a shape / continues from a shared node), else onto the grid
-	 * via `snapWorldToGrid`, else the raw clicked position.
+	 * an existing point first (closes a shape / continues from a shared node), else onto an existing
+	 * wall's line (a T-junction — see `snapToWallSegmentLine`), else onto the grid via
+	 * `snapWorldToGrid`, else the raw clicked position.
 	 */
 	private resolveWallPlacement(px: number, py: number): { x: number; y: number; existingPointId?: string } {
 		const hit = this.findWallPointAtScreenPoint(px, py);
 		if (hit) return { x: hit.x, y: hit.y, existingPointId: hit.id };
+		const onSegment = this.snapToWallSegmentLine(px, py);
+		if (onSegment) return onSegment;
 		return this.snapWorldToGrid(screenToWorld(px, py, this.transform));
 	}
 
@@ -1089,23 +1231,24 @@ export class MapCanvas {
 	}
 
 	/**
-	 * Whether the fog tremble should actually run right now: the opt-in setting has to be on, and
+	 * The active fog tremble mode right now: the setting has to be something other than "none", and
 	 * zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a render every
 	 * frame while zoomed out that far is the one combination that's shown fog visibly breaking near
 	 * the edges, so it's disabled there as a hard safety net regardless of the exact cause.
 	 */
-	private fogAnimationsActive(): boolean {
-		return this.settings.fogAnimations && this.transform.zoom >= FOG_ANIMATION_MIN_ZOOM;
+	private activeFogAnimationMode(): FogAnimationMode {
+		if (this.settings.fogAnimationMode === "none" || this.transform.zoom < FOG_ANIMATION_MIN_ZOOM) return "none";
+		return this.settings.fogAnimationMode;
 	}
 
 	/**
 	 * Keeps a `requestAnimationFrame` loop running for as long as (and only while) fog is visible
-	 * and animations are actually active (see `fogAnimationsActive`), so the vision edge's subtle
+	 * and animations are actually active (see `activeFogAnimationMode`), so the vision edge's subtle
 	 * tremble (see `appendVisionFan`) keeps redrawing; otherwise fog is static and this never fires,
-	 * costing nothing when the setting is off (its default) or zoomed out too far.
+	 * costing nothing when the setting is "none" (its default) or zoomed out too far.
 	 */
 	private syncFogAnimationLoop(): void {
-		const shouldAnimate = this.fogAnimationsActive() && this.fogCurrentlyVisible();
+		const shouldAnimate = this.activeFogAnimationMode() !== "none" && this.fogCurrentlyVisible();
 		if (shouldAnimate && this.animationFrameId === null) {
 			const tick = () => {
 				this.animationFrameId = requestAnimationFrame(tick);
@@ -1218,6 +1361,8 @@ export class MapCanvas {
 			ctx.restore();
 		}
 
+		if (!this.isMirror && !this.options.forceFog) this.drawTokenVisionZones(ctx);
+
 		this.drawTokens(ctx);
 		if (cellsVisible || noGrid || this.controller.selectedWallPointId) this.drawSelection(ctx);
 		this.drawWallPreview(ctx);
@@ -1303,10 +1448,10 @@ export class MapCanvas {
 
 	/**
 	 * Appends one token's vision fan (a closed polygon through its ray endpoints) to `path`. The
-	 * tremble (`animate`) is applied only to this drawn shape, never to `rays` themselves — see the
+	 * tremble (`mode`) is applied only to this drawn shape, never to `rays` themselves — see the
 	 * comment on `castRaysForToken` for why baking it into the actual reach caused lasting corruption.
 	 */
-	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, animate: boolean, time: number): void {
+	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, mode: FogAnimationMode, time: number): void {
 		const { center, rays, phase } = vision;
 		let started = false;
 		for (let i = 0; i < rays.length; i++) {
@@ -1315,12 +1460,26 @@ export class MapCanvas {
 			const angle = (360 / rays.length) * i;
 			const rad = (angle * Math.PI) / 180;
 			let dist = useDim ? ray.dimEnd : ray.clearEnd;
-			if (animate && dist > 0) {
+			if (mode !== "none" && dist > 0) {
 				// Fixed screen-pixel amplitude (divided by zoom) so it stays equally visible at any
 				// zoom, capped to a fraction of `dist` so it can't push the drawn point past the
 				// center (dividing a fixed px amount by a shrinking zoom is unbounded on its own).
 				const wobblePx = Math.min(FOG_TREMBLE_SCREEN_PX / this.transform.zoom, dist * 0.3);
-				dist += wobblePx * Math.sin(time * FOG_TREMBLE_SPEED + angle * 0.11 + phase);
+				if (mode === "advanced") {
+					// Sum of a few mismatched angular harmonics (integer multiples of `rad` — integer
+					// so the closed fan shape still lines up seamlessly at the 0/360 wrap, no seam)
+					// at different speeds and phases, instead of "simple"'s single traveling wave (one
+					// direction, one speed for the whole edge — see the `else` branch, unchanged).
+					// Summing mismatched harmonics makes different lobes of the fan edge bulge and
+					// recede on their own schedule rather than one ripple sweeping uniformly around it.
+					dist +=
+						wobblePx *
+						(Math.sin(time * 1.3 + rad * 3 + phase) * 0.5 +
+							Math.sin(time * 0.8 + rad * 7 + phase * 1.7) * 0.3 +
+							Math.sin(time * 1.9 + rad * 13 + phase * 2.3) * 0.2);
+				} else {
+					dist += wobblePx * Math.sin(time * FOG_TREMBLE_SPEED + angle * 0.11 + phase);
+				}
 			}
 			const x = center.x + Math.cos(rad) * dist;
 			const y = center.y + Math.sin(rad) * dist;
@@ -1337,6 +1496,56 @@ export class MapCanvas {
 	/** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
 	private isLitByCache(cache: PlayerVisionRays[], worldX: number, worldY: number, useDim: boolean): boolean {
 		return isPointLit(cache, worldX, worldY, useDim);
+	}
+
+	/** Translucent fill colors for `drawTokenVisionZones`, by category. */
+	private static readonly VISION_ZONE_COLOR: Record<TokenCategory, string> = {
+		entity: "rgba(220, 38, 38, 0.28)",
+		player: "rgba(37, 99, 235, 0.28)",
+	};
+
+	/**
+	 * GM-only tactical hint: a token's own vision cone (the exact same fields/geometry either
+	 * category uses, traced with `castVisionRays` against the same walls), drawn as a translucent
+	 * colored zone — red for an entity, blue for a player, so the GM can preview exactly what either
+	 * would notice without touching the real fog system at all: this never feeds `isLitByCache` (so
+	 * it doesn't affect which entities the fog itself renders) and never calls `markExplored` (so it
+	 * can't leak into a player's explored memory). The call site in `render` already excludes the
+	 * player-mirror window (`isMirror`/`forceFog`), the one canvas real players actually see, so it's
+	 * safe to show this in either "edit" or "view" mode here — both are GM-facing (see the "Public
+	 * viewer" section of CLAUDE.md on why in-Obsidian "view" mode is still GM-only).
+	 *
+	 * In edit mode specifically, only the *selected* token's own zone is drawn, regardless of
+	 * category — with every token's zone shown at once, a map with more than a couple of tokens
+	 * placed turns into a wash of overlapping color; a player's cone is also otherwise invisible in
+	 * edit mode (the real fog only ever renders in "view" mode, see `fogCurrentlyVisible`), so this
+	 * is the only way to preview it there at all. In "view" mode (live play, not actively
+	 * placing/editing tokens) every entity's zone shows continuously instead, since there's no
+	 * selection concept driving that same clutter there — a player's cone doesn't need the same
+	 * treatment in "view" mode since the real fog overlay already shows it for free there.
+	 *
+	 * Uses each ray's `dimEnd` (reach blocked only by "opaque" walls, not "dim" ones) as the single
+	 * boundary — there's no two-tier memory/live split to preserve here like `drawFog` has, just one
+	 * shape.
+	 */
+	private drawTokenVisionZones(ctx: CanvasRenderingContext2D): void {
+		const wallSegments = this.resolveWallSegments();
+		const fillZone = (tokens: Token[], color: string) => {
+			if (tokens.length === 0) return;
+			const path = new Path2D();
+			for (const token of tokens) this.appendVisionFan(path, this.castRaysForToken(token, wallSegments), true, "none", 0);
+			ctx.fillStyle = color;
+			ctx.fill(path);
+		};
+
+		if (this.effectiveMode() === "edit") {
+			const selected = this.controller.getData().tokens.find((t) => t.id === this.controller.selectedTokenId);
+			if (selected) fillZone([selected], MapCanvas.VISION_ZONE_COLOR[selected.category ?? "entity"]);
+			return;
+		}
+
+		const entities = this.controller.getData().tokens.filter((t) => (t.category ?? "entity") === "entity");
+		fillZone(entities, MapCanvas.VISION_ZONE_COLOR.entity);
 	}
 
 	/** World-space rectangle currently on screen, used to bound the fog-memory bucket scan. */
@@ -1452,7 +1661,8 @@ export class MapCanvas {
 		const cache = this.frameVisionCache;
 		const baseBucket = this.fogBucketSize();
 		const tile = this.fogIterationBucketSize(rect);
-		const animate = this.fogAnimationsActive();
+		const mode = this.activeFogAnimationMode();
+		const animate = mode !== "none";
 		const time = animate ? performance.now() / 1000 : 0;
 		// A fixed screen-pixel amplitude, converted to world units by the current zoom, so the
 		// tremble stays equally visible at any zoom instead of shrinking away when zoomed out (a
@@ -1460,16 +1670,19 @@ export class MapCanvas {
 		// with everything else once zoom drops, which read as "the animation stops"). Capped to a
 		// fraction of `tile` so it can never exceed a sane range at extreme zoom.
 		//
-		// This is a *single* offset applied uniformly to every tile's drawn position (not each
-		// tile's own size — see `jitterX`/`jitterY` below), and it never touches which world point
-		// is sampled for the persisted-memory lookup a few lines down. Perturbing each tile's own
-		// rect individually (an earlier version of this) could size a tile down to zero or negative
-		// at extreme/changing zoom, which is what actually broke near the edges; a shared shift can't
-		// do that, and keeping the memory lookup itself un-jittered means resetting fog has no
-		// bearing on the animation — it's purely cosmetic now.
+		// In "simple" mode this is a *single* offset applied uniformly to every tile's drawn
+		// position (not each tile's own size — see `jitterX`/`jitterY` below); in "advanced" mode
+		// each tile instead samples smooth spatial noise (see `organicJitter2D`) so different
+		// patches of the frontier drift independently instead of the whole boundary moving in
+		// lockstep. Neither mode touches which world point is sampled for the persisted-memory
+		// lookup a few lines down. Perturbing each tile's own rect *size* (an earlier version of
+		// this) could shrink a tile to zero or negative at extreme/changing zoom, which is what
+		// actually broke near the edges; a position-only shift can't do that, and keeping the memory
+		// lookup itself un-jittered means resetting fog has no bearing on the animation — it's
+		// purely cosmetic.
 		const jitterAmplitude = animate ? Math.min(FOG_MEMORY_TREMBLE_SCREEN_PX / this.transform.zoom, tile * 0.4) : 0;
-		const jitterX = jitterAmplitude * Math.sin(time * FOG_TREMBLE_SPEED * 0.7);
-		const jitterY = jitterAmplitude * Math.cos(time * FOG_TREMBLE_SPEED * 0.9);
+		const sharedJitterX = jitterAmplitude * Math.sin(time * FOG_TREMBLE_SPEED * 0.7);
+		const sharedJitterY = jitterAmplitude * Math.cos(time * FOG_TREMBLE_SPEED * 0.9);
 		// Generous, independent of the tile loop below: the whole visible area (plus this margin)
 		// is unconditionally covered by the single base `fillRect` further down, so no bucket-count
 		// cap or rounding in the loop can ever leave a gap at the screen edges — at worst the loop's
@@ -1499,10 +1712,30 @@ export class MapCanvas {
 				if (litNow) newlyExplored.push(key);
 				if (already || litNow) {
 					hasExplored = true;
-					// Every tile of the explored/unexplored frontier shifts together a little
-					// (rather than only the vision fan near a token), so the whole fog boundary
-					// feels alive — each tile keeps its exact size, just its drawn position moves.
-					exploredPath.rect(bx * tile + jitterX, by * tile + jitterY, tile, tile);
+					// "simple": every tile of the explored/unexplored frontier shifts together a
+					// little (rather than only the vision fan near a token), so the whole fog
+					// boundary feels alive. "advanced": each tile instead samples smooth spatial
+					// noise (see `organicJitter2D`) at its own world position, so different zones of
+					// fog drift independently instead of the whole frontier moving as one block.
+					let jitterX = sharedJitterX;
+					let jitterY = sharedJitterY;
+					// In "advanced" mode, neighboring tiles can end up with slightly different
+					// offsets (that's the point — see above), which would otherwise crack open a
+					// sliver of raw unexplored-opacity fog between them right at their shared edge.
+					// `organicJitter2D` is built to keep that difference far smaller than
+					// `jitterAmplitude` between adjacent tiles, but inflating every tile by that same
+					// amplitude on all sides guarantees neighbors always overlap regardless, so nothing
+					// in this loop depends on exactly how smooth the noise turns out to be. "simple"
+					// needs none of this: one shared offset moves every tile identically, so adjacent
+					// tiles never separate in the first place.
+					let overlap = 0;
+					if (mode === "advanced") {
+						const n = organicJitter2D(worldX, worldY, time);
+						jitterX = jitterAmplitude * n.x;
+						jitterY = jitterAmplitude * n.y;
+						overlap = jitterAmplitude;
+					}
+					exploredPath.rect(bx * tile + jitterX - overlap, by * tile + jitterY - overlap, tile + 2 * overlap, tile + 2 * overlap);
 				}
 			}
 		}
@@ -1532,8 +1765,8 @@ export class MapCanvas {
 			const dimFan = new Path2D();
 			const clearFan = new Path2D();
 			for (const vision of cache) {
-				this.appendVisionFan(dimFan, vision, true, animate, time);
-				this.appendVisionFan(clearFan, vision, false, animate, time);
+				this.appendVisionFan(dimFan, vision, true, mode, time);
+				this.appendVisionFan(clearFan, vision, false, mode, time);
 			}
 			// Punch the full (dim) reach to transparent, repaint it at "explored" opacity, then punch
 			// the inner (clear) reach again so it ends up fully see-through.
@@ -1606,6 +1839,8 @@ export class MapCanvas {
 		ctx.strokeStyle = selected ? lightenColor(baseColor, 0.55) : baseColor;
 		ctx.stroke();
 
+		drawTokenFacingArrow(ctx, cx, cy, r, token.rotation ?? 0, selected ? lightenColor(baseColor, 0.55) : baseColor);
+
 		if (!image) {
 			ctx.textAlign = "center";
 			ctx.fillStyle = "#000000";
@@ -1652,7 +1887,9 @@ export class MapCanvas {
 	private drawWalls(ctx: CanvasRenderingContext2D): void {
 		const data = this.controller.getData();
 		if (!this.cellsCurrentlyVisible() && data.gridType !== "none") return;
-		const showHandles = this.effectiveMode() === "edit" && (this.controller.activeTool === "wall" || this.controller.selectedWallPointId !== null);
+		const showHandles =
+			this.effectiveMode() === "edit" &&
+			(this.controller.activeTool === "wall" || this.controller.selectedWallPointId !== null || this.controller.selectedWallSegmentId !== null);
 		const pointRadius = Math.max(2, this.wallPointHitRadius() * 0.35);
 		for (const layer of data.layers) {
 			if (!layer.visible) continue;
@@ -1811,6 +2048,23 @@ export class MapCanvas {
 			ctx.beginPath();
 			ctx.arc(pos.x, pos.y, this.wallPointHitRadius(), 0, Math.PI * 2);
 			ctx.stroke();
+			return;
+		}
+		const selectedWallSegment = this.controller.getSelectedWallSegment();
+		if (selectedWallSegment) {
+			const layer = data.layers.find((l) => l.wallSegments.some((s) => s.id === selectedWallSegment.id));
+			const a = layer?.wallPoints.find((p) => p.id === selectedWallSegment.aId);
+			const b = layer?.wallPoints.find((p) => p.id === selectedWallSegment.bId);
+			if (a && b) {
+				const aPos = this.wallPointPosition(a);
+				const bPos = this.wallPointPosition(b);
+				ctx.lineWidth = Math.max(3, 5 / this.transform.zoom);
+				ctx.strokeStyle = "#e0a020";
+				ctx.beginPath();
+				ctx.moveTo(aPos.x, aPos.y);
+				ctx.lineTo(bPos.x, bPos.y);
+				ctx.stroke();
+			}
 			return;
 		}
 		if (data.gridType === "none") {

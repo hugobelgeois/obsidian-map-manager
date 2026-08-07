@@ -1,6 +1,16 @@
 import { DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM } from "../grid/gridMath";
 import { GridType, TokenTemplate, ZoneType } from "../data/mapData";
 
+/**
+ * `"none"` — static fog, no redraw loop.
+ * `"simple"` — the previous boolean `fogAnimations: true` behavior: the whole explored/unexplored
+ * frontier trembles together as one shared shift, plus each player's vision-fan edge wobbles.
+ * `"advanced"` — the frontier trembles per-tile instead of as one shared shift, so different patches
+ * of fog drift independently ("chaque zone bouge individuellement") instead of the whole boundary
+ * moving in lockstep — see `organicJitter2D` in `MapCanvas.ts`.
+ */
+export type FogAnimationMode = "none" | "simple" | "advanced";
+
 export interface MapManagerSettings {
 	defaultGridType: GridType;
 	defaultCellSize: number;
@@ -12,8 +22,8 @@ export interface MapManagerSettings {
 	infoPanelWidth: number;
 	defaultMinZoom: number;
 	defaultMaxZoom: number;
-	/** Subtle animated flicker on the fog of war's vision edge (off by default — a continuous redraw loop while active). */
-	fogAnimations: boolean;
+	/** Subtle animated flicker on the fog of war's vision edge ("none" by default — a continuous redraw loop while active). */
+	fogAnimationMode: FogAnimationMode;
 	/** Seconds of inactivity after a map edit before `<map>.json` (see `publishPublicSnapshot`) is regenerated automatically — see `wireAutoPublish`. `0` disables auto-publishing entirely. */
 	autoPublishDelaySeconds: number;
 }
@@ -43,6 +53,6 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	infoPanelWidth: 280,
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
-	fogAnimations: false,
+	fogAnimationMode: "none",
 	autoPublishDelaySeconds: 10,
 };

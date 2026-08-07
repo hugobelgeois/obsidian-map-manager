@@ -3,13 +3,14 @@ import { MapController } from "../controller/MapController";
 import {
 	CellData,
 	DEFAULT_TOKEN_COLOR,
+	DEFAULT_TOKEN_ROTATION,
 	DEFAULT_VISION_ANGLE,
-	DEFAULT_VISION_DIRECTION,
 	DEFAULT_VISION_RADIUS,
 	DEFAULT_VISION_RANGE,
 	Marker,
 	TOKEN_SIZES,
 	Token,
+	TokenCategory,
 	TokenTab,
 	TokenTemplate,
 	VisionBlockerType,
@@ -20,6 +21,7 @@ import {
 	makeLink,
 	splitLink,
 	tokenStatsSourceLink,
+	WallSegment,
 } from "../data/mapData";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
 import { MapManagerSettings } from "../settings/types";
@@ -196,6 +198,17 @@ export class InfoPanel {
 				this.renderPanelHeader("Point de mur", () => this.controller.selectWallPoint(null));
 
 				this.renderWallPointPanel(found.id);
+				return;
+			}
+		}
+
+		if (this.controller.selectedWallSegmentId) {
+			const found = this.controller.getSelectedWallSegment();
+			if (found) {
+				this.setOpen(true);
+				this.renderPanelHeader("Segment de mur", () => this.controller.selectWallSegment(null));
+
+				this.renderWallSegmentPanel(found);
 				return;
 			}
 		}
@@ -379,6 +392,26 @@ export class InfoPanel {
 		deleteBtn.onclick = () => this.controller.removeWallPoint(pointId);
 	}
 
+	/** Unlike `renderWallPointPanel` (whole connected shape), edits exactly one segment — e.g. a single door-sized gap in an otherwise opaque wall. Reached by clicking directly on a wall's line rather than one of its endpoint handles. */
+	private renderWallSegmentPanel(segment: WallSegment): void {
+		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
+		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		const blockerSelect = blockerField.createEl("select");
+		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
+		opaqueOpt.value = "opaque";
+		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
+		dimOpt.value = "dim";
+		blockerSelect.value = segment.blockerType;
+		blockerSelect.onchange = () => this.controller.setWallSegmentBlockerType(segment.id, blockerSelect.value as VisionBlockerType);
+
+		const hint = this.el.createDiv({ cls: "map-manager-infopanel-empty" });
+		hint.setText("Double-cliquez sur ce segment pour y ajouter un point et modifier sa forme.");
+
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		const deleteBtn = footer.createEl("button", { text: "Supprimer ce segment", cls: "map-manager-btn map-manager-btn-danger" });
+		deleteBtn.onclick = () => this.controller.removeWallSegment(segment.id);
+	}
+
 	// ---- Tokens (full edit panel in edit mode; reduced read-mostly panel in view mode) ----
 
 	private renderTokenPanel(token: Token): void {
@@ -426,7 +459,8 @@ export class InfoPanel {
 		categorySelect.onchange = () =>
 			this.controller.updateToken(token.id, (t) => (t.category = categorySelect.value === "player" ? "player" : "entity"));
 
-		if (category === "player") this.renderVisionFields(token);
+		this.renderRotationField(token);
+		this.renderVisionFields(token, category);
 
 		const sizeField = this.el.createDiv({ cls: "map-manager-field" });
 		sizeField.createEl("label", { text: "Taille" });
@@ -467,20 +501,16 @@ export class InfoPanel {
 	}
 
 	/**
-	 * View mode only shows what a player needs mid-session: their vision direction (player tokens
-	 * only, so they can turn to face somewhere) and their tabs' read-only content (stats/inventory/
-	 * story/... — see `renderTokenTabsReadOnly`, which applies to both player and entity tokens).
-	 * Everything else (icon/image/name/category/size/color/template picker/delete) is edit-only.
+	 * View mode ("Vue", still GM-facing — see `MapCanvas.drawTokenVisionZones`) only shows what's
+	 * needed mid-session: rotation (any category — for a player this is also their vision cone's
+	 * facing, see `castVisionRays`; for an entity it's what its own GM-only vision zone points, and
+	 * that zone is exactly what's drawn continuously here instead of only-while-selected like edit
+	 * mode) and tabs' read-only content (stats/inventory/story/... — see `renderTokenTabsReadOnly`,
+	 * which applies to both categories). Everything else
+	 * (icon/image/name/category/size/color/template picker/vision shape/delete) is edit-only.
 	 */
 	private renderTokenViewPanel(token: Token): void {
-		if ((token.category ?? "entity") === "player") {
-			const wrap = this.el.createDiv({ cls: "map-manager-field" });
-			const row = wrap.createDiv({ cls: "map-manager-vision-row" });
-			this.makeSliderField(row, "Direction (°, 0=est, horaire)", token.visionDirection ?? DEFAULT_VISION_DIRECTION, 0, 360, (v) =>
-				this.controller.updateToken(token.id, (t) => (t.visionDirection = ((v % 360) + 360) % 360))
-			);
-		}
-
+		this.renderRotationField(token);
 		this.renderTokenTabsReadOnly(token);
 	}
 
@@ -626,9 +656,27 @@ export class InfoPanel {
 		input.click();
 	}
 
-	private renderVisionFields(token: Token): void {
+	/** The token's own facing arrow (any category — see `drawTokenFacingArrow`), independent of a player's vision cone direction. */
+	private renderRotationField(token: Token): void {
 		const wrap = this.el.createDiv({ cls: "map-manager-field" });
-		wrap.createEl("label", { text: "Vision (brouillard de guerre)" });
+		this.makeRotationDialField(wrap, "Rotation (°, 0=est, horaire)", token.rotation ?? DEFAULT_TOKEN_ROTATION, (v) =>
+			this.controller.updateToken(token.id, (t) => (t.rotation = v))
+		);
+	}
+
+	/**
+	 * Same underlying fields for either category (see `visionAngle` in `mapData.ts`) — only the
+	 * label and what the cone actually *does* differ: a player's lights up the fog for real
+	 * (`castVisionRays`/`drawFog`) as well as showing a GM-only preview when selected in edit mode;
+	 * an entity's is only ever that GM-only hint (`MapCanvas.drawTokenVisionZones`), never touching
+	 * fog. The direction itself is
+	 * `token.rotation` (see `renderRotationField`) — the cone just points wherever the token is
+	 * facing, so there's nothing to configure here beyond its shape/reach.
+	 */
+	private renderVisionFields(token: Token, category: TokenCategory): void {
+		const isPlayer = category === "player";
+		const wrap = this.el.createDiv({ cls: "map-manager-field" });
+		wrap.createEl("label", { text: isPlayer ? "Vision (brouillard de guerre)" : "Vision (zone visible par le MJ uniquement)" });
 		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
 
 		const makeNumberInput = (labelText: string, value: number, onChange: (v: number) => void) => {
@@ -645,13 +693,10 @@ export class InfoPanel {
 		this.makeSliderField(row, "Angle (°)", token.visionAngle ?? DEFAULT_VISION_ANGLE, 1, 360, (v) =>
 			this.controller.updateToken(token.id, (t) => (t.visionAngle = v))
 		);
-		this.makeSliderField(row, "Direction (°, 0=est, horaire)", token.visionDirection ?? DEFAULT_VISION_DIRECTION, 0, 360, (v) =>
-			this.controller.updateToken(token.id, (t) => (t.visionDirection = ((v % 360) + 360) % 360))
-		);
 		makeNumberInput("Portée (cases)", token.visionRange ?? DEFAULT_VISION_RANGE, (v) =>
 			this.controller.updateToken(token.id, (t) => (t.visionRange = Math.max(0, v)))
 		);
-		makeNumberInput("Rayon exploré (cases)", token.visionRadius ?? DEFAULT_VISION_RADIUS, (v) =>
+		makeNumberInput(isPlayer ? "Rayon exploré (cases)" : "Rayon (cases)", token.visionRadius ?? DEFAULT_VISION_RADIUS, (v) =>
 			this.controller.updateToken(token.id, (t) => (t.visionRadius = Math.max(0, v)))
 		);
 	}
@@ -699,6 +744,74 @@ export class InfoPanel {
 			beginGestureIfNeeded();
 			slider.value = String(Math.min(max, Math.max(min, v)));
 			onCommit(v);
+		};
+		number.onchange = release;
+	}
+
+	/**
+	 * A "jog dial" for rotating a token: unlike `makeSliderField`, the slider's own thumb position
+	 * is NOT the value it controls — it always starts centered at 0 and reads as how far to turn
+	 * *from* wherever the rotation stood when the current drag began (captured once per gesture into
+	 * `baseRotation`, gated the same way `beginGestureIfNeeded` already gates the history-group
+	 * start). Turning further left/right keeps adding to that delta past ±180°, so the token rotates
+	 * continuously from its current facing instead of the slider ever hitting the end of a fixed
+	 * 0-360 range with the token still stuck at a different position — e.g. a token facing 10° would
+	 * otherwise have almost no room to turn further left on a plain 0-360 slider. Released, the
+	 * thumb snaps back to center so the next drag starts fresh. The paired number input is always
+	 * the true absolute value (0-360) and can be typed into directly.
+	 */
+	private makeRotationDialField(container: HTMLElement, labelText: string, currentRotation: number, onCommit: (v: number) => void): void {
+		const field = container.createDiv({ cls: "map-manager-field-inline map-manager-slider-field" });
+		field.createEl("label", { text: labelText });
+		const slider = field.createEl("input", { type: "range", cls: "map-manager-vision-slider" });
+		slider.min = "-180";
+		slider.max = "180";
+		slider.value = "0";
+		const number = field.createEl("input", { type: "number", cls: "map-manager-vision-number" });
+		number.min = "0";
+		number.max = "360";
+		number.value = String(Math.round(((currentRotation % 360) + 360) % 360));
+
+		// The rotation as of the last commit made *by this control*, kept up to date independently of
+		// `currentRotation` (only ever the value from when this field was built): `InfoPanel` skips
+		// rebuilding itself while a gesture is in progress (see `suppressRerender`) and doesn't force
+		// a rebuild right after release either, so nothing ever refreshes `currentRotation` between
+		// one drag ending and the next one starting — without this, `beginGestureIfNeeded` would keep
+		// resetting `baseRotation` back to whatever the token's rotation was when the panel was last
+		// rendered, undoing every gesture but the first.
+		let latestRotation = currentRotation;
+		let baseRotation = currentRotation;
+
+		const beginGestureIfNeeded = () => {
+			if (this.suppressRerender) return;
+			this.suppressRerender = true;
+			this.controller.beginHistoryGroup();
+			baseRotation = latestRotation;
+		};
+
+		const release = () => {
+			if (!this.suppressRerender) return;
+			this.suppressRerender = false;
+			this.controller.endHistoryGroup();
+			slider.value = "0";
+		};
+
+		slider.oninput = () => {
+			beginGestureIfNeeded();
+			const next = ((baseRotation + Number(slider.value)) % 360 + 360) % 360;
+			latestRotation = next;
+			number.value = String(Math.round(next));
+			onCommit(next);
+		};
+		slider.onchange = release;
+
+		number.oninput = () => {
+			const v = Number(number.value);
+			if (Number.isNaN(v)) return;
+			beginGestureIfNeeded();
+			const next = ((v % 360) + 360) % 360;
+			latestRotation = next;
+			onCommit(next);
 		};
 		number.onchange = release;
 	}

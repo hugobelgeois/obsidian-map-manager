@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { DEFAULT_TOKEN_TAB_NAMES, GRID_TYPE_LABELS, GRID_TYPES, GridType } from "../data/mapData";
+import { FogAnimationMode } from "./types";
 import { generateId } from "../utils";
 
 export class MapManagerSettingsTab extends PluginSettingTab {
@@ -99,12 +100,17 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Activer les animations")
-			.setDesc("Fait légèrement trembler le bord du brouillard de guerre (lumière vacillante), au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte.")
-			.addToggle((toggle) => {
-				toggle.setValue(settings.fogAnimations);
-				toggle.onChange(async (value) => {
-					settings.fogAnimations = value;
+			.setName("Animation du brouillard")
+			.setDesc(
+				"Fait légèrement trembler le bord du brouillard de guerre, au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. « Poussée » fait bouger chaque zone du brouillard indépendamment plutôt que l'ensemble d'un seul bloc."
+			)
+			.addDropdown((dd) => {
+				dd.addOption("none", "Pas d'animation");
+				dd.addOption("simple", "Animation simple");
+				dd.addOption("advanced", "Animation poussée");
+				dd.setValue(settings.fogAnimationMode);
+				dd.onChange(async (value) => {
+					settings.fogAnimationMode = value as FogAnimationMode;
 					await this.plugin.saveSettings();
 				});
 			});

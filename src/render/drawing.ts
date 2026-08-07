@@ -83,6 +83,36 @@ export function drawMarker(ctx: CanvasRenderingContext2D, marker: Marker, cellSi
 	if (marker.links?.length) drawLinkBadge(ctx, marker.x - cellSize * 0.35, marker.y - cellSize * 0.55, cellSize);
 }
 
+/**
+ * Small arrowhead poking out of a token's rim, pointing wherever it's currently facing
+ * (`token.rotation`, degrees, 0 = east, increasing clockwise). For a player token this is also the
+ * exact direction `castVisionRays` points its fog vision cone — a single facing drives both, so the
+ * arrow always shows exactly what the token can see. Drawn on every token regardless of category or
+ * whether `rotation` was ever explicitly set (defaults to facing east) — see `drawToken`.
+ */
+export function drawTokenFacingArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, radius: number, rotationDeg: number, color: string): void {
+	const rad = (rotationDeg * Math.PI) / 180;
+	const dx = Math.cos(rad);
+	const dy = Math.sin(rad);
+	const px = -dy;
+	const py = dx;
+	const tip = { x: cx + dx * radius * 1.25, y: cy + dy * radius * 1.25 };
+	const baseCx = cx + dx * radius * 0.75;
+	const baseCy = cy + dy * radius * 0.75;
+	const halfWidth = radius * 0.32;
+
+	ctx.beginPath();
+	ctx.moveTo(tip.x, tip.y);
+	ctx.lineTo(baseCx + px * halfWidth, baseCy + py * halfWidth);
+	ctx.lineTo(baseCx - px * halfWidth, baseCy - py * halfWidth);
+	ctx.closePath();
+	ctx.fillStyle = color;
+	ctx.fill();
+	ctx.lineWidth = Math.max(1, radius * 0.06);
+	ctx.strokeStyle = "rgba(255,255,255,0.85)";
+	ctx.stroke();
+}
+
 export function drawToken(
 	ctx: CanvasRenderingContext2D,
 	cx: number,
@@ -109,6 +139,8 @@ export function drawToken(
 	ctx.lineWidth = options.selected ? Math.max(2.5, 4 / options.zoom) : Math.max(1.5, 2.5 / options.zoom);
 	ctx.strokeStyle = options.selected ? lightenColor(baseColor, 0.55) : baseColor;
 	ctx.stroke();
+
+	drawTokenFacingArrow(ctx, cx, cy, radius, token.rotation ?? 0, options.selected ? lightenColor(baseColor, 0.55) : baseColor);
 
 	if (!image) {
 		ctx.textAlign = "center";

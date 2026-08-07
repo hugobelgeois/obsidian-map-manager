@@ -194,7 +194,7 @@ export interface SnapCandidate extends Point {
 }
 
 /** Nearest point on segment `a`-`b` to `(x, y)`, clamped to the segment (not the infinite line). */
-function projectOntoSegment(x: number, y: number, a: Point, b: Point): Point {
+export function projectOntoSegment(x: number, y: number, a: Point, b: Point): Point {
 	const abx = b.x - a.x;
 	const aby = b.y - a.y;
 	const lenSq = abx * abx + aby * aby;
@@ -255,6 +255,48 @@ export function segmentIntersection(p1: Point, p2: Point, p3: Point, p4: Point):
 	const u = (dx * d1y - dy * d1x) / denom;
 	if (t < 0 || t > 1 || u < 0 || u > 1) return null;
 	return { x: p1.x + t * d1x, y: p1.y + t * d1y };
+}
+
+/**
+ * Parameter `t` such that `a + t*(b-a)` is the closest point on the infinite line through `a`-`b`
+ * to `p` — unlike `projectOntoSegment`, NOT clamped to `[0, 1]`, so a caller can tell whether `p`
+ * sits before, after, or within the segment's own extent (used to reconcile a wall segment against
+ * one it's collinear with — see `collinearOverlap`/`MapController.addWallSegment`).
+ */
+export function projectParam(p: Point, a: Point, b: Point): number {
+	const abx = b.x - a.x;
+	const aby = b.y - a.y;
+	const lenSq = abx * abx + aby * aby;
+	if (lenSq === 0) return 0;
+	return ((p.x - a.x) * abx + (p.y - a.y) * aby) / lenSq;
+}
+
+/**
+ * Where segments `p1`-`p2` and `p3`-`p4` overlap along their shared line, as a `t` range along
+ * `p1`-`p2` (`0` = `p1`, `1` = `p2`, clamped to that segment's own extent) — or `null` if they
+ * aren't collinear, or are collinear but don't actually overlap. `segmentIntersection` returns
+ * `null` for this exact case (parallel lines have no single crossing point) — this fills that gap
+ * so two walls drawn along the same line don't end up stacked as two redundant, coincident
+ * segments (see `MapController.addWallSegment`).
+ */
+export function collinearOverlap(p1: Point, p2: Point, p3: Point, p4: Point): { t0: number; t1: number } | null {
+	const dx = p2.x - p1.x;
+	const dy = p2.y - p1.y;
+	const len = Math.hypot(dx, dy);
+	if (len === 0) return null;
+	// Perpendicular distance of p3/p4 from the infinite line through p1-p2 — both must sit right on
+	// it (within a tiny fraction of the segment's own length) for this to be the same line, not just
+	// a parallel one running alongside it.
+	const dist3 = Math.abs(dx * (p3.y - p1.y) - dy * (p3.x - p1.x)) / len;
+	const dist4 = Math.abs(dx * (p4.y - p1.y) - dy * (p4.x - p1.x)) / len;
+	const tolerance = len * 1e-4;
+	if (dist3 > tolerance || dist4 > tolerance) return null;
+	const t3 = projectParam(p3, p1, p2);
+	const t4 = projectParam(p4, p1, p2);
+	const t0 = Math.max(0, Math.min(t3, t4));
+	const t1 = Math.min(1, Math.max(t3, t4));
+	if (t1 - t0 <= 1e-4) return null;
+	return { t0, t1 };
 }
 
 /**

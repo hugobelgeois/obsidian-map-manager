@@ -154,16 +154,27 @@ export interface Token {
 	 * entities only render when inside a player's current vision cone. Defaults to "entity".
 	 */
 	category?: TokenCategory;
-	/** Vision cone full angle in degrees (player tokens only). */
+	/**
+	 * Vision cone full angle in degrees. Any category, same fields/geometry either way (see
+	 * `castVisionRays`) — but only a player's cone lights up the fog; the cone itself (either
+	 * category) is otherwise just a GM-only tactical overlay with no effect on fog at all (see
+	 * `MapCanvas.drawTokenVisionZones`).
+	 */
 	visionAngle?: number;
-	/** Vision range in cells (player tokens only). */
+	/** Vision range in cells — see `visionAngle` for which categories this affects and how. */
 	visionRange?: number;
-	/** Facing direction in degrees, 0 = east, increasing clockwise (player tokens only). */
-	visionDirection?: number;
-	/** Omnidirectional "always lit" radius around the player, in cells, regardless of facing (player tokens only). */
+	/** Omnidirectional "always lit" radius, in cells, regardless of facing — see `visionAngle` for which categories this affects and how. */
 	visionRadius?: number;
 	/** Vault path to a custom image shown instead of `icon` once loaded. */
 	image?: string;
+	/**
+	 * Which way the token is drawn facing (a small arrow on its rim — see `drawTokenFacingArrow`),
+	 * in degrees, 0 = east, increasing clockwise. Any category. For player tokens this is also the
+	 * fog vision cone's facing (see `castVisionRays`) — there's a single facing per token, not one
+	 * for the arrow and a separate one for vision; pre-v14 files stored that as `visionDirection`,
+	 * folded into this field on load (see `parseToken`).
+	 */
+	rotation?: number;
 }
 
 export const DEFAULT_TOKEN_COLOR = "#1e1e1e";
@@ -172,8 +183,8 @@ export const TOKEN_SIZES = [1, 2, 3];
 
 export const DEFAULT_VISION_ANGLE = 90;
 export const DEFAULT_VISION_RANGE = 6;
-export const DEFAULT_VISION_DIRECTION = 0;
 export const DEFAULT_VISION_RADIUS = 1;
+export const DEFAULT_TOKEN_ROTATION = 0;
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
 
@@ -216,7 +227,7 @@ export interface Layer {
 }
 
 export interface MapFileData {
-	version: 13;
+	version: 14;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -281,7 +292,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 13,
+		version: 14,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
@@ -389,9 +400,12 @@ function parseToken(value: unknown): Token | null {
 		category: isTokenCategory(value.category) ? value.category : undefined,
 		visionAngle: typeof value.visionAngle === "number" ? value.visionAngle : undefined,
 		visionRange: typeof value.visionRange === "number" ? value.visionRange : undefined,
-		visionDirection: typeof value.visionDirection === "number" ? value.visionDirection : undefined,
 		visionRadius: typeof value.visionRadius === "number" && value.visionRadius >= 0 ? value.visionRadius : undefined,
 		image: isString(value.image) ? value.image : undefined,
+		// Pre-v14 files kept the vision cone's facing separate from the token's own rotation
+		// (`visionDirection`); `rotation` takes over both, so a legacy file with no `rotation` yet
+		// but a `visionDirection` inherits it, keeping the cone pointing exactly where it did before.
+		rotation: typeof value.rotation === "number" ? value.rotation : typeof value.visionDirection === "number" ? value.visionDirection : undefined,
 	};
 }
 
@@ -532,7 +546,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 13, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
+	return { version: 14, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

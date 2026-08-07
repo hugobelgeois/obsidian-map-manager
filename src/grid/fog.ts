@@ -1,6 +1,6 @@
 import {
+	DEFAULT_TOKEN_ROTATION,
 	DEFAULT_VISION_ANGLE,
-	DEFAULT_VISION_DIRECTION,
 	DEFAULT_VISION_RADIUS,
 	DEFAULT_VISION_RANGE,
 	MapFileData,
@@ -120,14 +120,17 @@ function angleDiffDeg(a: number, b: number): number {
 /**
  * Traces `FOG_RAY_COUNT` rays outward from a player token's center (its omnidirectional radius
  * plus its directional cone, whichever reaches further at a given angle) against `wallSegments`.
- * Purely geometric (world units) — no cosmetic tremble, see `VisionRays`.
+ * The cone points wherever the token's own facing arrow does (`token.rotation` — see
+ * `drawTokenFacingArrow`): a player's vision is tied to their token's facing, not a separate value,
+ * so turning the token turns what it can see. Purely geometric (world units) — no cosmetic tremble,
+ * see `VisionRays`.
  */
 export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[]): VisionRays {
 	const center = footprintCenter(data, token);
 	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
 	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
-	const direction = token.visionDirection ?? DEFAULT_VISION_DIRECTION;
+	const direction = token.rotation ?? DEFAULT_TOKEN_ROTATION;
 
 	const rays: RaySample[] = [];
 	for (let i = 0; i < FOG_RAY_COUNT; i++) {
