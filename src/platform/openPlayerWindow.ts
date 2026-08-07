@@ -16,3 +16,8 @@ export async function openPlayerWindow(app: App, file: TFile): Promise<void> {
 		new Notice("Impossible d'ouvrir une nouvelle fenêtre (fonctionnalité desktop uniquement).");
 	}
 }
+
+/** Whether a player-mirror window is currently open for `file` — used by `Toolbar`'s player-window button to show its options dropdown instead of popping open a duplicate window. */
+export function isPlayerWindowOpen(app: App, file: TFile): boolean {
+	return app.workspace.getLeavesOfType(VIEW_TYPE_MAP_PLAYER_MIRROR).some((leaf) => leaf.view.getState().file === file.path);
+}

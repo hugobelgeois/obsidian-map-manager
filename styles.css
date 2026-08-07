@@ -261,6 +261,10 @@
 	cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26"><text x="0" y="20" font-size="20">🪣</text></svg>') 2 22, crosshair;
 }
 
+.map-manager-canvas.is-select-tool {
+	cursor: crosshair;
+}
+
 .map-manager-infopanel {
 	flex: 0 0 0;
 	width: 0;
@@ -468,7 +472,8 @@
 }
 
 .map-manager-fog-dropdown-panel,
-.map-manager-zoom-dropdown-panel {
+.map-manager-zoom-dropdown-panel,
+.map-manager-player-window-dropdown-panel {
 	width: 220px;
 }
 
@@ -572,4 +577,51 @@
 .map-manager-token-tab-link {
 	flex: 1 1 auto;
 	min-width: 0;
+}
+
+.map-manager-magic-walls-modal .map-manager-magic-walls-summary {
+	display: flex;
+	align-items: center;
+	gap: 0.6em;
+	margin: 0.8em 0;
+}
+
+.map-manager-magic-walls-swatch {
+	width: 1.4em;
+	height: 1.4em;
+	flex: 0 0 auto;
+	border-radius: var(--radius-s, 4px);
+	border: 1px solid var(--background-modifier-border);
+	background-color: var(--map-manager-magic-walls-color, transparent);
+}
+
+.map-manager-magic-walls-hint {
+	color: var(--text-muted);
+	font-size: 0.9em;
+}
+
+.map-manager-magic-walls-buttons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 0.5em;
+	margin-top: 1em;
+}
+
+.map-manager-magic-walls-color-row {
+	display: flex;
+	align-items: center;
+	gap: 0.4em;
+}
+
+.map-manager-magic-walls-color-swatch {
+	width: 1.2em;
+	height: 1.2em;
+	flex: 0 0 auto;
+	border-radius: var(--radius-s, 4px);
+	border: 1px dashed var(--background-modifier-border);
+}
+
+.map-manager-magic-walls-color-swatch.is-set {
+	border-style: solid;
+	background-color: var(--map-manager-magic-walls-color);
 }

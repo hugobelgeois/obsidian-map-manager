@@ -1,8 +1,10 @@
 import { App, Menu, Notice } from "obsidian";
-import { MapController, MapMode } from "../controller/MapController";
+import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { FogAnimationMode, MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Marker, Token, TokenCategory, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, Marker, Token, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, resolveEyeCones, squareKey } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
+import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
+import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
 import {
 	ABS_MIN_ZOOM,
 	SnapCandidate,
@@ -26,6 +28,7 @@ import {
 import {
 	ResolvedWallSegment,
 	VisionRays,
+	castEntityConeRays,
 	castVisionRays,
 	cellCenter as fogCellCenter,
 	cellVisualWidth as fogCellVisualWidth,
@@ -178,7 +181,7 @@ export interface MapCanvasOptions {
 	 * on any shared-controller change, like a selection) would drag the mirror's view along with that.
 	 */
 	isMirror?: boolean;
-	/** Forces fog to always render regardless of `data.fogEnabled`/mode — the player mirror shows fog even while the source window has it toggled off. */
+	/** Marks fog as independent of `data.fogEnabled`/mode on this instance — a player mirror shows/hides fog per its own `MapController.playerMirrorFogEnabled` toggle (see the player-window dropdown in `Toolbar`) even while the source window has `data.fogEnabled` set differently. */
 	forceFog?: boolean;
 	/** Called whenever pan/zoom changes from user input (wheel, drag-pan, recenter). Panning/zooming never touches `MapController` (no `notify()`), so a mirror wouldn't otherwise learn about it. */
 	onViewportChange?: () => void;
@@ -204,6 +207,18 @@ export class MapCanvas {
 
 	/** Every player token's traced vision rays, recomputed once per `render()` and reused by both `drawFog` and `drawTokens`. */
 	private frameVisionCache: PlayerVisionRays[] = [];
+
+	/**
+	 * Memoizes the actual (expensive) ray/wall tracing behind `castRaysForToken`/`castEntityConeVision`,
+	 * keyed against `MapController.dataVersion` — `render()` runs on every pan/zoom/hover/fog-tremble
+	 * animation frame, none of which touch `data`, so re-tracing rays whose token/wall inputs haven't
+	 * changed since the last `render()` was pure waste (the dominant cost of "several tokens with
+	 * vision on" lagging view mode). Only the cheap, per-frame cosmetic tremble in `appendVisionFan`
+	 * still runs unconditionally. Keyed by token id for players (one cone), and `tokenId|direction|
+	 * fullAngleDeg` for entities (multiple cones/tiers per token — see `drawEntityEyeCones`).
+	 */
+	private playerVisionRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
+	private entityConeRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 
 	/** Offscreen buffer fog is composited on before being drawn onto the main canvas as one image — see the constructor comment. */
 	private fogCanvas: HTMLCanvasElement = document.createElement("canvas");
@@ -236,8 +251,16 @@ export class MapCanvas {
 	private pointerDownAt = { x: 0, y: 0 };
 	private lastPointer = { x: 0, y: 0 };
 
+	/** "select" tool only: whatever object (if any) sat directly under the pointer on down — resolved into a toggle on a plain click, or ignored in favor of `marqueeWorld` once the drag exceeds `DRAG_THRESHOLD`. See `handleSelectPointerDown`. */
+	private selectPointerHit: { kind: MassSelectionKind; id: string } | null = null;
+	/** "select" tool only: the live marquee rectangle (world space) while dragging — `null` outside a select-tool drag. See `onPointerMove`/`drawMassSelectionOverlay`. */
+	private marqueeWorld: { start: { x: number; y: number }; current: { x: number; y: number } } | null = null;
+
 	/** Live (possibly snapped) target for the wall tool's in-progress chain — see `drawWallPreview`. Recomputed on every pointer move regardless of `dragging` (a click, not a drag, places each wall point). */
 	private wallPreview: { x: number; y: number } | null = null;
+
+	/** True while "Seau à murs" is flood-filling from a click (see `runColorRegionWalls`) — guards against a second click starting an overlapping run before the first one's async image load/analysis finishes. */
+	private colorRegionWallsRunning = false;
 
 	private unsubscribe: () => void;
 
@@ -246,6 +269,8 @@ export class MapCanvas {
 			e.preventDefault();
 			if (this.controller.pendingWallShape) {
 				this.controller.cancelWallShapeStep();
+			} else if (this.controller.pendingWallBucket) {
+				this.controller.cancelWallBucketPlacement();
 			} else {
 				this.controller.undoLastWallPoint();
 			}
@@ -293,6 +318,14 @@ export class MapCanvas {
 		// like "wall" is active, in particular) falls straight through to the plain drag-to-pan
 		// handled in onPointerMove's final `else` branch, same as a left-click on empty space.
 		if (e.button !== 0) return;
+
+		// The "select" tool gets its own entirely separate branch — it never falls through to the
+		// token/marker/wall-point/brush/fill/wall handling below, which assumes a different tool is
+		// active. See `handleSelectPointerDown`.
+		if (this.controller.mode === "edit" && this.controller.activeTool === "select") {
+			this.handleSelectPointerDown(px, py);
+			return;
+		}
 
 		// Tokens are selectable in both modes, but only draggable/movable in view mode — edit mode
 		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
@@ -350,15 +383,54 @@ export class MapCanvas {
 			this.fillFrom(key);
 			this.toolConsumedClick = true;
 		} else if (this.controller.activeTool === "wall") {
-			const placement = this.resolveWallPlacement(px, py);
-			if (this.controller.pendingWallShape) {
-				this.controller.placeWallShapeCorner(placement.x, placement.y);
+			if (this.controller.pendingWallBucket) {
+				void this.runColorRegionWalls(screenToWorld(px, py, this.transform));
 			} else {
-				this.controller.commitWallPoint(placement.x, placement.y, placement.existingPointId);
+				const placement = this.resolveWallPlacement(px, py);
+				if (this.controller.pendingWallShape) {
+					this.controller.placeWallShapeCorner(placement.x, placement.y);
+				} else {
+					this.controller.commitWallPoint(placement.x, placement.y, placement.existingPointId);
+				}
 			}
 			this.toolConsumedClick = true;
 		}
 	};
+
+	/**
+	 * The "select" tool's own pointer-down handling: hit-tests token → wall segment → (marker on grid
+	 * "none", else cell) in that priority, skipping a tier whose kind doesn't match an already-locked
+	 * `massSelectionKind`. Doesn't mutate the controller yet — `onPointerUp` decides between a plain
+	 * click (toggle) and a marquee drag once `dragMoved` is known, same pattern as token/marker drags.
+	 */
+	private handleSelectPointerDown(px: number, py: number): void {
+		const world = screenToWorld(px, py, this.transform);
+		this.marqueeWorld = { start: world, current: world };
+		this.selectPointerHit = this.resolveSelectHit(px, py);
+	}
+
+	private resolveSelectHit(px: number, py: number): { kind: MassSelectionKind; id: string } | null {
+		const lockedKind = this.controller.massSelectionKind;
+		if (!lockedKind || lockedKind === "token") {
+			const token = this.findTokenAtScreenPoint(px, py);
+			if (token) return { kind: "token", id: token.id };
+		}
+		if (!lockedKind || lockedKind === "wallSegment") {
+			const segment = this.findWallSegmentAtScreenPoint(px, py);
+			if (segment) return { kind: "wallSegment", id: segment.id };
+		}
+		if (!lockedKind || lockedKind === "stamp") {
+			const data = this.controller.getData();
+			if (data.gridType === "none") {
+				const marker = this.findMarkerAtScreenPoint(px, py);
+				if (marker) return { kind: "stamp", id: marker.id };
+			} else {
+				const world = screenToWorld(px, py, this.transform);
+				return { kind: "stamp", id: this.cellKeyAt(world.x, world.y) };
+			}
+		}
+		return null;
+	}
 
 	private onPointerMove = (e: PointerEvent) => {
 		// Unlike brush/drag gestures, wall points/shape corners are placed one click at a time — the
@@ -397,6 +469,12 @@ export class MapCanvas {
 		}
 
 		if (!this.dragMoved) return;
+
+		if (this.controller.activeTool === "select" && this.marqueeWorld) {
+			this.marqueeWorld.current = screenToWorld(px, py, this.transform);
+			this.render();
+			return;
+		}
 
 		if (this.draggingToken) {
 			this.draggingToken.currentWorld = screenToWorld(px, py, this.transform);
@@ -439,6 +517,11 @@ export class MapCanvas {
 				this.triggerPing(world.x, world.y);
 				this.options.onPing?.(world.x, world.y);
 			}
+		}
+
+		if (this.controller.mode === "edit" && this.controller.activeTool === "select") {
+			this.handleSelectPointerUp();
+			return;
 		}
 
 		if (this.toolConsumedClick) {
@@ -522,7 +605,117 @@ export class MapCanvas {
 		this.lastPaintedKey = null;
 		this.paintedInStroke = new Set();
 		this.toolConsumedClick = false;
+		this.selectPointerHit = null;
+		this.marqueeWorld = null;
 	};
+
+	/**
+	 * A plain click (no drag) toggles whatever `handleSelectPointerDown` resolved under the pointer;
+	 * a marquee drag instead adds every matching-kind object inside the drag rect. If no kind is
+	 * locked yet, a marquee tries tokens → wall segments → stamps, locking on the first tier with any
+	 * hits — see `inferMarqueeKind`.
+	 */
+	private handleSelectPointerUp(): void {
+		const hit = this.selectPointerHit;
+		const marquee = this.marqueeWorld;
+		this.selectPointerHit = null;
+		this.marqueeWorld = null;
+
+		if (!this.dragMoved) {
+			if (hit) {
+				this.controller.toggleMassSelection(hit.kind, hit.id);
+			} else if (this.controller.getData().gridType === "none") {
+				// Genuinely empty background — only possible on grid "none" (a celled grid has no
+				// "empty" click, every point belongs to some cell) — resets the whole selection.
+				this.controller.clearMassSelection();
+			}
+			return;
+		}
+
+		if (!marquee) return;
+		const rect = this.normalizedWorldRect(marquee.start, marquee.current);
+		const kind = this.controller.massSelectionKind ?? this.inferMarqueeKind(rect);
+		if (!kind) return;
+		const ids = this.idsInRect(kind, rect);
+		if (ids.length > 0) this.controller.addMassSelection(kind, ids);
+	}
+
+	private normalizedWorldRect(a: { x: number; y: number }, b: { x: number; y: number }): { minX: number; maxX: number; minY: number; maxY: number } {
+		return { minX: Math.min(a.x, b.x), maxX: Math.max(a.x, b.x), minY: Math.min(a.y, b.y), maxY: Math.max(a.y, b.y) };
+	}
+
+	/** Tries each kind in priority order and locks onto the first with any hits inside `rect` — used when a marquee drag starts on an unlocked selection. */
+	private inferMarqueeKind(rect: { minX: number; maxX: number; minY: number; maxY: number }): MassSelectionKind | null {
+		if (this.tokensInRect(rect).length > 0) return "token";
+		if (this.wallSegmentsInRect(rect).length > 0) return "wallSegment";
+		const stampIds = this.controller.getData().gridType === "none" ? this.markersInRect(rect) : this.cellsInRect(rect);
+		return stampIds.length > 0 ? "stamp" : null;
+	}
+
+	private idsInRect(kind: MassSelectionKind, rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
+		if (kind === "token") return this.tokensInRect(rect);
+		if (kind === "wallSegment") return this.wallSegmentsInRect(rect);
+		return this.controller.getData().gridType === "none" ? this.markersInRect(rect) : this.cellsInRect(rect);
+	}
+
+	private tokensInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
+		const out: string[] = [];
+		for (const token of this.controller.getData().tokens) {
+			const c = this.footprintCenter(token);
+			if (c.x >= rect.minX && c.x <= rect.maxX && c.y >= rect.minY && c.y <= rect.maxY) out.push(token.id);
+		}
+		return out;
+	}
+
+	/** A segment matches if either endpoint's world position falls inside `rect` ("touches" semantics, like most marquee tools). */
+	private wallSegmentsInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
+		const out: string[] = [];
+		const inRect = (p: { x: number; y: number }) => p.x >= rect.minX && p.x <= rect.maxX && p.y >= rect.minY && p.y <= rect.maxY;
+		for (const layer of this.controller.getData().layers) {
+			if (!layer.visible) continue;
+			const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
+			for (const segment of layer.wallSegments) {
+				const a = pointsById.get(segment.aId);
+				const b = pointsById.get(segment.bId);
+				if ((a && inRect(a)) || (b && inRect(b))) out.push(segment.id);
+			}
+		}
+		return out;
+	}
+
+	private markersInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
+		const out: string[] = [];
+		for (const layer of this.controller.getData().layers) {
+			if (!layer.visible) continue;
+			for (const marker of layer.markers) {
+				if (marker.x >= rect.minX && marker.x <= rect.maxX && marker.y >= rect.minY && marker.y <= rect.maxY) out.push(marker.id);
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Reuses `getVisibleSquareCells`/`getVisibleHexCells` (normally used to enumerate the whole
+	 * viewport) by synthesizing a `ViewTransform` that maps `rect` itself onto a same-sized "viewport"
+	 * — then trims the result back to cells actually centered inside `rect`, since those helpers pad
+	 * their result by a margin of about one cell.
+	 */
+	private cellsInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
+		if (rect.maxX <= rect.minX || rect.maxY <= rect.minY) return [];
+		const data = this.controller.getData();
+		const cellSize = this.effectiveCellSize();
+		const transform: ViewTransform = { zoom: 1, panX: -rect.minX, panY: -rect.minY };
+		const w = rect.maxX - rect.minX;
+		const h = rect.maxY - rect.minY;
+		const keys =
+			data.gridType === "hex-pointy" || data.gridType === "hex-flat"
+				? getVisibleHexCells(transform, cellSize, data.gridType === "hex-pointy" ? "pointy" : "flat", w, h).map((c) => hexKey(c.a, c.b))
+				: getVisibleSquareCells(transform, cellSize, w, h).map((c) => squareKey(c.a, c.b));
+		return keys.filter((key) => {
+			const center = this.cellCenter(key);
+			return center.x >= rect.minX && center.x <= rect.maxX && center.y >= rect.minY && center.y <= rect.maxY;
+		});
+	}
 
 	/**
 	 * Double-clicking a wall segment's line (away from an existing point) inserts a new point right
@@ -1089,6 +1282,39 @@ export class MapCanvas {
 		return fogResolveWallSegments(this.controller.getData());
 	}
 
+	/**
+	 * "Seau à murs": runs `detectColorRegionWalls` from the clicked world point and, if it found a
+	 * candidate wall network, opens `ColorRegionWallsModal` for the user to confirm before anything is
+	 * actually written to the map (`MapController.applyMagicWalls` — the same merge step "Murs
+	 * magiques" uses, since both produce the same `WallPoint[]`/`WallSegment[]` shape). The bucket
+	 * tool stays armed afterward, like the shape picker does, so filling several rooms in a row
+	 * doesn't need re-arming it from the toolbar each time. Guard conditions (no background image,
+	 * grid type "none", region too large) are all just thrown `Error`s from `detectColorRegionWalls`
+	 * with an already user-facing French message — shown as-is.
+	 */
+	private async runColorRegionWalls(world: { x: number; y: number }): Promise<void> {
+		if (this.colorRegionWallsRunning) return;
+		this.colorRegionWallsRunning = true;
+		try {
+			const activeLayer = this.controller.getActiveLayer();
+			const result = await detectColorRegionWalls(this.app, this.controller.getData(), activeLayer, this.controller.wallDrawBlockerType, world);
+			if (!result) {
+				new Notice("Impossible de délimiter une zone à cet endroit (couleur hors image, ou zone transparente).");
+				return;
+			}
+			new ColorRegionWallsModal(this.app, result, () => {
+				this.controller.applyMagicWalls(result.wallPoints, result.wallSegments);
+				const count = result.wallSegments.length;
+				new Notice(`${count} mur${count > 1 ? "s" : ""} ajouté${count > 1 ? "s" : ""} autour de la zone.`);
+			}).open();
+		} catch (e) {
+			console.error("Map Manager: échec du seau à murs", e);
+			new Notice(e instanceof Error ? e.message : "Échec de la détection de la zone.");
+		} finally {
+			this.colorRegionWallsRunning = false;
+		}
+	}
+
 	private handleClick(e: PointerEvent): void {
 		// Token/marker clicks are already resolved via draggingToken/draggingMarker in onPointerDown/onPointerUp;
 		// reaching here means the click landed on empty grid space.
@@ -1225,7 +1451,7 @@ export class MapCanvas {
 	 * doesn't depend on a visible grid, only on vision blockers and player tokens.
 	 */
 	private fogCurrentlyVisible(): boolean {
-		if (this.options.forceFog) return true;
+		if (this.options.forceFog) return this.controller.playerMirrorFogEnabled;
 		const data = this.controller.getData();
 		return data.fogEnabled && this.controller.mode === "view";
 	}
@@ -1266,6 +1492,7 @@ export class MapCanvas {
 		this.canvas.toggleClass("is-brush-tool", tool === "brush");
 		this.canvas.toggleClass("is-fill-tool", tool === "fill");
 		this.canvas.toggleClass("is-wall-tool", tool === "wall");
+		this.canvas.toggleClass("is-select-tool", tool === "select");
 	}
 
 	render(): void {
@@ -1361,10 +1588,14 @@ export class MapCanvas {
 			ctx.restore();
 		}
 
-		if (!this.isMirror && !this.options.forceFog) this.drawTokenVisionZones(ctx);
+		// GM's own window always shows this tactical hint; a player-mirror window only shows it while
+		// the GM has explicitly toggled it on (see `MapController.showEntityVisionToPlayers` and the
+		// player-window dropdown in `Toolbar`) — hidden there by default.
+		if (!this.isMirror || this.controller.showEntityVisionToPlayers) this.drawTokenVisionZones(ctx);
 
 		this.drawTokens(ctx);
 		if (cellsVisible || noGrid || this.controller.selectedWallPointId) this.drawSelection(ctx);
+		if (this.controller.activeTool === "select") this.drawMassSelectionOverlay(ctx);
 		this.drawWallPreview(ctx);
 		if (this.activePing) this.drawPing(ctx);
 
@@ -1442,7 +1673,22 @@ export class MapCanvas {
 	 * tremble is now applied only in `appendVisionFan`, purely to the drawn shape.
 	 */
 	private castRaysForToken(token: Token, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
-		const { center, rays } = castVisionRays(this.controller.getData(), token, wallSegments);
+		const version = this.controller.dataVersion;
+		const cached = this.playerVisionRaysCache.get(token.id);
+		const { center, rays } =
+			cached && cached.version === version ? cached.result : castVisionRays(this.controller.getData(), token, wallSegments);
+		if (!cached || cached.version !== version) this.playerVisionRaysCache.set(token.id, { version, result: { center, rays } });
+		return { center, rays, phase: tremblePhase(token.id) };
+	}
+
+	/** Same idea as `castRaysForToken`, for one of an entity's `resolveEyeCones` cones — see `drawEntityEyeCones`. */
+	private castEntityConeVision(token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
+		const version = this.controller.dataVersion;
+		const key = `${token.id}|${direction}|${fullAngleDeg}`;
+		const cached = this.entityConeRaysCache.get(key);
+		const { center, rays } =
+			cached && cached.version === version ? cached.result : castEntityConeRays(this.controller.getData(), token, direction, fullAngleDeg, wallSegments);
+		if (!cached || cached.version !== version) this.entityConeRaysCache.set(key, { version, result: { center, rays } });
 		return { center, rays, phase: tremblePhase(token.id) };
 	}
 
@@ -1498,22 +1744,32 @@ export class MapCanvas {
 		return isPointLit(cache, worldX, worldY, useDim);
 	}
 
-	/** Translucent fill colors for `drawTokenVisionZones`, by category. */
-	private static readonly VISION_ZONE_COLOR: Record<TokenCategory, string> = {
-		entity: "rgba(220, 38, 38, 0.28)",
-		player: "rgba(37, 99, 235, 0.28)",
-	};
+	/** Translucent fill color for a player token's own vision-cone preview — see `drawTokenVisionZones`. */
+	private static readonly PLAYER_VISION_ZONE_COLOR = "rgba(37, 99, 235, 0.28)";
 
 	/**
-	 * GM-only tactical hint: a token's own vision cone (the exact same fields/geometry either
-	 * category uses, traced with `castVisionRays` against the same walls), drawn as a translucent
-	 * colored zone — red for an entity, blue for a player, so the GM can preview exactly what either
-	 * would notice without touching the real fog system at all: this never feeds `isLitByCache` (so
-	 * it doesn't affect which entities the fog itself renders) and never calls `markExplored` (so it
-	 * can't leak into a player's explored memory). The call site in `render` already excludes the
-	 * player-mirror window (`isMirror`/`forceFog`), the one canvas real players actually see, so it's
-	 * safe to show this in either "edit" or "view" mode here — both are GM-facing (see the "Public
-	 * viewer" section of CLAUDE.md on why in-Obsidian "view" mode is still GM-only).
+	 * An entity eye cone's 3 tiers (see `resolveEyeCones`), listed widest-to-narrowest — the order
+	 * `drawEntityEyeCones` draws them in, so the narrower/sharper tiers layer visibly on top of the
+	 * wider/dimmer ones instead of underneath. Same red hue throughout, rising alpha per tier reads
+	 * as a gradient of "how well the entity actually makes you out" rather than one flat wash.
+	 */
+	private static readonly ENTITY_EYE_TIERS: { key: "monocularAngle" | "binocularAngle" | "detectionAngle"; alpha: number }[] = [
+		{ key: "monocularAngle", alpha: 0.1 },
+		{ key: "binocularAngle", alpha: 0.16 },
+		{ key: "detectionAngle", alpha: 0.28 },
+	];
+
+	/**
+	 * Normally a GM-only tactical hint: a token's own vision cone(s), drawn as translucent colored
+	 * zone(s) so the GM can preview exactly what a token would notice without touching the real fog
+	 * system at all: this never feeds `isLitByCache` (so it doesn't affect which entities the fog
+	 * itself renders) and never calls `markExplored` (so it can't leak into a player's explored
+	 * memory). The call site in `render` excludes the player-mirror window by default
+	 * (`isMirror`/`forceFog`), the one canvas real players actually see, except when the GM has
+	 * explicitly opted in via the player-window dropdown (`MapController.showEntityVisionToPlayers`)
+	 * — a mirror is always in "view" mode (see `effectiveMode`), so it only ever reaches the "every
+	 * entity" branch below, never a selected token's own zone (see the "Public viewer" section of
+	 * CLAUDE.md on why in-Obsidian "view" mode is otherwise still GM-only).
 	 *
 	 * In edit mode specifically, only the *selected* token's own zone is drawn, regardless of
 	 * category — with every token's zone shown at once, a map with more than a couple of tokens
@@ -1524,28 +1780,53 @@ export class MapCanvas {
 	 * selection concept driving that same clutter there — a player's cone doesn't need the same
 	 * treatment in "view" mode since the real fog overlay already shows it for free there.
 	 *
-	 * Uses each ray's `dimEnd` (reach blocked only by "opaque" walls, not "dim" ones) as the single
-	 * boundary — there's no two-tier memory/live split to preserve here like `drawFog` has, just one
-	 * shape.
+	 * The two categories draw entirely differently below: a player token keeps the single blue cone
+	 * this always drew (`castVisionRays`, `dimEnd` — reaches past a "dim"/partial wall, matching what
+	 * its real fog memory would eventually show once explored); an entity token instead draws both of
+	 * `resolveEyeCones`'s cones via `drawEntityEyeCones`, each using `clearEnd` — an entity has no
+	 * fog-memory concept, so a "partial" wall stops its sight exactly like an opaque one.
 	 */
 	private drawTokenVisionZones(ctx: CanvasRenderingContext2D): void {
 		const wallSegments = this.resolveWallSegments();
-		const fillZone = (tokens: Token[], color: string) => {
-			if (tokens.length === 0) return;
-			const path = new Path2D();
-			for (const token of tokens) this.appendVisionFan(path, this.castRaysForToken(token, wallSegments), true, "none", 0);
-			ctx.fillStyle = color;
-			ctx.fill(path);
-		};
 
 		if (this.effectiveMode() === "edit") {
 			const selected = this.controller.getData().tokens.find((t) => t.id === this.controller.selectedTokenId);
-			if (selected) fillZone([selected], MapCanvas.VISION_ZONE_COLOR[selected.category ?? "entity"]);
+			if (!selected) return;
+			if ((selected.category ?? "entity") === "entity") {
+				this.drawEntityEyeCones([selected], wallSegments, ctx);
+				return;
+			}
+			const path = new Path2D();
+			this.appendVisionFan(path, this.castRaysForToken(selected, wallSegments), true, "none", 0);
+			ctx.fillStyle = MapCanvas.PLAYER_VISION_ZONE_COLOR;
+			ctx.fill(path);
 			return;
 		}
 
 		const entities = this.controller.getData().tokens.filter((t) => (t.category ?? "entity") === "entity");
-		fillZone(entities, MapCanvas.VISION_ZONE_COLOR.entity);
+		this.drawEntityEyeCones(entities, wallSegments, ctx);
+	}
+
+	/**
+	 * Draws every one of `tokens`'s eye cones (see `resolveEyeCones` — 2 cones per token, mirrored
+	 * around its facing by `sideEyeAngle` and collapsing onto a single visible cone when that's 0,
+	 * each carrying its own 3-tier angle set sharing the token's own `visionRange`/`visionRadius`) as
+	 * layered translucent wedges — see `ENTITY_EYE_TIERS`. One Path2D per tier, batched across every
+	 * cone of every token, so each tier costs a single `ctx.fill` regardless of how many entities are
+	 * on screen, same batching the old single-path per-category fill used.
+	 */
+	private drawEntityEyeCones(tokens: Token[], wallSegments: ResolvedWallSegment[], ctx: CanvasRenderingContext2D): void {
+		if (tokens.length === 0) return;
+		for (const { key, alpha } of MapCanvas.ENTITY_EYE_TIERS) {
+			const path = new Path2D();
+			for (const token of tokens) {
+				for (const cone of resolveEyeCones(token)) {
+					this.appendVisionFan(path, this.castEntityConeVision(token, cone.direction, cone[key], wallSegments), false, "none", 0);
+				}
+			}
+			ctx.fillStyle = `rgba(220, 38, 38, ${alpha})`;
+			ctx.fill(path);
+		}
 	}
 
 	/** World-space rectangle currently on screen, used to bound the fog-memory bucket scan. */
@@ -2094,5 +2375,89 @@ export class MapCanvas {
 			ctx.closePath();
 		}
 		ctx.stroke();
+	}
+
+	/**
+	 * Outlines every mass-selected object (see `MassSelectionKind`) using the same amber highlight
+	 * `drawSelection` uses for a single selection, plus the live marquee drag rectangle itself.
+	 */
+	private drawMassSelectionOverlay(ctx: CanvasRenderingContext2D): void {
+		const data = this.controller.getData();
+		ctx.save();
+		ctx.strokeStyle = "#e0a020";
+		ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
+
+		for (const tokenId of this.controller.massSelectedTokenIds) {
+			const token = data.tokens.find((t) => t.id === tokenId);
+			if (!token) continue;
+			const center = this.footprintCenter(token);
+			ctx.beginPath();
+			ctx.arc(center.x, center.y, this.tokenRadius(token) + 3 / this.transform.zoom, 0, Math.PI * 2);
+			ctx.stroke();
+		}
+
+		if (this.controller.massSelectedWallSegmentIds.size > 0) {
+			ctx.lineWidth = Math.max(3, 5 / this.transform.zoom);
+			for (const layer of data.layers) {
+				const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
+				for (const segment of layer.wallSegments) {
+					if (!this.controller.massSelectedWallSegmentIds.has(segment.id)) continue;
+					const a = pointsById.get(segment.aId);
+					const b = pointsById.get(segment.bId);
+					if (!a || !b) continue;
+					ctx.beginPath();
+					ctx.moveTo(a.x, a.y);
+					ctx.lineTo(b.x, b.y);
+					ctx.stroke();
+				}
+			}
+			ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
+		}
+
+		if (this.controller.massSelectedCellKeys.size > 0 && data.gridType !== "none") {
+			const cellSize = this.effectiveCellSize();
+			for (const key of this.controller.massSelectedCellKeys) {
+				const { a, b } = parseCellKey(key);
+				ctx.beginPath();
+				if (data.gridType === "square") {
+					ctx.rect(a * cellSize, b * cellSize, cellSize, cellSize);
+				} else {
+					const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
+					const center = hexCellToWorldCenter(a, b, cellSize, orientation);
+					const corners = hexCorners(center.x, center.y, cellSize, orientation);
+					corners.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+					ctx.closePath();
+				}
+				ctx.stroke();
+			}
+		}
+
+		if (this.controller.massSelectedMarkerIds.size > 0) {
+			const radius = this.markerHitRadius();
+			for (const layer of data.layers) {
+				for (const marker of layer.markers) {
+					if (!this.controller.massSelectedMarkerIds.has(marker.id)) continue;
+					ctx.beginPath();
+					ctx.arc(marker.x, marker.y, radius, 0, Math.PI * 2);
+					ctx.stroke();
+				}
+			}
+		}
+
+		ctx.restore();
+
+		if (this.marqueeWorld && this.dragMoved) {
+			const rect = this.normalizedWorldRect(this.marqueeWorld.start, this.marqueeWorld.current);
+			ctx.save();
+			ctx.fillStyle = "rgba(224, 160, 32, 0.12)";
+			ctx.strokeStyle = "#e0a020";
+			ctx.lineWidth = Math.max(1, 1.5 / this.transform.zoom);
+			ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
+			ctx.beginPath();
+			ctx.rect(rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
+			ctx.fill();
+			ctx.stroke();
+			ctx.restore();
+		}
 	}
 }

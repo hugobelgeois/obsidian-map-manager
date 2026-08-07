@@ -81,6 +81,46 @@ export function getVisibleSquareCells(t: ViewTransform, cellSize: number, viewpo
 	return cells;
 }
 
+/**
+ * Square cell indices whose cells intersect a world-space rectangle, with a 1-cell margin — the
+ * same bounding-box logic as `getVisibleSquareCells`, but driven by an arbitrary world rect instead
+ * of a live viewport/`ViewTransform`. Used to enumerate every cell under a background image (see
+ * `detectMagicWalls`) without a canvas to project through.
+ */
+export function squareCellsInWorldRect(minX: number, minY: number, maxX: number, maxY: number, cellSize: number): AxialCoord[] {
+	const c0 = Math.floor(minX / cellSize) - 1;
+	const c1 = Math.ceil(maxX / cellSize) + 1;
+	const r0 = Math.floor(minY / cellSize) - 1;
+	const r1 = Math.ceil(maxY / cellSize) + 1;
+	const cells: AxialCoord[] = [];
+	for (let row = r0; row <= r1; row++) {
+		for (let col = c0; col <= c1; col++) {
+			cells.push({ a: col, b: row });
+		}
+	}
+	return cells;
+}
+
+/** The 4 edges of square cell `(col, row)`, each as a `[a, b]` endpoint pair, in world coordinates. */
+export function squareCellEdges(col: number, row: number, cellSize: number): [Point, Point][] {
+	const x0 = col * cellSize;
+	const y0 = row * cellSize;
+	const x1 = x0 + cellSize;
+	const y1 = y0 + cellSize;
+	const corners: Point[] = [
+		{ x: x0, y: y0 },
+		{ x: x1, y: y0 },
+		{ x: x1, y: y1 },
+		{ x: x0, y: y1 },
+	];
+	return [
+		[corners[0] as Point, corners[1] as Point],
+		[corners[1] as Point, corners[2] as Point],
+		[corners[2] as Point, corners[3] as Point],
+		[corners[3] as Point, corners[0] as Point],
+	];
+}
+
 // ---------------- Hex grid (axial q,r) ----------------
 
 export function hexCellToWorldCenter(q: number, r: number, size: number, orientation: HexOrientation): { x: number; y: number } {
@@ -159,6 +199,53 @@ export function getVisibleHexCells(t: ViewTransform, size: number, orientation: 
 		}
 	}
 	return cells;
+}
+
+/**
+ * Axial hex cell coordinates whose cells intersect a world-space rectangle, with a margin — the
+ * same bounding-box logic as `getVisibleHexCells`, but driven by an arbitrary world rect instead of
+ * a live viewport/`ViewTransform`. Used to enumerate every cell under a background image (see
+ * `detectMagicWalls`) without a canvas to project through.
+ */
+export function hexCellsInWorldRect(minX: number, minY: number, maxX: number, maxY: number, size: number, orientation: HexOrientation): AxialCoord[] {
+	const corners: Point[] = [
+		{ x: minX, y: minY },
+		{ x: maxX, y: minY },
+		{ x: minX, y: maxY },
+		{ x: maxX, y: maxY },
+	];
+	let qMin = Infinity;
+	let qMax = -Infinity;
+	let rMin = Infinity;
+	let rMax = -Infinity;
+	for (const c of corners) {
+		const hc = hexWorldToCell(c.x, c.y, size, orientation);
+		qMin = Math.min(qMin, hc.a);
+		qMax = Math.max(qMax, hc.a);
+		rMin = Math.min(rMin, hc.b);
+		rMax = Math.max(rMax, hc.b);
+	}
+	const margin = 1;
+	const cells: AxialCoord[] = [];
+	for (let r = rMin - margin; r <= rMax + margin; r++) {
+		for (let q = qMin - margin; q <= qMax + margin; q++) {
+			cells.push({ a: q, b: r });
+		}
+	}
+	return cells;
+}
+
+/** The 6 edges of hex cell `(q, r)`, each as a `[a, b]` endpoint pair, in world coordinates. */
+export function hexCellEdges(q: number, r: number, size: number, orientation: HexOrientation): [Point, Point][] {
+	const center = hexCellToWorldCenter(q, r, size, orientation);
+	const corners = hexCorners(center.x, center.y, size, orientation);
+	const edges: [Point, Point][] = [];
+	for (let i = 0; i < corners.length; i++) {
+		const a = corners[i];
+		const b = corners[(i + 1) % corners.length];
+		if (a && b) edges.push([a, b]);
+	}
+	return edges;
 }
 
 /** Hard safety rails: no per-map zoom setting can go beyond these. */
@@ -297,6 +384,30 @@ export function collinearOverlap(p1: Point, p2: Point, p3: Point, p4: Point): { 
 	const t1 = Math.min(1, Math.max(t3, t4));
 	if (t1 - t0 <= 1e-4) return null;
 	return { t0, t1 };
+}
+
+/**
+ * Whether `mid` sits exactly on the straight line running from `a` through to `b` — i.e. the
+ * polyline `a`→`mid`→`b` doesn't turn at `mid` at all, as opposed to merely being collinear (which
+ * would also be true of a spike where the path folds straight back on itself). Used to decide
+ * whether a wall point in between two segments of the same blocker type is just a redundant
+ * midpoint that can be dropped in favor of one direct `a`-`b` segment — see
+ * `MapController.optimizeWalls`.
+ */
+export function isStraightThrough(a: Point, mid: Point, b: Point): boolean {
+	const v1x = mid.x - a.x;
+	const v1y = mid.y - a.y;
+	const v2x = b.x - mid.x;
+	const v2y = b.y - mid.y;
+	const len1 = Math.hypot(v1x, v1y);
+	const len2 = Math.hypot(v2x, v2y);
+	if (len1 === 0 || len2 === 0) return false;
+	const cross = v1x * v2y - v1y * v2x;
+	const dot = v1x * v2x + v1y * v2y;
+	// Same relative-tolerance style as `collinearOverlap`: `cross` scales with len1*len2*sin(angle),
+	// so bounding it by a small fraction of len1*len2 is equivalent to bounding the angle itself.
+	const tolerance = len1 * len2 * 1e-4;
+	return Math.abs(cross) <= tolerance && dot > 0;
 }
 
 /**

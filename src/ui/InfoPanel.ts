@@ -2,6 +2,8 @@ import { App, Component, MarkdownRenderer, TFile, resolveSubpath, setIcon, setTo
 import { MapController } from "../controller/MapController";
 import {
 	CellData,
+	DEFAULT_EYE_TIER_ANGLES,
+	DEFAULT_SIDE_EYE_ANGLE,
 	DEFAULT_TOKEN_COLOR,
 	DEFAULT_TOKEN_ROTATION,
 	DEFAULT_VISION_ANGLE,
@@ -165,6 +167,14 @@ export class InfoPanel {
 		this.clearRenderComponents();
 		this.el.empty();
 
+		// The "select" tool's mass-edit panel always wins over any stale single-selection while the
+		// tool is active — even for a selection of exactly one object, kept simple as one dedicated
+		// bulk panel rather than merging with the full single-item editors below.
+		if (this.controller.activeTool === "select" && this.controller.massSelectionKind) {
+			this.renderMassSelectionPanel();
+			return;
+		}
+
 		if (this.controller.selectedTokenId) {
 			const found = this.controller.findToken(this.controller.selectedTokenId);
 			if (found) {
@@ -230,6 +240,282 @@ export class InfoPanel {
 			this.renderEditMode(key, cell, this.deps.settings.defaultZoneTypes);
 		} else {
 			this.renderViewMode(cell);
+		}
+	}
+
+	// ---- Mass selection ("select" tool, edit mode only) ----
+
+	/**
+	 * Dispatches to one of the three bulk field sets. Every control in all three follows one rule so
+	 * mixed/untouched values are preserved automatically (per-object, never overwritten just by being
+	 * part of the selection): nothing is written to the controller except from an explicit
+	 * `onclick`/`onchange` handler. Selects default to a leading "— ne pas changer —" option (same
+	 * convention as the toolbar's brush zone-mode select); quick-pick buttons (icon/stamp) only show
+	 * "active" when every selected object already shares that exact value, but clicking always just
+	 * sets that one value for the whole selection.
+	 */
+	private renderMassSelectionPanel(): void {
+		const kind = this.controller.massSelectionKind;
+		if (!kind) return;
+		this.setOpen(true);
+
+		if (kind === "token") {
+			const ids = this.controller.massSelectedTokenIds;
+			const tokens = this.controller.getData().tokens.filter((t) => ids.has(t.id));
+			if (tokens.length === 0) return;
+			const s = tokens.length > 1 ? "s" : "";
+			this.renderPanelHeader(`${tokens.length} pion${s} sélectionné${s}`, () => this.controller.clearMassSelection());
+			this.renderMassTokenPanel(tokens);
+			return;
+		}
+
+		if (kind === "wallSegment") {
+			const count = this.controller.massSelectedWallSegmentIds.size;
+			if (count === 0) return;
+			const s = count > 1 ? "s" : "";
+			this.renderPanelHeader(`${count} segment${s} de mur sélectionné${s}`, () => this.controller.clearMassSelection());
+			this.renderMassWallSegmentPanel();
+			return;
+		}
+
+		// "stamp": a grid cell on celled grid types, a Marker on grid type "none".
+		const isNoneGrid = this.controller.getData().gridType === "none";
+		const count = isNoneGrid ? this.controller.massSelectedMarkerIds.size : this.controller.massSelectedCellKeys.size;
+		if (count === 0) return;
+		const plural = count > 1 ? "s" : "";
+		const title = isNoneGrid ? `${count} tampon${plural} sélectionné${plural}` : `${count} case${plural} sélectionnée${plural}`;
+		this.renderPanelHeader(title, () => this.controller.clearMassSelection());
+		this.renderMassStampPanel(isNoneGrid);
+	}
+
+	private renderMassTokenPanel(tokens: Token[]): void {
+		const iconField = this.el.createDiv({ cls: "map-manager-field" });
+		iconField.createEl("label", { text: "Icône" });
+		const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
+		for (const s of QUICK_TOKEN_ICONS) {
+			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
+			if (tokens.every((t) => t.icon === s)) btn.addClass("is-active");
+			btn.onclick = () => this.controller.massUpdateTokens((t) => (t.icon = s));
+		}
+
+		const categoryField = this.el.createDiv({ cls: "map-manager-field" });
+		categoryField.createEl("label", { text: "Catégorie" });
+		const categorySelect = categoryField.createEl("select");
+		const keepCategoryOpt = categorySelect.createEl("option", { text: "— ne pas changer —" });
+		keepCategoryOpt.value = "";
+		const playerOpt = categorySelect.createEl("option", { text: "Joueur" });
+		playerOpt.value = "player";
+		const entityOpt = categorySelect.createEl("option", { text: "Entité" });
+		entityOpt.value = "entity";
+		categorySelect.value = "";
+		categorySelect.onchange = () => {
+			const value = categorySelect.value;
+			if (value === "player" || value === "entity") this.controller.massUpdateTokens((t) => (t.category = value));
+		};
+
+		const categories = new Set(tokens.map((t) => t.category ?? "entity"));
+		if (categories.size === 1) {
+			this.renderMassVisionFields(tokens, [...categories][0] as TokenCategory);
+		} else {
+			this.el.createDiv({
+				cls: "map-manager-view-empty",
+				text: "Sélection mixte (joueurs et entités) : changez d'abord la catégorie pour éditer la vision.",
+			});
+		}
+
+		const sizeField = this.el.createDiv({ cls: "map-manager-field" });
+		sizeField.createEl("label", { text: "Taille" });
+		const sizeSelect = sizeField.createEl("select");
+		const keepSizeOpt = sizeSelect.createEl("option", { text: "— ne pas changer —" });
+		keepSizeOpt.value = "";
+		for (const size of TOKEN_SIZES) {
+			const opt = sizeSelect.createEl("option", { text: `${size}×${size} case${size > 1 ? "s" : ""}` });
+			opt.value = String(size);
+		}
+		sizeSelect.value = "";
+		sizeSelect.onchange = () => {
+			const value = Number(sizeSelect.value);
+			if (value > 0) this.controller.massUpdateTokens((t) => (t.size = value));
+		};
+
+		const colorField = this.el.createDiv({ cls: "map-manager-field" });
+		colorField.createEl("label", { text: "Couleur du bord" });
+		const colorInput = colorField.createEl("input", { type: "color" });
+		colorInput.value = tokens[0]?.color ?? DEFAULT_TOKEN_COLOR;
+		colorInput.onchange = () => this.controller.massUpdateTokens((t) => (t.color = colorInput.value));
+
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		const deleteBtn = footer.createEl("button", {
+			text: tokens.length > 1 ? "Supprimer les pions" : "Supprimer le pion",
+			cls: "map-manager-btn map-manager-btn-danger",
+		});
+		deleteBtn.onclick = () => this.controller.massRemoveTokens();
+	}
+
+	/**
+	 * Mirrors `renderVisionFields`, but every control writes via `massUpdateTokens` instead of a single
+	 * token id, and each field's starting position is seeded from `tokens[0]` (only a visual default
+	 * for where the slider/input starts — nothing is written until the user actually interacts with
+	 * it, so an untouched field never overwrites a token whose value differed from the seed).
+	 */
+	private renderMassVisionFields(tokens: Token[], category: TokenCategory): void {
+		const seed = tokens[0];
+		if (!seed) return;
+		const isPlayer = category === "player";
+		const wrap = this.el.createDiv({ cls: "map-manager-field" });
+		wrap.createEl("label", { text: isPlayer ? "Vision (brouillard de guerre)" : "Vision (zone visible par le MJ uniquement)" });
+		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
+
+		if (isPlayer) {
+			this.makeSliderField(row, "Angle (°)", seed.visionAngle ?? DEFAULT_VISION_ANGLE, 1, 360, (v) => this.controller.massUpdateTokens((t) => (t.visionAngle = v)), 10);
+		} else {
+			this.makeSliderField(
+				row,
+				"Angle des yeux (°)",
+				seed.sideEyeAngle ?? DEFAULT_SIDE_EYE_ANGLE,
+				0,
+				180,
+				(v) => this.controller.massUpdateTokens((t) => (t.sideEyeAngle = v)),
+				10
+			);
+			this.makeSliderField(
+				row,
+				"Détection (°)",
+				seed.detectionAngle ?? DEFAULT_EYE_TIER_ANGLES.detectionAngle,
+				1,
+				360,
+				(v) => this.controller.massUpdateTokens((t) => (t.detectionAngle = v)),
+				10
+			);
+			this.makeSliderField(
+				row,
+				"Binoculaire (°)",
+				seed.binocularAngle ?? DEFAULT_EYE_TIER_ANGLES.binocularAngle,
+				1,
+				360,
+				(v) => this.controller.massUpdateTokens((t) => (t.binocularAngle = v)),
+				10
+			);
+			this.makeSliderField(
+				row,
+				"Monoculaire (°)",
+				seed.monocularAngle ?? DEFAULT_EYE_TIER_ANGLES.monocularAngle,
+				1,
+				360,
+				(v) => this.controller.massUpdateTokens((t) => (t.monocularAngle = v)),
+				10
+			);
+		}
+
+		const makeNumberInput = (labelText: string, value: number, onChange: (v: number) => void) => {
+			const field = row.createDiv({ cls: "map-manager-field-inline" });
+			field.createEl("label", { text: labelText });
+			const input = field.createEl("input", { type: "number" });
+			input.value = String(value);
+			input.onchange = () => {
+				const v = parseFloat(input.value);
+				if (!Number.isNaN(v)) onChange(v);
+			};
+		};
+		makeNumberInput("Portée (cases)", seed.visionRange ?? DEFAULT_VISION_RANGE, (v) => this.controller.massUpdateTokens((t) => (t.visionRange = Math.max(0, v))));
+		makeNumberInput(isPlayer ? "Rayon exploré (cases)" : "Rayon (cases)", seed.visionRadius ?? DEFAULT_VISION_RADIUS, (v) =>
+			this.controller.massUpdateTokens((t) => (t.visionRadius = Math.max(0, v)))
+		);
+	}
+
+	/** Bulk blocker-type editor for mass-selected wall *segments* — unlike the single-point editor, this never touches a whole connected shape, only exactly the segments in the selection. */
+	private renderMassWallSegmentPanel(): void {
+		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
+		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		const blockerSelect = blockerField.createEl("select");
+		const keepOpt = blockerSelect.createEl("option", { text: "— ne pas changer —" });
+		keepOpt.value = "";
+		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
+		opaqueOpt.value = "opaque";
+		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
+		dimOpt.value = "dim";
+		blockerSelect.value = "";
+		blockerSelect.onchange = () => {
+			const value = blockerSelect.value;
+			if (value === "opaque" || value === "dim") this.controller.massSetWallSegmentsBlockerType(value);
+		};
+
+		const count = this.controller.massSelectedWallSegmentIds.size;
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		const deleteBtn = footer.createEl("button", {
+			text: count > 1 ? "Supprimer les segments" : "Supprimer le segment",
+			cls: "map-manager-btn map-manager-btn-danger",
+		});
+		deleteBtn.onclick = () => this.controller.massRemoveWallSegments();
+	}
+
+	/** Bulk editor for mass-selected "stamps": grid cells on a celled grid type, or `Marker`s on grid type "none". */
+	private renderMassStampPanel(isNoneGrid: boolean): void {
+		if (!isNoneGrid) {
+			const zoneField = this.el.createDiv({ cls: "map-manager-field" });
+			zoneField.createEl("label", { text: "Type de zone" });
+			const select = zoneField.createEl("select");
+			const keepOpt = select.createEl("option", { text: "— ne pas changer —" });
+			keepOpt.value = "__keep__";
+			const noneOpt = select.createEl("option", { text: "— aucun —" });
+			noneOpt.value = "__none__";
+			for (const z of this.deps.settings.defaultZoneTypes) {
+				const opt = select.createEl("option", { text: z.name });
+				opt.value = z.id;
+			}
+			select.value = "__keep__";
+			select.onchange = () => {
+				const value = select.value;
+				if (value === "__keep__") return;
+				const zoneTypeId = value === "__none__" ? undefined : value;
+				this.controller.massUpdateCells((c) => (c.zoneTypeId = zoneTypeId));
+			};
+		}
+
+		const stampField = this.el.createDiv({ cls: "map-manager-field" });
+		stampField.createEl("label", { text: "Tampon" });
+		const quickRow = stampField.createDiv({ cls: "map-manager-stamp-row" });
+		for (const s of QUICK_STAMPS) {
+			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
+			btn.onclick = () => {
+				if (isNoneGrid) this.controller.massUpdateMarkers((m) => (m.stamp = s));
+				else this.controller.massUpdateCells((c) => (c.stamp = s));
+			};
+		}
+
+		const labelField = this.el.createDiv({ cls: "map-manager-field" });
+		labelField.createEl("label", { text: "Nom (affiché sous le tampon)" });
+		const labelRow = labelField.createDiv({ cls: "map-manager-field-inline" });
+		const labelInput = labelRow.createEl("input", { type: "text" });
+		labelInput.placeholder = "(valeurs différentes)";
+		labelInput.onchange = () => {
+			const value = labelInput.value;
+			if (!value) return;
+			if (isNoneGrid) this.controller.massUpdateMarkers((m) => (m.label = value));
+			else this.controller.massUpdateCells((c) => (c.label = value));
+		};
+		const clearLabelBtn = labelRow.createEl("button", { text: "×", cls: "map-manager-btn map-manager-btn-icon" });
+		clearLabelBtn.title = "Effacer le nom pour la sélection";
+		clearLabelBtn.onclick = () => {
+			if (isNoneGrid) this.controller.massUpdateMarkers((m) => (m.label = undefined));
+			else this.controller.massUpdateCells((c) => (c.label = undefined));
+		};
+
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		if (isNoneGrid) {
+			const count = this.controller.massSelectedMarkerIds.size;
+			const deleteBtn = footer.createEl("button", {
+				text: count > 1 ? "Supprimer les tampons" : "Supprimer le tampon",
+				cls: "map-manager-btn map-manager-btn-danger",
+			});
+			deleteBtn.onclick = () => this.controller.massRemoveMarkers();
+		} else {
+			const count = this.controller.massSelectedCellKeys.size;
+			const clearBtn = footer.createEl("button", {
+				text: count > 1 ? "Vider les cases" : "Vider la case",
+				cls: "map-manager-btn map-manager-btn-danger",
+			});
+			clearBtn.onclick = () => this.controller.massClearCells();
 		}
 	}
 
@@ -665,13 +951,13 @@ export class InfoPanel {
 	}
 
 	/**
-	 * Same underlying fields for either category (see `visionAngle` in `mapData.ts`) — only the
-	 * label and what the cone actually *does* differ: a player's lights up the fog for real
-	 * (`castVisionRays`/`drawFog`) as well as showing a GM-only preview when selected in edit mode;
-	 * an entity's is only ever that GM-only hint (`MapCanvas.drawTokenVisionZones`), never touching
-	 * fog. The direction itself is
-	 * `token.rotation` (see `renderRotationField`) — the cone just points wherever the token is
-	 * facing, so there's nothing to configure here beyond its shape/reach.
+	 * Range/radius (see `visionRange`/`visionRadius` in `mapData.ts`) are shared fields for either
+	 * category, but the cone shape itself diverges: a player gets the single `visionAngle` slider it
+	 * always had, lighting up the fog for real (`castVisionRays`/`drawFog`) as well as showing a
+	 * GM-only preview when selected in edit mode; an entity instead gets `renderEntityEyeFields`'s
+	 * eye-angle + 3-tier controls, only ever a GM-only hint (`MapCanvas.drawTokenVisionZones`), never
+	 * touching fog. Either way the direction itself is `token.rotation` (see `renderRotationField`)
+	 * — the cone(s) just point wherever the token is facing, nothing to configure here beyond shape/reach.
 	 */
 	private renderVisionFields(token: Token, category: TokenCategory): void {
 		const isPlayer = category === "player";
@@ -690,9 +976,20 @@ export class InfoPanel {
 			};
 		};
 
-		this.makeSliderField(row, "Angle (°)", token.visionAngle ?? DEFAULT_VISION_ANGLE, 1, 360, (v) =>
-			this.controller.updateToken(token.id, (t) => (t.visionAngle = v))
-		);
+		if (isPlayer) {
+			this.makeSliderField(
+				row,
+				"Angle (°)",
+				token.visionAngle ?? DEFAULT_VISION_ANGLE,
+				1,
+				360,
+				(v) => this.controller.updateToken(token.id, (t) => (t.visionAngle = v)),
+				10
+			);
+		} else {
+			this.renderEntityEyeFields(token, row);
+		}
+
 		makeNumberInput("Portée (cases)", token.visionRange ?? DEFAULT_VISION_RANGE, (v) =>
 			this.controller.updateToken(token.id, (t) => (t.visionRange = Math.max(0, v)))
 		);
@@ -702,20 +999,71 @@ export class InfoPanel {
 	}
 
 	/**
+	 * An entity's eye layout (see `Token.sideEyeAngle`/`resolveEyeCones` in `mapData.ts`): always two
+	 * cones mirrored around the token's facing, spread apart by the "Angle des yeux" slider
+	 * (`sideEyeAngle`) — `0` (its default) collapses them onto a single forward-facing cone; larger
+	 * values spread them towards the sides, like a prey animal's eyes. Each of the 3 tiers
+	 * (Détection/Binoculaire/Monoculaire) defaults to `DEFAULT_EYE_TIER_ANGLES` until individually
+	 * overridden here.
+	 */
+	private renderEntityEyeFields(token: Token, row: HTMLElement): void {
+		this.makeSliderField(
+			row,
+			"Angle des yeux (°)",
+			token.sideEyeAngle ?? DEFAULT_SIDE_EYE_ANGLE,
+			0,
+			180,
+			(v) => this.controller.updateToken(token.id, (t) => (t.sideEyeAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Détection (°)",
+			token.detectionAngle ?? DEFAULT_EYE_TIER_ANGLES.detectionAngle,
+			1,
+			360,
+			(v) => this.controller.updateToken(token.id, (t) => (t.detectionAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Binoculaire (°)",
+			token.binocularAngle ?? DEFAULT_EYE_TIER_ANGLES.binocularAngle,
+			1,
+			360,
+			(v) => this.controller.updateToken(token.id, (t) => (t.binocularAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Monoculaire (°)",
+			token.monocularAngle ?? DEFAULT_EYE_TIER_ANGLES.monocularAngle,
+			1,
+			360,
+			(v) => this.controller.updateToken(token.id, (t) => (t.monocularAngle = v)),
+			10
+		);
+	}
+
+	/**
 	 * A slider paired with a synced number input for typing an exact value. Intermediate drags
 	 * push live updates to `onCommit` (so the map updates as you go) without ever rebuilding this
-	 * panel mid-gesture — see `suppressRerender`.
+	 * panel mid-gesture — see `suppressRerender`. `step` (both the slider's drag increment and the
+	 * number input's arrow-key increment — typing an exact value is unaffected either way) defaults
+	 * to 1; every current caller is a vision/eye angle field and passes 10.
 	 */
-	private makeSliderField(container: HTMLElement, labelText: string, value: number, min: number, max: number, onCommit: (v: number) => void): void {
+	private makeSliderField(container: HTMLElement, labelText: string, value: number, min: number, max: number, onCommit: (v: number) => void, step = 1): void {
 		const field = container.createDiv({ cls: "map-manager-field-inline map-manager-slider-field" });
 		field.createEl("label", { text: labelText });
 		const slider = field.createEl("input", { type: "range", cls: "map-manager-vision-slider" });
 		slider.min = String(min);
 		slider.max = String(max);
+		slider.step = String(step);
 		slider.value = String(value);
 		const number = field.createEl("input", { type: "number", cls: "map-manager-vision-number" });
 		number.min = String(min);
 		number.max = String(max);
+		number.step = String(step);
 		number.value = String(value);
 
 		// Coalesces the whole drag/typing gesture into a single undo step (see `MapController.beginHistoryGroup`).

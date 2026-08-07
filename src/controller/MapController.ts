@@ -1,14 +1,22 @@
 import { CellData, Marker, VisionBlockerType, WallPoint, WallSegment, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
-import { WallShapeKind, clamp, collinearOverlap, projectParam, segmentIntersection, wallShapeCorners } from "../grid/gridMath";
+import { WallShapeKind, wallShapeCorners } from "../grid/gridMath";
+import { addWallSegment, optimizeWallNetwork } from "../grid/wallOptimize";
 
 export type MapControllerListener = () => void;
 
 export type MapMode = "edit" | "view";
 
-export type EditTool = "none" | "brush" | "fill" | "wall";
+export type EditTool = "none" | "brush" | "fill" | "wall" | "select";
 
-/** Tolerance, as a fraction of a segment's own length, for treating a `t` parameter as landing "at" 0/1 (an endpoint) rather than strictly inside — see `addWallSegment`. */
-const WALL_T_EPSILON = 1e-4;
+/**
+ * What kind of object the "select" tool's mass selection currently holds — set by whichever kind
+ * gets clicked/marquee-selected first, and locked until the selection is cleared (see
+ * `toggleMassSelection`/`addMassSelection`). "wallSegment" is deliberately just segments, not whole
+ * connected wall shapes (unlike the single-select wall-point editor) — each line is its own bulk-editable
+ * unit. "stamp" means a grid cell on celled grid types, or a `Marker` on grid type "none" — whichever
+ * one actually exists for the map's current grid type.
+ */
+export type MassSelectionKind = "token" | "wallSegment" | "stamp";
 
 const MAX_HISTORY = 100;
 
@@ -28,6 +36,10 @@ export class MapController {
 	showCells = true;
 	/** Whether the InfoPanel (whatever is currently selected) also renders on a player mirror window — see InfoPanel's "eye" button and `MapPlayerMirrorView`. Session-only, not persisted. */
 	showInfoToPlayers = false;
+	/** Whether entity tokens' vision zones (see `MapCanvas.drawTokenVisionZones`) also render on a player mirror window — normally a GM-only tactical hint, so this defaults off. Session-only, not persisted. See the player-window dropdown in `Toolbar`. */
+	showEntityVisionToPlayers = false;
+	/** Whether fog renders on a player mirror window — independent of `data.fogEnabled` (which only governs the GM's own window/tab); a mirror otherwise always shows fog (see `MapCanvasOptions.forceFog`). Defaults on. Session-only, not persisted. See the player-window dropdown in `Toolbar`. */
+	playerMirrorFogEnabled = true;
 	/**
 	 * Which InfoPanel tab is currently previewed for the selected token (by tab id) — shared on the
 	 * controller (rather than kept private to one InfoPanel instance) so a player mirror's InfoPanel
@@ -47,6 +59,18 @@ export class MapController {
 	activeTool: EditTool = "none";
 	brushRadius = 0;
 	brushZoneMode = "keep";
+
+	/**
+	 * The "select" tool's mass selection (edit mode): which kind is locked (see `MassSelectionKind`),
+	 * plus one id set per kind — only the set matching `massSelectionKind` is ever non-empty. Session-only,
+	 * not persisted. See `toggleMassSelection`/`addMassSelection`/`clearMassSelection` and the mass
+	 * mutators further below.
+	 */
+	massSelectionKind: MassSelectionKind | null = null;
+	massSelectedTokenIds: Set<string> = new Set();
+	massSelectedWallSegmentIds: Set<string> = new Set();
+	massSelectedCellKeys: Set<string> = new Set();
+	massSelectedMarkerIds: Set<string> = new Set();
 
 	/** Default blocker type applied to newly-drawn wall segments (edit mode, "wall" tool). Session-only. */
 	wallDrawBlockerType: VisionBlockerType = "opaque";
@@ -69,9 +93,25 @@ export class MapController {
 	pendingWallShape: WallShapeKind | null = null;
 	private wallShapeFirstCorner: { x: number; y: number } | null = null;
 
+	/**
+	 * "Seau à murs" (paint-bucket wall tool): armed via `startWallBucketPlacement`, then a single
+	 * click on the canvas (handled entirely in `MapCanvas`, which has the `App` needed to load the
+	 * background image) flood-fills outward from that spot and walls off the result — see
+	 * `detectColorRegionWalls`. Session-only, mutually exclusive with `pendingWallShape` like the rest
+	 * of the wall tool's placement modes.
+	 */
+	pendingWallBucket = false;
+
 	private data: MapFileData;
 	private listeners: Set<MapControllerListener> = new Set();
 	private exploredSetCache: { source: string[]; set: Set<string> } | null = null;
+	/**
+	 * Bumped on every actual mutation of `data` (`update()`/`undo()`/`redo()`/`replaceData()`) — never
+	 * on UI-only `notify()` calls like selection or tool changes. Lets expensive derived work keyed
+	 * off `data` (see `MapCanvas`'s vision-ray caches) skip recomputing on renders triggered by
+	 * panning/zooming/hovering, where nothing it depends on actually changed.
+	 */
+	dataVersion = 0;
 
 	/** Undo/redo history, in-memory only. A gesture (drag, brush stroke, fill) coalesces into one entry via begin/endHistoryGroup. */
 	private undoStack: MapFileData[] = [];
@@ -99,6 +139,16 @@ export class MapController {
 		this.notify();
 	}
 
+	toggleShowEntityVisionToPlayers(): void {
+		this.showEntityVisionToPlayers = !this.showEntityVisionToPlayers;
+		this.notify();
+	}
+
+	togglePlayerMirrorFog(): void {
+		this.playerMirrorFogEnabled = !this.playerMirrorFogEnabled;
+		this.notify();
+	}
+
 	setActiveInfoTab(tabId: string): void {
 		this.activeInfoTabId = tabId;
 		this.notify();
@@ -120,6 +170,7 @@ export class MapController {
 	update(mutator: (data: MapFileData) => void, options: { save?: boolean; history?: boolean } = {}): void {
 		if (options.history !== false && this.historyGroupDepth === 0) this.pushHistory();
 		mutator(this.data);
+		this.dataVersion++;
 		this.notify();
 		if (options.save !== false) this.onSave(this.data);
 	}
@@ -133,6 +184,7 @@ export class MapController {
 	replaceData(newData: MapFileData): void {
 		this.data = newData;
 		this.exploredSetCache = null;
+		this.dataVersion++;
 		this.undoStack = [];
 		this.redoStack = [];
 		this.notify();
@@ -170,6 +222,7 @@ export class MapController {
 		this.redoStack.push(this.data);
 		this.data = prev;
 		this.exploredSetCache = null;
+		this.dataVersion++;
 		this.notify();
 		this.onSave(this.data);
 	}
@@ -180,6 +233,7 @@ export class MapController {
 		this.undoStack.push(this.data);
 		this.data = next;
 		this.exploredSetCache = null;
+		this.dataVersion++;
 		this.notify();
 		this.onSave(this.data);
 	}
@@ -356,7 +410,11 @@ export class MapController {
 	// ---- Brush/fill tools (edit mode) ----
 
 	setActiveTool(tool: EditTool): void {
-		this.activeTool = this.activeTool === tool ? "none" : tool;
+		const next = this.activeTool === tool ? "none" : tool;
+		// Leftover mass selection from a previous "select" session never carries over into a fresh
+		// one, same spirit as the wall tool resetting its in-progress chain on activation below.
+		if (next !== this.activeTool) this.clearMassSelection();
+		this.activeTool = next;
 		// A fresh activation of the wall tool always starts an unconnected chain and cancels any
 		// pending shape placement, whether it's being turned on for the first time or re-toggled
 		// after being switched off mid-chain/mid-placement. It also drops any leftover point/segment
@@ -367,6 +425,7 @@ export class MapController {
 		if (tool === "wall") {
 			this.resetWallChain();
 			this.cancelWallShapePlacement();
+			this.cancelWallBucketPlacement();
 			this.selectWallPoint(null);
 		}
 		this.notify();
@@ -441,6 +500,7 @@ export class MapController {
 		}
 		this.pendingWallShape = shape;
 		this.wallShapeFirstCorner = null;
+		this.cancelWallBucketPlacement();
 		this.resetWallChain();
 		this.notify();
 	}
@@ -458,6 +518,25 @@ export class MapController {
 		if (!this.pendingWallShape) return;
 		if (this.wallShapeFirstCorner) this.wallShapeFirstCorner = null;
 		else this.pendingWallShape = null;
+		this.notify();
+	}
+
+	/** Arms/disarms "Seau à murs" — toggling like `startWallShapePlacement` does, and mutually exclusive with it (arming one cancels the other). Unlike the shape picker this needs no first-corner step: the very next click runs the flood fill (see `MapCanvas.handleClick`) and the tool stays armed afterward for repeat clicks, only turned off explicitly. */
+	startWallBucketPlacement(): void {
+		if (this.pendingWallBucket) {
+			this.cancelWallBucketPlacement();
+			return;
+		}
+		this.pendingWallBucket = true;
+		this.cancelWallShapePlacement();
+		this.resetWallChain();
+		this.notify();
+	}
+
+	/** Disarms "Seau à murs" (toolbar toggle-off / a shape picked instead / right-click while armed). */
+	cancelWallBucketPlacement(): void {
+		if (!this.pendingWallBucket) return;
+		this.pendingWallBucket = false;
 		this.notify();
 	}
 
@@ -494,7 +573,7 @@ export class MapController {
 				const a = points[i];
 				const b = points[(i + 1) % points.length];
 				if (!a || !b) continue;
-				this.addWallSegment(layer, a.id, b.id, blockerType);
+				addWallSegment(layer, a.id, b.id, blockerType);
 			}
 		});
 	}
@@ -536,161 +615,11 @@ export class MapController {
 				pointId = point.id;
 			}
 			if (previous && previous !== pointId) {
-				if (this.addWallSegment(layer, previous, pointId, blockerType)) joinedExisting = true;
+				if (addWallSegment(layer, previous, pointId, blockerType)) joinedExisting = true;
 			}
 			this.wallChain.push(pointId);
 		});
 		if (joinedExisting) this.resetWallChain();
-	}
-
-	/**
-	 * Adds a wall segment `aId`→`bId` to `layer`, reconciling it against every already-committed
-	 * segment there first — walls aren't allowed to just cross or stack over each other invisibly:
-	 *  - A transversal crossing gets a shared point dropped right where the two lines meet,
-	 *    splitting the *existing* segment there so the two walls are actually joined, not just
-	 *    visually overlapping; the new segment is likewise split into sub-segments between
-	 *    crossings, so each sub-segment always sits between two real points.
-	 *  - A run that's collinear with (and overlaps) an existing segment doesn't get a second,
-	 *    stacked segment for the shared stretch — that stretch keeps a single segment, using
-	 *    whichever of the two blocker types is more restrictive ("opaque" over "dim").
-	 * Must run inside `update()`'s mutator (one history entry per commit, however many
-	 * points/segments it ends up touching — see `commitWallPoint`).
-	 *
-	 * Returns whether `bId` — the point just placed, as opposed to `aId`, the chain's already-
-	 * established previous point — ended up touching some *other* wall (its line, or one of its own
-	 * points) in the process, which `commitWallPoint` treats as "joined a wall", finishing the chain.
-	 */
-	private addWallSegment(layer: Layer, aId: string, bId: string, blockerType: VisionBlockerType): boolean {
-		if (aId === bId) return false;
-		const pointsById = new Map(layer.wallPoints.map((p) => [p.id, p]));
-		const a = pointsById.get(aId);
-		const b = pointsById.get(bId);
-		if (!a || !b) return false;
-
-		const eps = WALL_T_EPSILON;
-		/** Reuses whichever WallPoint already sits at `pt` (within a hair of floating-point noise) instead of stacking a near-duplicate. */
-		const pointAt = (pt: { x: number; y: number }): string => {
-			for (const p of layer.wallPoints) {
-				if (Math.hypot(p.x - pt.x, p.y - pt.y) < 1e-4) return p.id;
-			}
-			const point: WallPoint = { id: generateLocalId("wallpoint"), x: pt.x, y: pt.y };
-			layer.wallPoints.push(point);
-			pointsById.set(point.id, point);
-			return point.id;
-		};
-
-		// Every point the final a→b chain of sub-segments must pass through, keyed by its `t` along
-		// a→b (0 = a, 1 = b) so they sort/dedupe naturally; the two ends are always included.
-		const cuts = new Map<number, string>([
-			[0, aId],
-			[1, bId],
-		]);
-		// t-ranges of the new segment an existing wall already covers — resolved as part of that
-		// existing wall's own rebuild below, so the final a→b pass must skip re-creating a stacked
-		// duplicate there.
-		const coveredRanges: { t0: number; t1: number }[] = [];
-		let joinedOtherWall = false;
-
-		const existingSegments = layer.wallSegments;
-		const keptSegments: WallSegment[] = [];
-		for (const existing of existingSegments) {
-			const ea = pointsById.get(existing.aId);
-			const eb = pointsById.get(existing.bId);
-			if (!ea || !eb) {
-				keptSegments.push(existing);
-				continue;
-			}
-
-			const overlap = collinearOverlap(a, b, ea, eb);
-			if (overlap) {
-				const { t0, t1 } = overlap;
-				const startPt = { x: a.x + t0 * (b.x - a.x), y: a.y + t0 * (b.y - a.y) };
-				const endPt = { x: a.x + t1 * (b.x - a.x), y: a.y + t1 * (b.y - a.y) };
-				const startId = t0 <= eps ? aId : t0 >= 1 - eps ? bId : pointAt(startPt);
-				const endId = t1 <= eps ? aId : t1 >= 1 - eps ? bId : pointAt(endPt);
-				cuts.set(t0, startId);
-				cuts.set(t1, endId);
-				coveredRanges.push({ t0, t1 });
-				if (t1 >= 1 - eps) joinedOtherWall = true;
-
-				// Rebuild `existing` around the overlap: whatever of its own extent sits outside
-				// [t0, t1] keeps its original type as its own segment(s); the shared middle becomes
-				// one merged segment, opaque winning over dim.
-				const winningType: VisionBlockerType = existing.blockerType === "opaque" || blockerType === "opaque" ? "opaque" : "dim";
-				const teA = projectParam(ea, a, b);
-				const teB = projectParam(eb, a, b);
-				const [loT, loId, hiT, hiId] = teA <= teB ? [teA, existing.aId, teB, existing.bId] : [teB, existing.bId, teA, existing.aId];
-				if (loT < t0 - eps) keptSegments.push({ id: generateLocalId("wallsegment"), aId: loId, bId: startId, blockerType: existing.blockerType });
-				if (hiT > t1 + eps) keptSegments.push({ id: generateLocalId("wallsegment"), aId: endId, bId: hiId, blockerType: existing.blockerType });
-				keptSegments.push({ id: generateLocalId("wallsegment"), aId: startId, bId: endId, blockerType: winningType });
-				continue;
-			}
-
-			const cross = segmentIntersection(a, b, ea, eb);
-			if (!cross) {
-				keptSegments.push(existing);
-				continue;
-			}
-			const t = clamp(projectParam(cross, a, b), 0, 1);
-			const u = clamp(projectParam(cross, ea, eb), 0, 1);
-			const uInterior = u > eps && u < 1 - eps;
-
-			if (t > eps && t < 1 - eps) {
-				// A genuine interior crossing (an "X") — split both segments at a shared new point,
-				// or route through whichever of the existing segment's own endpoints it lands on.
-				if (uInterior) {
-					const crossPointId = pointAt(cross);
-					cuts.set(t, crossPointId);
-					keptSegments.push(
-						{ id: generateLocalId("wallsegment"), aId: existing.aId, bId: crossPointId, blockerType: existing.blockerType },
-						{ id: generateLocalId("wallsegment"), aId: crossPointId, bId: existing.bId, blockerType: existing.blockerType }
-					);
-				} else {
-					cuts.set(t, u <= 0.5 ? existing.aId : existing.bId);
-					keptSegments.push(existing);
-				}
-			} else if (t >= 1 - eps && uInterior) {
-				// `b` — the point just placed — lands mid-way along an existing wall's line: a
-				// T-junction. Split the existing segment there (reusing `bId`, no new point needed)
-				// and flag this as "joined an existing wall" for `commitWallPoint`.
-				keptSegments.push(
-					{ id: generateLocalId("wallsegment"), aId: existing.aId, bId, blockerType: existing.blockerType },
-					{ id: generateLocalId("wallsegment"), aId: bId, bId: existing.bId, blockerType: existing.blockerType }
-				);
-				joinedOtherWall = true;
-			} else if (t <= eps && uInterior) {
-				// `a` — the chain's already-established point — sits mid-way along an existing wall's
-				// line (typically because it was itself placed there via a T-junction snap). Split the
-				// existing segment there too, for the same connectivity reason, but this doesn't count
-				// as "just joined" — `a` wasn't the point placed by *this* click.
-				keptSegments.push(
-					{ id: generateLocalId("wallsegment"), aId: existing.aId, bId: aId, blockerType: existing.blockerType },
-					{ id: generateLocalId("wallsegment"), aId, bId: existing.bId, blockerType: existing.blockerType }
-				);
-			} else {
-				keptSegments.push(existing);
-			}
-		}
-
-		const sortedTs = Array.from(cuts.keys()).sort((x, y) => x - y);
-		const uniqueTs: number[] = [];
-		for (const t of sortedTs) {
-			if (uniqueTs.length === 0 || t - (uniqueTs[uniqueTs.length - 1] as number) > eps) uniqueTs.push(t);
-		}
-		const newSegments: WallSegment[] = [];
-		for (let i = 0; i < uniqueTs.length - 1; i++) {
-			const t0 = uniqueTs[i] as number;
-			const t1 = uniqueTs[i + 1] as number;
-			const mid = (t0 + t1) / 2;
-			if (coveredRanges.some((r) => mid > r.t0 - eps && mid < r.t1 + eps)) continue;
-			const fromId = cuts.get(t0);
-			const toId = cuts.get(t1);
-			if (!fromId || !toId) continue;
-			newSegments.push({ id: generateLocalId("wallsegment"), aId: fromId, bId: toId, blockerType });
-		}
-
-		layer.wallSegments = [...keptSegments, ...newSegments];
-		return joinedOtherWall;
 	}
 
 	/**
@@ -847,6 +776,207 @@ export class MapController {
 		});
 		if (this.selectedWallSegmentId === segmentId) this.selectedWallSegmentId = null;
 		return newPointId;
+	}
+
+	/**
+	 * Cleans up the active layer's wall network without changing what it actually blocks ("Optimiser
+	 * les murs" toolbar button) — a wall built up over many manual edits tends to accumulate orphan
+	 * points, overlapping/duplicate segments, and redundant straight-line points; see
+	 * `optimizeWallNetwork` for the three-step pipeline. Scoped to the active layer, like every other
+	 * wall edit (walls are per-layer; see `Layer`).
+	 */
+	optimizeWalls(): void {
+		this.update((data) => {
+			const layer = getActiveLayer(data);
+			optimizeWallNetwork(layer);
+			if (this.selectedWallPointId && !layer.wallPoints.some((p) => p.id === this.selectedWallPointId)) this.selectedWallPointId = null;
+			if (this.selectedWallSegmentId && !layer.wallSegments.some((s) => s.id === this.selectedWallSegmentId)) this.selectedWallSegmentId = null;
+		});
+	}
+
+	/**
+	 * Merges a batch of freshly-detected wall points/segments — "Murs magiques" (`detectMagicWalls`,
+	 * traces existing wall linework) or "Seau à murs" (`detectColorRegionWalls`, walls off a flood-
+	 * filled color region) — into the active layer: each incoming point is first reconciled onto
+	 * whichever existing layer point already sits at (essentially) the same spot rather than stacked
+	 * as a near-duplicate — the detector built its candidate network independently, so it has no idea
+	 * which grid corners the layer's own hand-drawn walls already occupy — then every incoming segment
+	 * is committed exactly like a manual chain click (`addWallSegment`), so it reconciles against
+	 * whatever's already there (crossings split, overlaps merged, opaque winning over dim) instead of
+	 * just stacking on top.
+	 */
+	applyMagicWalls(points: WallPoint[], segments: WallSegment[]): void {
+		this.update((data) => {
+			const layer = getActiveLayer(data);
+			const remap = new Map<string, string>();
+			for (const point of points) {
+				const existing = layer.wallPoints.find((p) => Math.hypot(p.x - point.x, p.y - point.y) < 1e-4);
+				if (existing) {
+					remap.set(point.id, existing.id);
+				} else {
+					const fresh: WallPoint = { id: generateLocalId("wallpoint"), x: point.x, y: point.y };
+					layer.wallPoints.push(fresh);
+					remap.set(point.id, fresh.id);
+				}
+			}
+			for (const segment of segments) {
+				const aId = remap.get(segment.aId);
+				const bId = remap.get(segment.bId);
+				if (!aId || !bId) continue;
+				addWallSegment(layer, aId, bId, segment.blockerType);
+			}
+		});
+	}
+
+	// ---- Mass selection ("select" tool, edit mode) ----
+
+	/**
+	 * "stamp" is backed by two different sets depending on the map's current grid type (cells on a
+	 * celled grid, markers on "none") — this always resolves to the one that actually applies right
+	 * now, so a marquee/click always lands in the correct set even if `massSelectionSet`'s own
+	 * disambiguation (which only looks at whether cells are already populated) would otherwise be
+	 * ambiguous on an empty selection.
+	 */
+	private stampSelectionSet(): Set<string> {
+		return this.data.gridType === "none" ? this.massSelectedMarkerIds : this.massSelectedCellKeys;
+	}
+
+	private resolveMassSet(kind: MassSelectionKind): Set<string> {
+		return kind === "stamp" ? this.stampSelectionSet() : kind === "token" ? this.massSelectedTokenIds : this.massSelectedWallSegmentIds;
+	}
+
+	/** Resets the mass selection entirely (kind unlocks, every set empties). */
+	clearMassSelection(): void {
+		if (!this.massSelectionKind && this.massSelectedTokenIds.size === 0 && this.massSelectedWallSegmentIds.size === 0 && this.massSelectedCellKeys.size === 0 && this.massSelectedMarkerIds.size === 0)
+			return;
+		this.massSelectionKind = null;
+		this.massSelectedTokenIds = new Set();
+		this.massSelectedWallSegmentIds = new Set();
+		this.massSelectedCellKeys = new Set();
+		this.massSelectedMarkerIds = new Set();
+		this.notify();
+	}
+
+	/** A plain click on one object while the "select" tool is active: toggles it in/out, locking `massSelectionKind` on the first hit and unlocking it again once every set empties. Ignored if a different kind is already locked. */
+	toggleMassSelection(kind: MassSelectionKind, id: string): void {
+		if (this.massSelectionKind && this.massSelectionKind !== kind) return;
+		const set = this.resolveMassSet(kind);
+		if (set.has(id)) set.delete(id);
+		else set.add(id);
+		this.massSelectionKind = set.size > 0 ? kind : null;
+		this.notify();
+	}
+
+	/** A marquee-drag drop while the "select" tool is active: unions `ids` into the matching set (never replaces), locking `massSelectionKind` the same way `toggleMassSelection` does. Ignored if a different kind is already locked. */
+	addMassSelection(kind: MassSelectionKind, ids: Iterable<string>): void {
+		if (this.massSelectionKind && this.massSelectionKind !== kind) return;
+		const set = this.resolveMassSet(kind);
+		for (const id of ids) set.add(id);
+		if (set.size > 0) this.massSelectionKind = kind;
+		this.notify();
+	}
+
+	/** Bulk-applies `mutator` to every mass-selected token, as one undo step. */
+	massUpdateTokens(mutator: (token: Token) => void): void {
+		const ids = this.massSelectedTokenIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			for (const token of data.tokens) {
+				if (ids.has(token.id)) mutator(token);
+			}
+		});
+	}
+
+	/** Deletes every mass-selected token, then clears the selection. */
+	massRemoveTokens(): void {
+		const ids = this.massSelectedTokenIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			data.tokens = data.tokens.filter((t) => !ids.has(t.id));
+		});
+		this.clearMassSelection();
+	}
+
+	/** Bulk-sets the blocker type of every mass-selected wall segment (each segment individually, unlike `setWallPointBlockerType`'s whole-connected-shape behavior), as one undo step. */
+	massSetWallSegmentsBlockerType(type: VisionBlockerType): void {
+		const ids = this.massSelectedWallSegmentIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			for (const layer of data.layers) {
+				for (const segment of layer.wallSegments) {
+					if (ids.has(segment.id)) segment.blockerType = type;
+				}
+			}
+		});
+	}
+
+	/** Deletes every mass-selected wall segment (purging any endpoint left touching nothing, like `removeWallSegment`), then clears the selection. */
+	massRemoveWallSegments(): void {
+		const ids = this.massSelectedWallSegmentIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			for (const layer of data.layers) {
+				const touched = new Set<string>();
+				for (const segment of layer.wallSegments) {
+					if (!ids.has(segment.id)) continue;
+					touched.add(segment.aId);
+					touched.add(segment.bId);
+				}
+				if (touched.size === 0) continue;
+				layer.wallSegments = layer.wallSegments.filter((s) => !ids.has(s.id));
+				for (const pointId of touched) this.purgeIfOrphanedWallPoint(layer, pointId);
+			}
+		});
+		this.clearMassSelection();
+	}
+
+	/** Bulk-applies `mutator` to every mass-selected cell (active layer, same "none" → "square" substrate redirect as `updateCell`), as one undo step. */
+	massUpdateCells(mutator: (cell: CellData) => void): void {
+		const keys = this.massSelectedCellKeys;
+		if (keys.size === 0) return;
+		this.update((data) => {
+			const layer = getActiveLayer(data);
+			const gridType = data.gridType === "none" ? "square" : data.gridType;
+			const cells = layer.cellsByGridType[gridType];
+			for (const key of keys) {
+				const cell = cells[key] ?? {};
+				mutator(cell);
+				cells[key] = cell;
+			}
+		});
+	}
+
+	/** Blanks every mass-selected cell's fields (matches the single-cell panel's "Vider la case") without deleting the cell entry itself — an already-empty cell is pruned on save regardless (see `purgeEmptyCells`). */
+	massClearCells(): void {
+		this.massUpdateCells((c) => {
+			c.zoneTypeId = undefined;
+			c.stamp = undefined;
+			c.label = undefined;
+			c.links = undefined;
+		});
+	}
+
+	/** Bulk-applies `mutator` to every mass-selected marker (across layers, like `updateMarker`), as one undo step. */
+	massUpdateMarkers(mutator: (marker: Marker) => void): void {
+		const ids = this.massSelectedMarkerIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			for (const layer of data.layers) {
+				for (const marker of layer.markers) {
+					if (ids.has(marker.id)) mutator(marker);
+				}
+			}
+		});
+	}
+
+	/** Deletes every mass-selected marker outright (matches the single-marker panel — an emptied marker has no standalone meaning and is pruned on save anyway), then clears the selection. */
+	massRemoveMarkers(): void {
+		const ids = this.massSelectedMarkerIds;
+		if (ids.size === 0) return;
+		this.update((data) => {
+			for (const layer of data.layers) layer.markers = layer.markers.filter((m) => !ids.has(m.id));
+		});
+		this.clearMassSelection();
 	}
 
 	// ---- Tokens (map-level: not tied to any layer) ----

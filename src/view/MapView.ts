@@ -2,8 +2,9 @@ import { Notice, TextFileView, WorkspaceLeaf } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
+import { extractLayerToNewMap } from "../platform/extractLayerToNewMap";
 import { registerMirrorSource } from "../platform/mirrorRegistry";
-import { openPlayerWindow } from "../platform/openPlayerWindow";
+import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
@@ -35,6 +36,10 @@ export class MapView extends TextFileView {
 		this.registerEvent(this.app.vault.on("modify", (file) => {
 			if (file === this.file) void this.handleExternalModify();
 		}));
+		// A player-mirror window opening/closing doesn't touch this view's MapController (it's a
+		// separate leaf), but the toolbar's player-window button needs to flip between "open" and its
+		// options dropdown when that happens — see `isPlayerWindowOpen`/`renderPlayerWindowControl`.
+		this.registerEvent(this.app.workspace.on("layout-change", () => this.controller?.refresh()));
 	}
 
 	/** Reloads from disk when another open window saved a change to this same file (e.g. this map opened in a second normal tab elsewhere). No-op if the file on disk still matches what we already hold in memory (an echo of our own debounced save). A player mirror window doesn't need this — it shares this instance's `MapController` object directly (see `mirrorRegistry`). */
@@ -92,6 +97,8 @@ export class MapView extends TextFileView {
 					this.controller?.setMode("view");
 					if (this.file) void openPlayerWindow(this.app, this.file);
 				},
+				isPlayerWindowOpen: () => (this.file ? isPlayerWindowOpen(this.app, this.file) : false),
+				extractLayer: (layerId) => void this.extractLayer(layerId),
 			}
 		);
 		const body = this.rootEl.createDiv({ cls: "map-manager-body" });
@@ -148,6 +155,19 @@ export class MapView extends TextFileView {
 		} catch (e) {
 			console.error("Map Manager: échec de la publication de la vue publique", e);
 			new Notice("Échec de la publication de la vue publique.");
+		}
+	}
+
+	private async extractLayer(layerId: string): Promise<void> {
+		if (!this.controller || !this.file) return;
+		try {
+			const created = await extractLayerToNewMap(this.app, this.file, this.controller.getData(), layerId);
+			if (!created) return;
+			new Notice(`Calque extrait vers ${created.path}`);
+			await this.app.workspace.getLeaf(true).openFile(created);
+		} catch (e) {
+			console.error("Map Manager: échec de l'extraction du calque", e);
+			new Notice("Échec de l'extraction du calque.");
 		}
 	}
 

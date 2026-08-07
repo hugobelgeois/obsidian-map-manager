@@ -118,20 +118,13 @@ function angleDiffDeg(a: number, b: number): number {
 }
 
 /**
- * Traces `FOG_RAY_COUNT` rays outward from a player token's center (its omnidirectional radius
- * plus its directional cone, whichever reaches further at a given angle) against `wallSegments`.
- * The cone points wherever the token's own facing arrow does (`token.rotation` — see
- * `drawTokenFacingArrow`): a player's vision is tied to their token's facing, not a separate value,
- * so turning the token turns what it can see. Purely geometric (world units) — no cosmetic tremble,
- * see `VisionRays`.
+ * Traces `FOG_RAY_COUNT` rays outward from `center` (the omnidirectional `radius` plus a
+ * directional cone reaching `range` within `halfAngle` of `direction`, whichever reaches further at
+ * a given angle) against `wallSegments`. Shared core for `castVisionRays` (a player's own facing
+ * cone) and `castEntityConeRays` (one of an entity's `resolveEyeCones` cones) — everything about
+ * *whose* angle/direction/reach this is lives in the caller, this function only knows geometry.
  */
-export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[]): VisionRays {
-	const center = footprintCenter(data, token);
-	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
-	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
-	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
-	const direction = token.rotation ?? DEFAULT_TOKEN_ROTATION;
-
+function traceRays(center: Point, radius: number, range: number, halfAngle: number, direction: number, wallSegments: ResolvedWallSegment[]): RaySample[] {
 	const rays: RaySample[] = [];
 	for (let i = 0; i < FOG_RAY_COUNT; i++) {
 		const angle = (360 / FOG_RAY_COUNT) * i;
@@ -168,7 +161,35 @@ export function castVisionRays(data: MapFileData, token: Token, wallSegments: Re
 		}
 		rays.push({ clearEnd, dimEnd });
 	}
-	return { center, rays };
+	return rays;
+}
+
+/**
+ * A player token's vision: the cone points wherever the token's own facing arrow does
+ * (`token.rotation` — see `drawTokenFacingArrow`), full angle `token.visionAngle` — a player's
+ * vision is tied to their token's facing, not a separate value, so turning the token turns what it
+ * can see. Purely geometric (world units) — no cosmetic tremble, see `VisionRays`.
+ */
+export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[]): VisionRays {
+	const center = footprintCenter(data, token);
+	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
+	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
+	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
+	const direction = token.rotation ?? DEFAULT_TOKEN_ROTATION;
+	return { center, rays: traceRays(center, radius, range, halfAngle, direction, wallSegments) };
+}
+
+/**
+ * One of an entity's eye cones (see `resolveEyeCones` in `mapData.ts`): same geometry as
+ * `castVisionRays`, but with an explicit `direction`/`fullAngleDeg` instead of the token's own
+ * `rotation`/`visionAngle` — an entity's `visionRange`/`visionRadius` still supply the shared
+ * magnitude (see `resolveEyeCones`'s doc comment on why every tier/cone reaches the same distance).
+ */
+export function castEntityConeRays(data: MapFileData, token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): VisionRays {
+	const center = footprintCenter(data, token);
+	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
+	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
+	return { center, rays: traceRays(center, radius, range, fullAngleDeg / 2, direction, wallSegments) };
 }
 
 /** Every player token's traced vision, for `data` as a whole (all visible layers' walls). */

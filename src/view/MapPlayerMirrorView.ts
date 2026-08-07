@@ -12,8 +12,10 @@ export const VIEW_TYPE_MAP_PLAYER_MIRROR = "map-manager-player-mirror-view";
  * dragged onto a second monitor for players (see `openPlayerWindow`). Shares the exact same
  * `MapController` as its source (`mirrorRegistry`), so token/wall/layer edits appear instantly with
  * no polling; camera pan/zoom is pushed explicitly via `onViewportChange` since panning doesn't
- * otherwise touch `MapController`. Fog always renders here regardless of the source's own fog
- * toggle (see `MapCanvasOptions.forceFog`). The InfoPanel itself only appears here while the GM has
+ * otherwise touch `MapController`. Fog here follows its own toggle, independent of the source's own
+ * fog setting (see `MapCanvasOptions.forceFog`/`MapController.playerMirrorFogEnabled`), and entity
+ * token vision zones only show here while the GM has separately opted in (both toggled from the
+ * player-window dropdown in `Toolbar`, defaulting to fog-on/vision-off). The InfoPanel itself only appears here while the GM has
  * it toggled on (the "eye" button in `InfoPanel`, `MapController.showInfoToPlayers`) — since that
  * flag and the current selection both live on the shared controller, this just mirrors it live too.
  */

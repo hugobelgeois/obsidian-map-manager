@@ -2,8 +2,9 @@ import { MarkdownPostProcessorContext, MarkdownRenderChild, Notice, TFile, debou
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapBlockSource, parseMapData, serializeMapData } from "../data/mapData";
+import { extractLayerToNewMap } from "../platform/extractLayerToNewMap";
 import { registerMirrorSource } from "../platform/mirrorRegistry";
-import { openPlayerWindow } from "../platform/openPlayerWindow";
+import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas } from "../render/MapCanvas";
@@ -68,6 +69,10 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const modifyRef = app.vault.on("modify", (f) => {
 		if (f instanceof TFile) void handleExternalModify(f);
 	});
+	// A player-mirror window opening/closing doesn't touch this embed's MapController (it's a separate
+	// leaf), but the toolbar's player-window button needs to flip between "open" and its options
+	// dropdown when that happens — see `isPlayerWindowOpen`/`renderPlayerWindowControl`.
+	const layoutChangeRef = app.workspace.on("layout-change", () => controller.refresh());
 
 	const publishView = async () => {
 		try {
@@ -79,6 +84,18 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		}
 	};
 
+	const extractLayer = async (layerId: string) => {
+		try {
+			const created = await extractLayerToNewMap(app, file, controller.getData(), layerId);
+			if (!created) return;
+			new Notice(`Calque extrait vers ${created.path}`);
+			await app.workspace.getLeaf(true).openFile(created);
+		} catch (e) {
+			console.error("Map Manager: échec de l'extraction du calque", e);
+			new Notice("Échec de l'extraction du calque.");
+		}
+	};
+
 	const toolbar = new Toolbar(host, app, { assetsFolder: plugin.settings.assetsFolder, settings: plugin.settings }, controller, {
 		recenter: () => canvasRef?.recenter(),
 		publish: () => void publishView(),
@@ -86,6 +103,8 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			controller.setMode("view");
 			void openPlayerWindow(app, file);
 		},
+		isPlayerWindowOpen: () => isPlayerWindowOpen(app, file),
+		extractLayer: (layerId) => void extractLayer(layerId),
 	});
 	const body = host.createDiv({ cls: "map-manager-body" });
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
@@ -143,6 +162,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 			unsubscribeSettings();
 			unregisterMirror();
 			app.vault.offref(modifyRef);
+			app.workspace.offref(layoutChangeRef);
 		})
 	);
 }

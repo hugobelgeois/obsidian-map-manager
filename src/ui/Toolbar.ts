@@ -1,10 +1,12 @@
-import { App, TFile, setIcon, setTooltip } from "obsidian";
+import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
+import { detectMagicWalls } from "../platform/detectMagicWalls";
 import { MapManagerSettings } from "../settings/types";
 import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
+import { MagicWallsModal } from "./MagicWallsModal";
 
 export interface ToolbarActions {
 	recenter: () => void;
@@ -12,6 +14,10 @@ export interface ToolbarActions {
 	publish: () => void;
 	/** Switches this window to "Vue" (GMs run live sessions from there) and pops open a read-only mirror of the map in a new OS window, for dragging onto a second monitor — see `openPlayerWindow`. */
 	openPlayerWindow: () => void;
+	/** Whether a player-mirror window for this map is currently open — see `openPlayerWindow.isPlayerWindowOpen`. Toolbar polls this on every render rather than caching it, since opening/closing that window doesn't itself touch `MapController`. */
+	isPlayerWindowOpen: () => boolean;
+	/** Extracts one layer into a brand-new standalone `.map` file — see `extractLayerToNewMap`. */
+	extractLayer: (layerId: string) => void;
 }
 
 export interface ToolbarDeps {
@@ -46,7 +52,12 @@ export class Toolbar {
 	private imageMenuOpen = false;
 	private fogMenuOpen = false;
 	private zoomMenuOpen = false;
+	private playerWindowMenuOpen = false;
 	private openDropdownEl: HTMLElement | null = null;
+	/** True while "Murs magiques" is analyzing the active layer's background image (see `runMagicWalls`) — local UI state, not part of `MapController`, so it needs its own re-render. */
+	private magicWallsRunning = false;
+	/** The wall color picked with "Murs magiques"' eyedropper (see `pickMagicWallsColor`), or `null` to fall back to automatic color detection. Local UI state, like `magicWallsRunning` — session-only, resets if the toolbar itself is torn down. */
+	private magicWallsColor: string | null = null;
 
 	constructor(container: HTMLElement, private app: App, private deps: ToolbarDeps, private controller: MapController, private actions: ToolbarActions) {
 		this.el = container.createDiv({ cls: "map-manager-toolbar" });
@@ -66,6 +77,7 @@ export class Toolbar {
 		this.imageMenuOpen = false;
 		this.fogMenuOpen = false;
 		this.zoomMenuOpen = false;
+		this.playerWindowMenuOpen = false;
 	}
 
 	private handleDocumentClick = (e: MouseEvent): void => {
@@ -135,10 +147,59 @@ export class Toolbar {
 		const resetBtn = recenterGroup.createEl("button", { text: "Recentrer", cls: "map-manager-btn" });
 		resetBtn.onclick = () => this.actions.recenter();
 
-		const playerWindowBtn = recenterGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(playerWindowBtn, "monitor");
-		setTooltip(playerWindowBtn, "Ouvrir la vue joueur dans une nouvelle fenêtre (à glisser sur un second écran)");
-		playerWindowBtn.onclick = () => this.actions.openPlayerWindow();
+		this.renderPlayerWindowControl(recenterGroup);
+	}
+
+	/**
+	 * While no player-mirror window is open yet, this is a plain button: clicking it just pops one
+	 * open (`actions.openPlayerWindow`), same as before. Once one is open, clicking instead opens a
+	 * dropdown of live options for it — opening a second window isn't useful, so the click's meaning
+	 * changes rather than adding a separate menu button. See `MapController.showEntityVisionToPlayers`
+	 * (hidden by default) and `playerMirrorFogEnabled` (enabled by default).
+	 */
+	private renderPlayerWindowControl(container: HTMLElement): void {
+		const isOpen = this.actions.isPlayerWindowOpen();
+
+		if (!isOpen) {
+			const btn = container.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(btn, "monitor");
+			setTooltip(btn, "Ouvrir la vue joueur dans une nouvelle fenêtre (à glisser sur un second écran)");
+			btn.onclick = () => this.actions.openPlayerWindow();
+			return;
+		}
+
+		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-player-window-dropdown" });
+		wrapper.toggleClass("is-open", this.playerWindowMenuOpen);
+		if (this.playerWindowMenuOpen) this.openDropdownEl = wrapper;
+
+		const trigger = wrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
+		setIcon(trigger, "monitor");
+		trigger.addClass("is-active");
+		setTooltip(trigger, "Vue joueur (options)");
+		setIcon(trigger.createSpan({ cls: "map-manager-dropdown-chevron" }), "chevron-down");
+		trigger.onclick = () => {
+			const wasOpen = this.playerWindowMenuOpen;
+			this.closeMenus();
+			this.playerWindowMenuOpen = !wasOpen;
+			this.render();
+		};
+
+		const panel = wrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-player-window-dropdown-panel" });
+		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Vue joueur" });
+
+		const visionBtn = panel.createEl("button", {
+			text: this.controller.showEntityVisionToPlayers ? "Masquer la vision des entités" : "Afficher la vision des entités",
+			cls: "map-manager-btn",
+		});
+		visionBtn.toggleClass("is-active", this.controller.showEntityVisionToPlayers);
+		visionBtn.onclick = () => this.controller.toggleShowEntityVisionToPlayers();
+
+		const fogBtn = panel.createEl("button", {
+			text: this.controller.playerMirrorFogEnabled ? "Désactiver le brouillard" : "Activer le brouillard",
+			cls: "map-manager-btn",
+		});
+		fogBtn.toggleClass("is-active", this.controller.playerMirrorFogEnabled);
+		fogBtn.onclick = () => this.controller.togglePlayerMirrorFog();
 	}
 
 	/** Clicking the active grid icon opens a dropdown of the other grid types below it; picking one applies and closes it. */
@@ -226,6 +287,11 @@ export class Toolbar {
 				setTooltip(downBtn, "Descendre le calque");
 				downBtn.disabled = displayIndex === layers.length - 1;
 				downBtn.onclick = () => this.controller.moveLayer(layer.id, -1);
+
+				const extractBtn = row.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+				setIcon(extractBtn, "copy-plus");
+				setTooltip(extractBtn, "Extraire ce calque vers une nouvelle carte");
+				extractBtn.onclick = () => this.actions.extractLayer(layer.id);
 
 				const deleteBtn = row.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-btn-danger" });
 				setIcon(deleteBtn, "trash");
@@ -368,6 +434,12 @@ export class Toolbar {
 		wallBtn.toggleClass("is-active", this.controller.activeTool === "wall");
 		wallBtn.onclick = () => this.controller.setActiveTool("wall");
 
+		const selectBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(selectBtn, "mouse-pointer-2");
+		setTooltip(selectBtn, "Sélection (actions groupées)");
+		selectBtn.toggleClass("is-active", this.controller.activeTool === "select");
+		selectBtn.onclick = () => this.controller.setActiveTool("select");
+
 		if (this.controller.activeTool === "wall") {
 			wallWrapper.addClass("is-open");
 			const panel = wallWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-wall-shape-dropdown-panel" });
@@ -383,15 +455,75 @@ export class Toolbar {
 			shapeBtn("square", "square", "Carré / rectangle : cliquez un coin, puis le coin opposé");
 			shapeBtn("triangle", "triangle", "Triangle : cliquez un coin, puis le coin opposé de sa zone");
 			shapeBtn("losange", "diamond", "Losange : cliquez un coin, puis le coin opposé de sa zone");
+			// "Seau à murs" needs no second corner like the shapes above — one click on the map is enough
+			// to flood-fill the color under the cursor and wall off where it stops (see
+			// `MapCanvas.runColorRegionWalls`), so it stays armed after each use instead of needing a
+			// "first corner placed" half-state.
+			const bucketBtn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(bucketBtn, "paint-bucket");
+			setTooltip(bucketBtn, "Seau à murs : cliquez sur une couleur pour murer la zone qui l'entoure");
+			bucketBtn.toggleClass("is-active", this.controller.pendingWallBucket);
+			bucketBtn.onclick = () => this.controller.startWallBucketPlacement();
 			if (this.controller.pendingWallShape) {
 				const hintText = this.controller.getWallShapeFirstCorner()
 					? "Cliquez pour poser le coin opposé (clic droit pour annuler)"
 					: "Cliquez pour poser le premier coin (clic droit pour annuler)";
 				panel.createDiv({ cls: "map-manager-wall-shape-hint", text: hintText });
+			} else if (this.controller.pendingWallBucket) {
+				panel.createDiv({
+					cls: "map-manager-wall-shape-hint",
+					text: "Cliquez sur la carte pour murer la zone de couleur sous le curseur (clic droit pour désactiver)",
+				});
 			}
+
+			// "Optimiser les murs" runs a one-off cleanup pass over the active layer's wall network
+			// (orphan points, overlapping/duplicate segments, redundant straight-line points — see
+			// `MapController.optimizeWalls`). "Murs magiques" auto-detects wall linework from the
+			// layer's background image instead of placing points by hand — see `runMagicWalls`. Its
+			// color row lets the user override automatic color detection with an exact pick instead
+			// (`pickMagicWallsColor`) — handy when the image's wall lines aren't the map's boldest,
+			// highest-contrast stroke (a heavy border/frame, say), which would otherwise win the vote.
+			panel.createDiv({ cls: "map-manager-dropdown-title", text: "Outils" });
+
+			const colorRow = panel.createDiv({ cls: "map-manager-magic-walls-color-row" });
+			colorRow.createSpan({ text: "Couleur des murs :" });
+			const colorSwatch = colorRow.createDiv({ cls: "map-manager-magic-walls-color-swatch" });
+			if (this.magicWallsColor) {
+				colorSwatch.addClass("is-set");
+				colorSwatch.style.setProperty("--map-manager-magic-walls-color", this.magicWallsColor);
+				setTooltip(colorSwatch, this.magicWallsColor);
+			} else {
+				setTooltip(colorSwatch, "Détection automatique");
+			}
+			const pipetteBtn = colorRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(pipetteBtn, "pipette");
+			setTooltip(pipetteBtn, "Choisir la couleur des murs à la pipette");
+			pipetteBtn.onclick = () => void this.pickMagicWallsColor();
+			if (this.magicWallsColor) {
+				const clearColorBtn = colorRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+				setIcon(clearColorBtn, "x");
+				setTooltip(clearColorBtn, "Revenir à la détection automatique");
+				clearColorBtn.onclick = () => {
+					this.magicWallsColor = null;
+					this.render();
+				};
+			}
+
+			const optimizeWallsBtn = panel.createEl("button", { text: "Optimiser les murs", cls: "map-manager-btn" });
+			optimizeWallsBtn.onclick = () => {
+				this.controller.optimizeWalls();
+				new Notice("Murs optimisés.");
+			};
+			const magicWallsBtn = panel.createEl("button", { text: this.magicWallsRunning ? "Analyse en cours…" : "Murs magiques", cls: "map-manager-btn" });
+			magicWallsBtn.disabled = this.magicWallsRunning;
+			magicWallsBtn.onclick = () => void this.runMagicWalls();
 		}
 
 		if (this.controller.activeTool === "none") return;
+
+		// The "select" tool's own controls live entirely in InfoPanel's mass-edit panel (matching every
+		// other selection type) — nothing further to show in the toolbar row itself.
+		if (this.controller.activeTool === "select") return;
 
 		if (this.controller.activeTool === "wall") {
 			const blockerSelect = toolGroup.createEl("select");
@@ -428,6 +560,62 @@ export class Toolbar {
 			}
 			zoneSelect.value = this.controller.brushZoneMode;
 			zoneSelect.onchange = () => this.controller.setBrushZoneMode(zoneSelect.value);
+		}
+	}
+
+	/**
+	 * "Murs magiques": runs `detectMagicWalls` against the active layer's background image — using
+	 * `magicWallsColor` (the eyedropper pick) if set, else automatic detection — and, if it found a
+	 * candidate wall network, opens `MagicWallsModal` for the user to confirm before anything is
+	 * actually written to the map (`MapController.applyMagicWalls`). Guard conditions (no background
+	 * image, grid type "none", grid too fine for the image, an invalid picked color) are all just
+	 * thrown `Error`s from `detectMagicWalls` with an already user-facing French message — shown as-is.
+	 */
+	private async runMagicWalls(): Promise<void> {
+		if (this.magicWallsRunning) return;
+		this.magicWallsRunning = true;
+		this.render();
+		try {
+			const activeLayer = this.controller.getActiveLayer();
+			const result = await detectMagicWalls(this.app, this.controller.getData(), activeLayer, this.controller.wallDrawBlockerType, this.magicWallsColor ?? undefined);
+			if (!result) {
+				new Notice("Aucun mur détecté sur l'image de ce calque.");
+				return;
+			}
+			new MagicWallsModal(this.app, result, () => {
+				this.controller.applyMagicWalls(result.wallPoints, result.wallSegments);
+				const count = result.wallSegments.length;
+				new Notice(`${count} mur${count > 1 ? "s" : ""} magique${count > 1 ? "s" : ""} ajouté${count > 1 ? "s" : ""}.`);
+			}).open();
+		} catch (e) {
+			console.error("Map Manager: échec de la détection des murs magiques", e);
+			new Notice(e instanceof Error ? e.message : "Échec de la détection des murs magiques.");
+		} finally {
+			this.magicWallsRunning = false;
+			this.render();
+		}
+	}
+
+	/**
+	 * Opens the browser's native `EyeDropper` (Chromium/Electron desktop only — not yet part of
+	 * TypeScript's DOM lib, hence the local type cast rather than a global ambient declaration) so
+	 * the user can sample the wall color directly off the map canvas (or anywhere else on screen) for
+	 * "Murs magiques" to target instead of guessing it automatically. Silently does nothing if the
+	 * user presses Escape (`open()` rejects) — that's a cancel, not an error.
+	 */
+	private async pickMagicWallsColor(): Promise<void> {
+		type EyeDropperCtor = new () => { open(): Promise<{ sRGBHex: string }> };
+		const ctor = (window as unknown as { EyeDropper?: EyeDropperCtor }).EyeDropper;
+		if (!ctor) {
+			new Notice("La pipette n'est pas disponible sur cette plateforme.");
+			return;
+		}
+		try {
+			const result = await new ctor().open();
+			this.magicWallsColor = result.sRGBHex;
+			this.render();
+		} catch {
+			// Cancelled (Escape) — nothing to do.
 		}
 	}
 

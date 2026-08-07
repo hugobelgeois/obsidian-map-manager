@@ -155,24 +155,40 @@ export interface Token {
 	 */
 	category?: TokenCategory;
 	/**
-	 * Vision cone full angle in degrees. Any category, same fields/geometry either way (see
-	 * `castVisionRays`) — but only a player's cone lights up the fog; the cone itself (either
-	 * category) is otherwise just a GM-only tactical overlay with no effect on fog at all (see
-	 * `MapCanvas.drawTokenVisionZones`).
+	 * Player-only vision cone full angle in degrees (see `castVisionRays`) — a player's cone both
+	 * lights up the fog for real and shows the same GM-only tactical preview as an entity's
+	 * (`MapCanvas.drawTokenVisionZones`). An entity token ignores this field entirely; its own vision
+	 * shape instead comes from `sideEyeAngle`/`detectionAngle`/`binocularAngle`/`monocularAngle` (see
+	 * `resolveEyeCones`) — never touching fog either way, purely a GM-only tactical overlay.
 	 */
 	visionAngle?: number;
-	/** Vision range in cells — see `visionAngle` for which categories this affects and how. */
+	/** Vision range in cells, shared by both categories' vision shapes — see `visionAngle` (player) and `resolveEyeCones` (entity). */
 	visionRange?: number;
-	/** Omnidirectional "always lit" radius, in cells, regardless of facing — see `visionAngle` for which categories this affects and how. */
+	/** Omnidirectional "always lit" radius, in cells, regardless of facing — shared by both categories, see `visionAngle` (player) and `resolveEyeCones` (entity). */
 	visionRadius?: number;
+	/**
+	 * Entity-only: how far each of the token's two eye cones sits from its facing (`rotation`), in
+	 * degrees, one clockwise and one counter-clockwise — `0` (the default) puts both cones on top of
+	 * each other pointing straight ahead, like a single forward-facing cone; larger values spread
+	 * them out to either side, like a prey animal's eyes. Overrides `DEFAULT_SIDE_EYE_ANGLE`. See
+	 * `resolveEyeCones`.
+	 */
+	sideEyeAngle?: number;
+	/** Full angle (degrees) of the narrowest, sharpest tier of an entity's eye cone(s) — overrides `DEFAULT_EYE_TIER_ANGLES.detectionAngle`. See `resolveEyeCones`. */
+	detectionAngle?: number;
+	/** Full angle (degrees) of the middle tier — overrides `DEFAULT_EYE_TIER_ANGLES.binocularAngle`. See `resolveEyeCones`. */
+	binocularAngle?: number;
+	/** Full angle (degrees) of the widest tier — overrides `DEFAULT_EYE_TIER_ANGLES.monocularAngle`. See `resolveEyeCones`. */
+	monocularAngle?: number;
 	/** Vault path to a custom image shown instead of `icon` once loaded. */
 	image?: string;
 	/**
 	 * Which way the token is drawn facing (a small arrow on its rim — see `drawTokenFacingArrow`),
 	 * in degrees, 0 = east, increasing clockwise. Any category. For player tokens this is also the
-	 * fog vision cone's facing (see `castVisionRays`) — there's a single facing per token, not one
-	 * for the arrow and a separate one for vision; pre-v14 files stored that as `visionDirection`,
-	 * folded into this field on load (see `parseToken`).
+	 * fog vision cone's facing (see `castVisionRays`); for entities it's what `resolveEyeCones`
+	 * points its own cone(s) relative to. There's a single facing per token, not one for the arrow
+	 * and a separate one for vision; pre-v14 files stored that as `visionDirection`, folded into
+	 * this field on load (see `parseToken`).
 	 */
 	rotation?: number;
 }
@@ -185,6 +201,52 @@ export const DEFAULT_VISION_ANGLE = 90;
 export const DEFAULT_VISION_RANGE = 6;
 export const DEFAULT_VISION_RADIUS = 1;
 export const DEFAULT_TOKEN_ROTATION = 0;
+
+/** Default `Token.sideEyeAngle` — how far each of an entity's two eye cones sits from its facing, in degrees. `0` collapses them onto a single forward direction. See `resolveEyeCones`. */
+export const DEFAULT_SIDE_EYE_ANGLE = 0;
+
+/** An entity eye cone's 3-tier angles (degrees, full angle) — see `resolveEyeCones`. */
+export interface EyeTierAngles {
+	detectionAngle: number;
+	binocularAngle: number;
+	monocularAngle: number;
+}
+
+/**
+ * Default tier angles for every entity's eye cones, real-world-inspired for a side-eyed creature
+ * (eyes towards the sides of the head, e.g. a prey animal): a narrow sharp-detail zone
+ * ("détection"), a wider zone with depth perception ("binoculaire"), and the widest zone where only
+ * shape/motion registers ("monoculaire"). See `resolveEyeCones`.
+ */
+export const DEFAULT_EYE_TIER_ANGLES: EyeTierAngles = { detectionAngle: 20, binocularAngle: 50, monocularAngle: 150 };
+
+/** One of an entity's eye cones — a facing direction (same convention as `Token.rotation`) plus its own resolved 3-tier angles. */
+export interface EntityEyeCone extends EyeTierAngles {
+	direction: number;
+}
+
+/**
+ * Resolves an entity token's eye layout into its two cones, mirrored around its facing (`rotation`)
+ * by `token.sideEyeAngle` (defaults to `DEFAULT_SIDE_EYE_ANGLE`, i.e. `0` — both cones pointing the
+ * same way, reading as a single forward cone) — one clockwise, one counter-clockwise, both sharing
+ * the token's own facing point/`visionRange`/`visionRadius` (see `Token.rotation` and
+ * `castVisionRays` callers). Each per-tier angle field on the token overrides
+ * `DEFAULT_EYE_TIER_ANGLES` individually, so customizing e.g. just `detectionAngle` leaves the other
+ * two at their default. Player tokens never call this — see `Token.visionAngle`.
+ */
+export function resolveEyeCones(token: Token): EntityEyeCone[] {
+	const tierAngles: EyeTierAngles = {
+		detectionAngle: token.detectionAngle ?? DEFAULT_EYE_TIER_ANGLES.detectionAngle,
+		binocularAngle: token.binocularAngle ?? DEFAULT_EYE_TIER_ANGLES.binocularAngle,
+		monocularAngle: token.monocularAngle ?? DEFAULT_EYE_TIER_ANGLES.monocularAngle,
+	};
+	const facing = token.rotation ?? DEFAULT_TOKEN_ROTATION;
+	const sideAngle = token.sideEyeAngle ?? DEFAULT_SIDE_EYE_ANGLE;
+	return [
+		{ direction: facing - sideAngle, ...tierAngles },
+		{ direction: facing + sideAngle, ...tierAngles },
+	];
+}
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
 
@@ -401,6 +463,10 @@ function parseToken(value: unknown): Token | null {
 		visionAngle: typeof value.visionAngle === "number" ? value.visionAngle : undefined,
 		visionRange: typeof value.visionRange === "number" ? value.visionRange : undefined,
 		visionRadius: typeof value.visionRadius === "number" && value.visionRadius >= 0 ? value.visionRadius : undefined,
+		sideEyeAngle: typeof value.sideEyeAngle === "number" ? value.sideEyeAngle : undefined,
+		detectionAngle: typeof value.detectionAngle === "number" ? value.detectionAngle : undefined,
+		binocularAngle: typeof value.binocularAngle === "number" ? value.binocularAngle : undefined,
+		monocularAngle: typeof value.monocularAngle === "number" ? value.monocularAngle : undefined,
 		image: isString(value.image) ? value.image : undefined,
 		// Pre-v14 files kept the vision cone's facing separate from the token's own rotation
 		// (`visionDirection`); `rotation` takes over both, so a legacy file with no `rotation` yet
