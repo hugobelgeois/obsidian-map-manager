@@ -36,6 +36,7 @@ import {
 	fogBucketSize as fogFogBucketSize,
 	footprintCenter as fogFootprintCenter,
 	isPointLit,
+	isWorldPointExplored as fogIsWorldPointExplored,
 	occupiedFootprintCells,
 	resolveWallSegments as fogResolveWallSegments,
 } from "../grid/fog";
@@ -82,6 +83,13 @@ const FOG_ORGANIC_WAVELENGTH = 260;
 const FOG_BLUR_SCREEN_PX = 22;
 /** Fixed screen-pixel overdraw margin on the offscreen fog buffer — see `renderFogLayer`. Comfortably larger than `FOG_BLUR_SCREEN_PX`. */
 const FOG_OVERDRAW_PX = FOG_BLUR_SCREEN_PX * 3;
+/**
+ * How far (fixed screen px) `drawFog` pulls a revealed shape's own edge inward before the blur runs,
+ * wherever that edge borders unrevealed territory — see `dimInset`/`erosionInset` there. A CSS
+ * `blur()` doesn't cut off sharply right at `FOG_BLUR_SCREEN_PX`, it only falls off *fast* past it, so
+ * this needs real headroom past that nominal radius, not just a few px of slack.
+ */
+const FOG_LEAK_INSET_PX = FOG_BLUR_SCREEN_PX * 2.5;
 /** Fog animations (the tremble, and the render loop driving it) are force-disabled at or past this zoom — see `activeFogAnimationMode`. */
 const FOG_ANIMATION_MIN_ZOOM = 0.5;
 
@@ -1864,6 +1872,19 @@ export class MapCanvas {
 		ctx.translate(this.transform.panX, this.transform.panY);
 		ctx.scale(this.transform.zoom, this.transform.zoom);
 
+		// Computed up front (rather than alongside the fog overlay itself, further down) so
+		// `drawWallShadowBlackout` below — and thus `drawBackgrounds`/`drawGridAndCells` — can already
+		// use this frame's live vision reach, not just last frame's.
+		if (this.fogCurrentlyVisible()) {
+			const wallSegments = this.resolveWallSegments();
+			this.frameVisionCache = this.controller
+				.getData()
+				.tokens.filter((t) => (t.category ?? "entity") === "player")
+				.map((t) => this.castRaysForToken(t, wallSegments));
+		} else {
+			this.frameVisionCache = [];
+		}
+
 		this.drawBackgrounds(ctx);
 
 		const cellsVisible = this.cellsCurrentlyVisible();
@@ -1880,19 +1901,15 @@ export class MapCanvas {
 			}
 		}
 
+		// Patches solid black back over content drawn right above, but only within a margin of an
+		// actual wall and only where fog wouldn't otherwise reveal it — see the method doc. Away from
+		// any wall, `drawBackgrounds`/`drawGridAndCells` above are left completely untouched, so open
+		// territory keeps exactly its original smooth vision-cone look with no masking artifacts.
+		if (this.fogCurrentlyVisible()) this.drawWallShadowBlackout(ctx, dpr, imageBounds);
+
 		const noGrid = this.controller.getData().gridType === "none";
 		if (noGrid) this.drawMarkers(ctx);
 		this.drawWalls(ctx);
-
-		if (this.fogCurrentlyVisible()) {
-			const wallSegments = this.resolveWallSegments();
-			this.frameVisionCache = this.controller
-				.getData()
-				.tokens.filter((t) => (t.category ?? "entity") === "player")
-				.map((t) => this.castRaysForToken(t, wallSegments));
-		} else {
-			this.frameVisionCache = [];
-		}
 
 		if (this.fogCurrentlyVisible()) {
 			const viewportRect = this.visibleWorldRect();
@@ -2026,8 +2043,13 @@ export class MapCanvas {
 	 * Appends one token's vision fan (a closed polygon through its ray endpoints) to `path`. The
 	 * tremble (`mode`) is applied only to this drawn shape, never to `rays` themselves — see the
 	 * comment on `castRaysForToken` for why baking it into the actual reach caused lasting corruption.
+	 *
+	 * `inset` (world units, default 0) pulls every ray's endpoint inward by that much before anything
+	 * else — used only by `drawFog`'s own crisp shapes (see the comment there) to keep the blur applied
+	 * afterward from ever visibly bleeding past a ray's *true* reach; every other caller (GM tactical
+	 * previews, `buildRevealedPath`) leaves it at 0, the real, unshrunk reach.
 	 */
-	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, mode: FogAnimationMode, time: number): void {
+	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, mode: FogAnimationMode, time: number, inset = 0): void {
 		const { center, rays, phase } = vision;
 		let started = false;
 		for (let i = 0; i < rays.length; i++) {
@@ -2035,7 +2057,7 @@ export class MapCanvas {
 			if (!ray) continue;
 			const angle = (360 / rays.length) * i;
 			const rad = (angle * Math.PI) / 180;
-			let dist = useDim ? ray.dimEnd : ray.clearEnd;
+			let dist = Math.max(0, (useDim ? ray.dimEnd : ray.clearEnd) - inset);
 			if (mode !== "none" && dist > 0) {
 				// Fixed screen-pixel amplitude (divided by zoom) so it stays equally visible at any
 				// zoom, capped to a fraction of `dist` so it can't push the drawn point past the
@@ -2207,6 +2229,137 @@ export class MapCanvas {
 	}
 
 	/**
+	 * Everything this frame considers explored-or-lit at all, as two different shapes unioned
+	 * together, each matching what it represents — used only to subtract from `drawWallShadowBlackout`
+	 * below, never drawn on its own:
+	 *
+	 * - Persisted "ever explored" memory has no shape of its own worth preserving (it's just "has a
+	 *   token been here"), so it's built one whole grid cell at a time (a cell's center decides the
+	 *   *entire* cell, revealed cells getting their own real square/hex shape) instead of off the
+	 *   fog's own independent bucket grid — the memory boundary then always lands exactly on a grid
+	 *   line instead of cutting across cells wherever a fog bucket happens to fall. Grid type "none"
+	 *   has no visible cells to align to, so it falls back to that same bucket grid fog memory is
+	 *   actually stored on (see `fogBucketSize`) — the hidden square substrate fog still runs on
+	 *   there (see `MapController.updateCell`) has no on-screen lines to visibly misalign with.
+	 * - Current live vision keeps its natural round/fan shape: the same precise, ungridded polygon
+	 *   `drawFog` itself traces (`appendVisionFan`, unanimated) — snapping *this* part to cells too
+	 *   would stair-step the field of view's own outline along the grid instead of leaving it smooth.
+	 *
+	 * Deliberately independent of `drawFog`'s own drawing (no jitter/tremble, no `markExplored` side
+	 * effect — that stays `drawFog`'s alone).
+	 */
+	private buildRevealedPath(): Path2D {
+		const data = this.controller.getData();
+		const exploredSet = this.controller.getExploredSet();
+		const isExplored = (worldX: number, worldY: number) => fogIsWorldPointExplored(exploredSet, data, worldX, worldY);
+
+		const path = new Path2D();
+
+		if (data.gridType === "none") {
+			const rect = this.visibleWorldRect();
+			const tile = this.fogIterationBucketSize(rect);
+			const margin = tile * 2;
+			const bx0 = Math.floor((rect.minX - margin) / tile);
+			const bx1 = Math.ceil((rect.maxX + margin) / tile);
+			const by0 = Math.floor((rect.minY - margin) / tile);
+			const by1 = Math.ceil((rect.maxY + margin) / tile);
+			for (let by = by0; by <= by1; by++) {
+				for (let bx = bx0; bx <= bx1; bx++) {
+					const worldX = bx * tile + tile / 2;
+					const worldY = by * tile + tile / 2;
+					if (isExplored(worldX, worldY)) path.rect(bx * tile, by * tile, tile, tile);
+				}
+			}
+		} else {
+			const cellSize = this.effectiveCellSize();
+			if (data.gridType === "square") {
+				for (const c of getVisibleSquareCells(this.transform, cellSize, this.viewportW, this.viewportH)) {
+					const x = c.a * cellSize;
+					const y = c.b * cellSize;
+					if (isExplored(x + cellSize / 2, y + cellSize / 2)) path.rect(x, y, cellSize, cellSize);
+				}
+			} else {
+				const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
+				for (const c of getVisibleHexCells(this.transform, cellSize, orientation, this.viewportW, this.viewportH)) {
+					const center = hexCellToWorldCenter(c.a, c.b, cellSize, orientation);
+					if (!isExplored(center.x, center.y)) continue;
+					const corners = hexCorners(center.x, center.y, cellSize, orientation);
+					corners.forEach((p, i) => (i === 0 ? path.moveTo(p.x, p.y) : path.lineTo(p.x, p.y)));
+					path.closePath();
+				}
+			}
+		}
+
+		for (const vision of this.frameVisionCache) this.appendVisionFan(path, vision, true, "none", 0);
+		return path;
+	}
+
+	/**
+	 * Patches solid black back over `drawBackgrounds`/`drawGridAndCells`'s own output, one cell wide
+	 * (`cellVisualWidth`, so it visually reads as "the one grid square straddling the wall" rather
+	 * than an unrelated-looking band) and centered on each actual wall segment, wherever
+	 * `buildRevealedPath` doesn't already reveal it. Everywhere else — any open territory not near a
+	 * wall at all — this touches nothing, leaving the original content exactly as drawn. Deliberately a
+	 * fixed world-space (i.e. grid-relative) size — it never grows or shrinks on its own as the view is
+	 * zoomed, same as the grid itself.
+	 *
+	 * A `stroke()` hugging every wall segment, then punched through wherever already revealed, patches
+	 * that band back to opaque black — unblurred, so blurring *this* patch's own edges afterward can't
+	 * reopen a leak. Keeping the blurred fog tint itself from ever bleeding *past* a wall in the first
+	 * place (rather than growing this patch to chase it) is `drawFog`'s job — see the inset there.
+	 *
+	 * Drawn into `fogCanvas`/`fogCtx` (idle at this point in `render()` — `renderFogLayer` further
+	 * down starts by clearing and resizing it fresh for its own, unrelated use) and blitted back with
+	 * the same world-rect-to-buffer-rect technique the fog overlay's own final blit uses, just without
+	 * that blit's blur or overdraw margin — nothing here is filtered, so there's no blur radius that
+	 * needs real pixels past the viewport's own edge to sample from.
+	 */
+	private drawWallShadowBlackout(ctx: CanvasRenderingContext2D, dpr: number, imageBounds: { x: number; y: number; w: number; h: number } | null): void {
+		const wallSegments = this.resolveWallSegments();
+		if (wallSegments.length === 0) return;
+
+		const rect = this.visibleWorldRect();
+		const w = Math.max(1, Math.round(this.viewportW * dpr));
+		const h = Math.max(1, Math.round(this.viewportH * dpr));
+		if (this.fogCanvas.width !== w || this.fogCanvas.height !== h) {
+			this.fogCanvas.width = w;
+			this.fogCanvas.height = h;
+		}
+
+		const fctx = this.fogCtx;
+		fctx.save();
+		fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		fctx.clearRect(0, 0, this.viewportW, this.viewportH);
+		fctx.translate(this.transform.panX, this.transform.panY);
+		fctx.scale(this.transform.zoom, this.transform.zoom);
+
+		fctx.lineCap = "round";
+		fctx.lineJoin = "round";
+		fctx.strokeStyle = "rgba(8, 8, 12, 1)";
+		fctx.lineWidth = this.cellVisualWidth();
+		fctx.beginPath();
+		for (const seg of wallSegments) {
+			fctx.moveTo(seg.a.x, seg.a.y);
+			fctx.lineTo(seg.b.x, seg.b.y);
+		}
+		fctx.stroke();
+
+		fctx.globalCompositeOperation = "destination-out";
+		fctx.fillStyle = "rgba(0, 0, 0, 1)";
+		fctx.fill(this.buildRevealedPath());
+		fctx.restore();
+
+		ctx.save();
+		if (imageBounds) {
+			ctx.beginPath();
+			ctx.rect(imageBounds.x, imageBounds.y, imageBounds.w, imageBounds.h);
+			ctx.clip();
+		}
+		ctx.drawImage(this.fogCanvas, rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
+		ctx.restore();
+	}
+
+	/**
 	 * Prepares the offscreen fog buffer and draws into it; returns the world rect the buffer ends
 	 * up covering (`render()` blits it back with that same rect — see the comment there).
 	 *
@@ -2326,12 +2479,24 @@ export class MapCanvas {
 		const by0 = Math.floor((rect.minY - margin) / tile);
 		const by1 = Math.ceil((rect.maxY + margin) / tile);
 
+		// One extra ring of tiles all around, purely so every tile actually drawn below can look up
+		// whether each of its 4 neighbors is revealed too (see `erosionInset` below) — including the
+		// ones right at bx0/bx1/by0/by1's own edge, whose outward neighbor sits just outside that
+		// range. `margin` (2 whole tiles) already comfortably covers the one extra ring this costs.
+		const gbx0 = bx0 - 1;
+		const gbx1 = bx1 + 1;
+		const gby0 = by0 - 1;
+		const gby1 = by1 + 1;
+		const gridCols = gbx1 - gbx0 + 1;
+		const revealedGrid = new Uint8Array(gridCols * (gby1 - gby0 + 1));
+		const gridIndex = (bx: number, by: number) => (by - gby0) * gridCols + (bx - gbx0);
+
 		const exploredPath = new Path2D();
 		let hasExplored = false;
 		const newlyExplored: string[] = [];
 
-		for (let by = by0; by <= by1; by++) {
-			for (let bx = bx0; bx <= bx1; bx++) {
+		for (let by = gby0; by <= gby1; by++) {
+			for (let bx = gbx0; bx <= gbx1; bx++) {
 				const worldX = bx * tile + tile / 2;
 				const worldY = by * tile + tile / 2;
 				// Persisted memory always keys off the fine `baseBucket` grid regardless of how
@@ -2340,34 +2505,60 @@ export class MapCanvas {
 				const key = `${Math.floor(worldX / baseBucket)},${Math.floor(worldY / baseBucket)}`;
 				const already = exploredSet.has(key);
 				const litNow = !already && this.isLitByCache(cache, worldX, worldY, true);
-				if (litNow) newlyExplored.push(key);
-				if (already || litNow) {
-					hasExplored = true;
-					// "simple": every tile of the explored/unexplored frontier shifts together a
-					// little (rather than only the vision fan near a token), so the whole fog
-					// boundary feels alive. "advanced": each tile instead samples smooth spatial
-					// noise (see `organicJitter2D`) at its own world position, so different zones of
-					// fog drift independently instead of the whole frontier moving as one block.
-					let jitterX = sharedJitterX;
-					let jitterY = sharedJitterY;
-					// In "advanced" mode, neighboring tiles can end up with slightly different
-					// offsets (that's the point — see above), which would otherwise crack open a
-					// sliver of raw unexplored-opacity fog between them right at their shared edge.
-					// `organicJitter2D` is built to keep that difference far smaller than
-					// `jitterAmplitude` between adjacent tiles, but inflating every tile by that same
-					// amplitude on all sides guarantees neighbors always overlap regardless, so nothing
-					// in this loop depends on exactly how smooth the noise turns out to be. "simple"
-					// needs none of this: one shared offset moves every tile identically, so adjacent
-					// tiles never separate in the first place.
-					let overlap = 0;
-					if (mode === "advanced") {
-						const n = organicJitter2D(worldX, worldY, time);
-						jitterX = jitterAmplitude * n.x;
-						jitterY = jitterAmplitude * n.y;
-						overlap = jitterAmplitude;
-					}
-					exploredPath.rect(bx * tile + jitterX - overlap, by * tile + jitterY - overlap, tile + 2 * overlap, tile + 2 * overlap);
+				// Only the tiles actually drawn below (not this loop's extra lookup-only ring) ever
+				// get persisted — see the comment on `gbx0`/`gbx1`/`gby0`/`gby1` above.
+				if (litNow && bx >= bx0 && bx <= bx1 && by >= by0 && by <= by1) newlyExplored.push(key);
+				if (already || litNow) revealedGrid[gridIndex(bx, by)] = 1;
+			}
+		}
+		const isRevealedTile = (bx: number, by: number) => revealedGrid[gridIndex(bx, by)] === 1;
+
+		// A revealed tile's edge is eroded inward by roughly the blur radius (world units, so it
+		// shrinks back down as the view zooms in) wherever it faces a tile that *isn't* revealed —
+		// same reasoning as `dimInset` below: the blur applied to this whole buffer afterward then has
+		// nowhere near that boundary left to visibly bleed light past. An edge shared with another
+		// revealed tile is left untouched, so two neighboring revealed tiles always keep touching
+		// seamlessly (no artificial grid lines cutting across an already fully-explored room).
+		const erosionInset = FOG_LEAK_INSET_PX / this.transform.zoom;
+
+		for (let by = by0; by <= by1; by++) {
+			for (let bx = bx0; bx <= bx1; bx++) {
+				if (!isRevealedTile(bx, by)) continue;
+				hasExplored = true;
+				const worldX = bx * tile + tile / 2;
+				const worldY = by * tile + tile / 2;
+				// "simple": every tile of the explored/unexplored frontier shifts together a
+				// little (rather than only the vision fan near a token), so the whole fog
+				// boundary feels alive. "advanced": each tile instead samples smooth spatial
+				// noise (see `organicJitter2D`) at its own world position, so different zones of
+				// fog drift independently instead of the whole frontier moving as one block.
+				let jitterX = sharedJitterX;
+				let jitterY = sharedJitterY;
+				// In "advanced" mode, neighboring tiles can end up with slightly different
+				// offsets (that's the point — see above), which would otherwise crack open a
+				// sliver of raw unexplored-opacity fog between them right at their shared edge.
+				// `organicJitter2D` is built to keep that difference far smaller than
+				// `jitterAmplitude` between adjacent tiles, but inflating every tile by that same
+				// amplitude on all sides guarantees neighbors always overlap regardless, so nothing
+				// in this loop depends on exactly how smooth the noise turns out to be. "simple"
+				// needs none of this: one shared offset moves every tile identically, so adjacent
+				// tiles never separate in the first place.
+				let overlap = 0;
+				if (mode === "advanced") {
+					const n = organicJitter2D(worldX, worldY, time);
+					jitterX = jitterAmplitude * n.x;
+					jitterY = jitterAmplitude * n.y;
+					overlap = jitterAmplitude;
 				}
+				const left = bx * tile + jitterX - overlap;
+				const right = (bx + 1) * tile + jitterX + overlap;
+				const top = by * tile + jitterY - overlap;
+				const bottom = (by + 1) * tile + jitterY + overlap;
+				const x0 = isRevealedTile(bx - 1, by) ? left : left + erosionInset;
+				const x1 = isRevealedTile(bx + 1, by) ? right : right - erosionInset;
+				const y0 = isRevealedTile(bx, by - 1) ? top : top + erosionInset;
+				const y1 = isRevealedTile(bx, by + 1) ? bottom : bottom - erosionInset;
+				exploredPath.rect(x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0));
 			}
 		}
 
@@ -2395,9 +2586,20 @@ export class MapCanvas {
 		if (cache.length > 0) {
 			const dimFan = new Path2D();
 			const clearFan = new Path2D();
+			// `dimFan`'s outer edge is the one that meets the opaque unexplored base right below —
+			// pulling it inward by a bit more than the blur's own radius means the blur (applied to
+			// this whole buffer afterward, in `renderFogLayer`) has nowhere near a wall/max-range edge
+			// left to visibly bleed light *past* — its outward half of the softening now lands back on
+			// roughly the true boundary instead of beyond it, at the cost of that same softening now
+			// eating into the fan's own edge instead (a harmless vignette, since that's still legitimate,
+			// already-revealed territory). `clearFan` gets the identical inset so it stays strictly
+			// inside `dimFan` (dim reach is never shorter than clear reach — see `fog.ts` — so the same
+			// subtraction preserves that ordering); insetting only one of the two would let the other
+			// stick out past it and carve its own separate leak through the base layer.
+			const dimInset = FOG_LEAK_INSET_PX / this.transform.zoom;
 			for (const vision of cache) {
-				this.appendVisionFan(dimFan, vision, true, mode, time);
-				this.appendVisionFan(clearFan, vision, false, mode, time);
+				this.appendVisionFan(dimFan, vision, true, mode, time, dimInset);
+				this.appendVisionFan(clearFan, vision, false, mode, time, dimInset);
 			}
 			// Punch the full (dim) reach to transparent, repaint it at "explored" opacity, then punch
 			// the inner (clear) reach again so it ends up fully see-through.
