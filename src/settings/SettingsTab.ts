@@ -134,6 +134,23 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName("Pas de rotation des tokens")
+			.setDesc("Incrément (en degrés) de la molette de rotation d'un pion dans le panneau d'infos.")
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "180";
+				text.setValue(String(settings.tokenRotationStep));
+				text.onChange(async (value) => {
+					const n = parseFloat(value);
+					if (!Number.isNaN(n) && n > 0) {
+						settings.tokenRotationStep = n;
+						await this.plugin.saveSettings();
+					}
+				});
+			});
+
+		new Setting(containerEl)
 			.setName("Palette de zones (types de terrain)")
 			.setDesc("Partagée par toutes les cartes : toute modification ici (nom, couleur, ajout, suppression) se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte.")
 			.setHeading();

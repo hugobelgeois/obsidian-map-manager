@@ -9,7 +9,7 @@ import {
 	parseCellKey,
 	squareKey,
 } from "../data/mapData";
-import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, raySegmentDistance } from "./gridMath";
+import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, pointSegmentDistance, raySegmentDistance } from "./gridMath";
 
 /**
  * Rays cast per player token when tracing vision (ray/path tracing, not grid tracing) — fixed
@@ -23,6 +23,15 @@ export const FOG_RAY_COUNT = 180;
  * doesn't need cell-level precision — but small enough to hug walls/blockers reasonably closely.
  */
 export const FOG_BUCKET_SCALE = 1.25;
+/**
+ * How close (in cell-widths) a vision source has to be to a "dim"/partial wall segment for its
+ * *directional cone* (`visionRange`/`visionAngle` — "être contre ce mur") to see through it at all.
+ * Farther than this, a partial wall blocks the cone exactly like an opaque one instead of letting a
+ * dim glimpse through from any distance — see the proximity check in `traceRays`. The omnidirectional
+ * `visionRadius` fallback (rays outside the cone) is unaffected by this and keeps stopping at any
+ * wall type regardless of distance, same as before this rule existed.
+ */
+export const WALL_ADJACENCY_CELLS = 1;
 
 /** A `WallSegment` with its two endpoints resolved to world coordinates, for ray casting/flood-fill. */
 export interface ResolvedWallSegment {
@@ -93,6 +102,38 @@ export function footprintCenter(data: MapFileData, token: Token): { x: number; y
 	};
 }
 
+/**
+ * Every cell key a token's full footprint covers: on a square grid with `size` > 1, the whole
+ * size×size block growing down/right from `cellKey` (its anchor — see `footprintCenter`); anything
+ * else (hex, size 1) is just `[cellKey]`, since hex tokens are only ever centered/enlarged on their
+ * single anchor cell.
+ */
+export function footprintCellKeys(data: MapFileData, cellKey: string, size: number): string[] {
+	if (data.gridType !== "square" || size <= 1) return [cellKey];
+	const { a, b } = parseCellKey(cellKey);
+	const keys: string[] = [];
+	for (let da = 0; da < size; da++) {
+		for (let db = 0; db < size; db++) keys.push(squareKey(a + da, b + db));
+	}
+	return keys;
+}
+
+/**
+ * Every cell key occupied by any token *not* in `excludeIds` (each expanded to its full footprint
+ * via `footprintCellKeys`) — a batch-move collision check, used both by
+ * `MapController.moveTokensToCells` and `MapCanvas`'s group-move/distribute-into-area preview so
+ * the footprint math isn't duplicated between them. Tokens with no `cellKey` (grid type "none") are
+ * skipped, same as any single-token collision check on this map.
+ */
+export function occupiedFootprintCells(data: MapFileData, excludeIds: ReadonlySet<string>): Set<string> {
+	const occupied = new Set<string>();
+	for (const token of data.tokens) {
+		if (excludeIds.has(token.id) || !token.cellKey) continue;
+		for (const key of footprintCellKeys(data, token.cellKey, token.size ?? 1)) occupied.add(key);
+	}
+	return occupied;
+}
+
 /** Every `WallSegment` (across visible layers) resolved to world-space endpoints, for ray casting and the fill tool's flood boundary. */
 export function resolveWallSegments(data: MapFileData): ResolvedWallSegment[] {
 	const result: ResolvedWallSegment[] = [];
@@ -123,8 +164,23 @@ function angleDiffDeg(a: number, b: number): number {
  * a given angle) against `wallSegments`. Shared core for `castVisionRays` (a player's own facing
  * cone) and `castEntityConeRays` (one of an entity's `resolveEyeCones` cones) — everything about
  * *whose* angle/direction/reach this is lives in the caller, this function only knows geometry.
+ *
+ * A "dim" wall segment blocks a ray completely (both `clearEnd` and `dimEnd` stop there, same as an
+ * opaque wall) *unless* that ray is inside the directional cone AND `center` sits within
+ * `wallAdjacency` (world units, see `WALL_ADJACENCY_CELLS`) of the segment itself — only then does it
+ * not block the ray at all (skipped entirely, as if it weren't there). The plain omnidirectional
+ * `radius` fallback (rays outside the cone) never gets that exception, regardless of distance to the
+ * wall — only the directional cone is ever meant to "peer through" a partial wall up close.
  */
-function traceRays(center: Point, radius: number, range: number, halfAngle: number, direction: number, wallSegments: ResolvedWallSegment[]): RaySample[] {
+function traceRays(
+	center: Point,
+	radius: number,
+	range: number,
+	halfAngle: number,
+	direction: number,
+	wallSegments: ResolvedWallSegment[],
+	wallAdjacency: number
+): RaySample[] {
 	const rays: RaySample[] = [];
 	for (let i = 0; i < FOG_RAY_COUNT; i++) {
 		const angle = (360 / FOG_RAY_COUNT) * i;
@@ -141,7 +197,13 @@ function traceRays(center: Point, radius: number, range: number, halfAngle: numb
 		const hits: { dist: number; type: VisionBlockerType }[] = [];
 		for (const seg of wallSegments) {
 			const dist = raySegmentDistance(center, dx, dy, reach, seg.a, seg.b);
-			if (dist !== null) hits.push({ dist, type: seg.type });
+			if (dist === null) continue;
+			if (seg.type === "dim") {
+				if (inCone && pointSegmentDistance(center, seg.a, seg.b) <= wallAdjacency) continue; // against it, cone only: fully passable
+				hits.push({ dist, type: "opaque" }); // radius fallback, or cone but too far: blocks fully, like an opaque wall
+				continue;
+			}
+			hits.push({ dist, type: seg.type });
 		}
 		hits.sort((h1, h2) => h1.dist - h2.dist);
 
@@ -176,7 +238,8 @@ export function castVisionRays(data: MapFileData, token: Token, wallSegments: Re
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
 	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
 	const direction = token.rotation ?? DEFAULT_TOKEN_ROTATION;
-	return { center, rays: traceRays(center, radius, range, halfAngle, direction, wallSegments) };
+	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
+	return { center, rays: traceRays(center, radius, range, halfAngle, direction, wallSegments, wallAdjacency) };
 }
 
 /**
@@ -189,7 +252,8 @@ export function castEntityConeRays(data: MapFileData, token: Token, direction: n
 	const center = footprintCenter(data, token);
 	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
-	return { center, rays: traceRays(center, radius, range, fullAngleDeg / 2, direction, wallSegments) };
+	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
+	return { center, rays: traceRays(center, radius, range, fullAngleDeg / 2, direction, wallSegments, wallAdjacency) };
 }
 
 /** Every player token's traced vision, for `data` as a whole (all visible layers' walls). */

@@ -26,6 +26,8 @@ export interface MapManagerSettings {
 	fogAnimationMode: FogAnimationMode;
 	/** Seconds of inactivity after a map edit before `<map>.json` (see `publishPublicSnapshot`) is regenerated automatically — see `wireAutoPublish`. `0` disables auto-publishing entirely. */
 	autoPublishDelaySeconds: number;
+	/** Degree increment for a token's rotation dial (see `InfoPanel.makeRotationDialField`) — both its jog-dial slider and its paired number input step by this amount. */
+	tokenRotationStep: number;
 }
 
 export const DEFAULT_ZONE_TYPES: ZoneType[] = [
@@ -55,4 +57,5 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
 	fogAnimationMode: "none",
 	autoPublishDelaySeconds: 10,
+	tokenRotationStep: 10,
 };

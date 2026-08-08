@@ -169,8 +169,12 @@ export class InfoPanel {
 
 		// The "select" tool's mass-edit panel always wins over any stale single-selection while the
 		// tool is active — even for a selection of exactly one object, kept simple as one dedicated
-		// bulk panel rather than merging with the full single-item editors below.
-		if (this.controller.activeTool === "select" && this.controller.massSelectionKind) {
+		// bulk panel rather than merging with the full single-item editors below. A token mass
+		// selection also wins outside the edit-mode select tool: view mode's own Shift-marquee/Ctrl+click
+		// gestures (see MapCanvas) build the very same `massSelectedTokenIds`, without ever touching
+		// `activeTool` — wall-segment/stamp mass selections stay tool-gated since view mode never
+		// populates those sets.
+		if (this.controller.massSelectionKind === "token" || (this.controller.activeTool === "select" && this.controller.massSelectionKind)) {
 			this.renderMassSelectionPanel();
 			return;
 		}
@@ -1109,15 +1113,18 @@ export class InfoPanel {
 	 * the true absolute value (0-360) and can be typed into directly.
 	 */
 	private makeRotationDialField(container: HTMLElement, labelText: string, currentRotation: number, onCommit: (v: number) => void): void {
+		const step = this.deps.settings.tokenRotationStep || 10;
 		const field = container.createDiv({ cls: "map-manager-field-inline map-manager-slider-field" });
 		field.createEl("label", { text: labelText });
 		const slider = field.createEl("input", { type: "range", cls: "map-manager-vision-slider" });
 		slider.min = "-180";
 		slider.max = "180";
+		slider.step = String(step);
 		slider.value = "0";
 		const number = field.createEl("input", { type: "number", cls: "map-manager-vision-number" });
 		number.min = "0";
 		number.max = "360";
+		number.step = String(step);
 		number.value = String(Math.round(((currentRotation % 360) + 360) % 360));
 
 		// The rotation as of the last commit made *by this control*, kept up to date independently of

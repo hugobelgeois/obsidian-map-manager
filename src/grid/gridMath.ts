@@ -411,6 +411,16 @@ export function isStraightThrough(a: Point, mid: Point, b: Point): boolean {
 }
 
 /**
+ * Shortest distance from point `p` to finite segment `a`-`b` (perpendicular distance if `p`
+ * projects within the segment's own extent, else distance to the nearest endpoint). Used to test
+ * whether a vision source sits "against" a wall segment — see `traceRays` in `fog.ts`.
+ */
+export function pointSegmentDistance(p: Point, a: Point, b: Point): number {
+	const proj = projectOntoSegment(p.x, p.y, a, b);
+	return Math.hypot(p.x - proj.x, p.y - proj.y);
+}
+
+/**
  * Distance along the ray from `origin` in unit direction `(dx, dy)` to where it crosses segment
  * `a`-`b`, or `null` if it doesn't cross within `[0, maxDist]`. `(dx, dy)` must already be a unit
  * vector — the returned distance is the direct `t` parameter, not rescaled.

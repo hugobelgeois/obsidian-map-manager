@@ -1,7 +1,7 @@
 import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { FogAnimationMode, MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Marker, Token, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, resolveEyeCones, squareKey } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, DEFAULT_VISION_RADIUS, Marker, Token, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, resolveEyeCones, squareKey } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
@@ -36,6 +36,7 @@ import {
 	fogBucketSize as fogFogBucketSize,
 	footprintCenter as fogFootprintCenter,
 	isPointLit,
+	occupiedFootprintCells,
 	resolveWallSegments as fogResolveWallSegments,
 } from "../grid/fog";
 
@@ -156,6 +157,24 @@ interface DraggingWallPoint {
 	currentWorld: { x: number; y: number };
 }
 
+/** View mode only: a multi-selected group of tokens being dragged together — see `MapCanvas.startGroupDrag`/`commitGroupDrag`. */
+interface DraggingTokenGroup {
+	anchorTokenId: string;
+	entries: { token: Token; originWorld: { x: number; y: number } }[];
+	pointerDownWorld: { x: number; y: number };
+	currentWorld: { x: number; y: number };
+}
+
+/** Live preview for the Ctrl-drag "distribute the selection into this area" gesture — see `MapCanvas.recomputeDistributePreview`. */
+interface DistributePreview {
+	valid: boolean;
+	/** Celled grids: the actual candidate cells (drawn as real cell shapes, not a free-floating rectangle — see `drawDistributePreview`). `null` on grid type "none", which has no cells to highlight. */
+	cellKeys: string[] | null;
+	/** Grid type "none" only: each token's proposed free-form landing point (drawn as a dot, since there's no cell to highlight). */
+	points: { x: number; y: number }[];
+	assignment: { tokenId: string; cellKey?: string; point?: { x: number; y: number } }[] | null;
+}
+
 interface BackgroundEntry {
 	path: string;
 	img: HTMLImageElement | null;
@@ -253,8 +272,29 @@ export class MapCanvas {
 
 	/** "select" tool only: whatever object (if any) sat directly under the pointer on down — resolved into a toggle on a plain click, or ignored in favor of `marqueeWorld` once the drag exceeds `DRAG_THRESHOLD`. See `handleSelectPointerDown`. */
 	private selectPointerHit: { kind: MassSelectionKind; id: string } | null = null;
-	/** "select" tool only: the live marquee rectangle (world space) while dragging — `null` outside a select-tool drag. See `onPointerMove`/`drawMassSelectionOverlay`. */
+	/**
+	 * The live marquee rectangle (world space) while dragging — `null` outside a marquee drag. Shared
+	 * by the edit-mode "select" tool (see `handleSelectPointerDown`) and view mode's Shift-drag
+	 * multi-token select (see `onPointerDown`'s `e.shiftKey` branch). See `onPointerMove`/
+	 * `drawMassSelectionOverlay`.
+	 */
 	private marqueeWorld: { start: { x: number; y: number }; current: { x: number; y: number } } | null = null;
+
+	/** View mode only: a token's whole selected group being dragged together, preserving relative offsets — see `startGroupDrag`/`commitGroupDrag`. */
+	private draggingTokenGroup: DraggingTokenGroup | null = null;
+	/** View mode only: whatever token (if any) sat under the pointer at a Ctrl+mousedown — resolved into a toggle on a plain Ctrl+click, or ignored in favor of the distribute-paint drag once past `DRAG_THRESHOLD`. See `handleViewCtrlPointerDown`. */
+	private viewCtrlTokenHit: string | null = null;
+	/**
+	 * View mode only: "distribute the selection into this area" — works like the brush tool, painting
+	 * whatever cell the pointer is over into the area as the Ctrl-drag moves (any resulting shape, not
+	 * just a rectangle), rather than dragging out a bounding box. `cellKeys` accumulates every distinct
+	 * cell painted so far (celled grids); `points` accumulates the raw pointer path (grid type "none",
+	 * which has no cells to paint — see `recomputeDistributePreview`'s proportional-remap branch).
+	 * `null` outside that gesture. See `handleViewCtrlPointerDown`/`recomputeDistributePreview`.
+	 */
+	private distributePaint: { cellKeys: Set<string>; points: { x: number; y: number }[]; lastCellKey: string | null } | null = null;
+	/** Live preview for the distribute-paint gesture, recomputed on every cell/point painted — see `recomputeDistributePreview`. */
+	private distributePreview: DistributePreview | null = null;
 
 	/** Live (possibly snapped) target for the wall tool's in-progress chain — see `drawWallPreview`. Recomputed on every pointer move regardless of `dragging` (a click, not a drag, places each wall point). */
 	private wallPreview: { x: number; y: number } | null = null;
@@ -327,13 +367,35 @@ export class MapCanvas {
 			return;
 		}
 
+		// View mode's own multi-token select gestures take priority over the plain token-drag/pan
+		// handling below — Ctrl (toggle-on-click / paint-the-distribute-area-on-drag) and Shift
+		// (marquee select) each get their own branch, mutually exclusive with everything else a click
+		// could do.
+		if (this.controller.mode === "view" && e.ctrlKey) {
+			this.handleViewCtrlPointerDown(px, py);
+			return;
+		}
+		if (this.controller.mode === "view" && e.shiftKey) {
+			const world = screenToWorld(px, py, this.transform);
+			this.marqueeWorld = { start: world, current: world };
+			return;
+		}
+
 		// Tokens are selectable in both modes, but only draggable/movable in view mode — edit mode
 		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
 		// selects the token instead of letting the click fall through to panning/tools.
 		const tokenHit = this.findTokenAtScreenPoint(px, py);
 		if (tokenHit) {
 			if (this.controller.mode === "view") {
-				this.draggingToken = { token: tokenHit, currentWorld: screenToWorld(px, py, this.transform) };
+				// A token already part of a real (2+) multi-selection drags the whole group together;
+				// otherwise this click starts fresh — any previous multi-selection is dropped so a plain
+				// drag only ever moves the one token actually under the pointer.
+				if (this.controller.massSelectionKind === "token" && this.controller.massSelectedTokenIds.has(tokenHit.id) && this.controller.massSelectedTokenIds.size > 1) {
+					this.startGroupDrag(tokenHit, px, py);
+				} else {
+					if (this.controller.massSelectedTokenIds.size > 0) this.controller.clearMassSelection();
+					this.draggingToken = { token: tokenHit, currentWorld: screenToWorld(px, py, this.transform) };
+				}
 			} else {
 				this.controller.selectToken(tokenHit.id);
 				this.toolConsumedClick = true;
@@ -468,10 +530,27 @@ export class MapCanvas {
 			return;
 		}
 
+		// Like `painting` above, this runs regardless of `dragMoved` — the distribute area is painted
+		// continuously as the pointer moves, cell by cell (any shape), not dragged out as a rectangle.
+		if (this.distributePaint) {
+			this.paintDistributeCellAt(px, py);
+			this.recomputeDistributePreview();
+			this.render();
+			return;
+		}
+
 		if (!this.dragMoved) return;
 
-		if (this.controller.activeTool === "select" && this.marqueeWorld) {
+		// Shared by the edit-mode "select" tool's marquee and view mode's Shift-drag marquee — both
+		// just fill in the same `marqueeWorld` at pointer-down (see `onPointerDown`).
+		if (this.marqueeWorld) {
 			this.marqueeWorld.current = screenToWorld(px, py, this.transform);
+			this.render();
+			return;
+		}
+
+		if (this.draggingTokenGroup) {
+			this.draggingTokenGroup.currentWorld = screenToWorld(px, py, this.transform);
 			this.render();
 			return;
 		}
@@ -506,17 +585,33 @@ export class MapCanvas {
 		// placement). Re-does the same hit-tests as `onPointerDown` rather than reading
 		// `draggingToken`/`draggingMarker`, since edit mode never sets those for a token click.
 		// Right-click is excluded — that's `onContextMenu`'s job (placing a token there), not a ping.
-		if (!this.dragMoved && e.button === 0 && this.controller.mode === "view" && this.controller.activeTool === "none") {
+		if (!this.dragMoved && e.button === 0 && !e.ctrlKey && !e.shiftKey && this.controller.mode === "view" && this.controller.activeTool === "none") {
 			const rect = this.canvas.getBoundingClientRect();
 			const px = e.clientX - rect.left;
 			const py = e.clientY - rect.top;
 			const hitToken = this.findTokenAtScreenPoint(px, py);
 			const hitMarker = this.controller.getData().gridType === "none" ? this.findMarkerAtScreenPoint(px, py) : null;
 			if (!hitToken && !hitMarker) {
+				// Genuinely empty space, no modifier: same "click clears" convention as the edit-mode
+				// select tool's marquee (see `handleSelectPointerUp`), on top of the existing ping.
+				if (this.controller.massSelectedTokenIds.size > 0) this.controller.clearMassSelection();
 				const world = screenToWorld(px, py, this.transform);
 				this.triggerPing(world.x, world.y);
 				this.options.onPing?.(world.x, world.y);
 			}
+		}
+
+		if (this.controller.mode === "view" && this.marqueeWorld) {
+			this.handleViewMarqueePointerUp();
+			return;
+		}
+		if (this.distributePaint) {
+			this.handleDistributePointerUp();
+			return;
+		}
+		if (this.draggingTokenGroup) {
+			this.commitGroupDrag();
+			return;
 		}
 
 		if (this.controller.mode === "edit" && this.controller.activeTool === "select") {
@@ -607,6 +702,10 @@ export class MapCanvas {
 		this.toolConsumedClick = false;
 		this.selectPointerHit = null;
 		this.marqueeWorld = null;
+		this.draggingTokenGroup = null;
+		this.viewCtrlTokenHit = null;
+		this.distributePaint = null;
+		this.distributePreview = null;
 	};
 
 	/**
@@ -640,6 +739,16 @@ export class MapCanvas {
 		if (ids.length > 0) this.controller.addMassSelection(kind, ids);
 	}
 
+	/** View mode's Shift-drag marquee release: unlike the edit-mode select tool, this only ever targets tokens — a click with no drag is a no-op (Ctrl+click is the dedicated single-token toggle gesture). */
+	private handleViewMarqueePointerUp(): void {
+		const marquee = this.marqueeWorld;
+		this.marqueeWorld = null;
+		if (!marquee || !this.dragMoved) return;
+		const rect = this.normalizedWorldRect(marquee.start, marquee.current);
+		const ids = this.tokensInRect(rect);
+		if (ids.length > 0) this.controller.addMassSelection("token", ids);
+	}
+
 	private normalizedWorldRect(a: { x: number; y: number }, b: { x: number; y: number }): { minX: number; maxX: number; minY: number; maxY: number } {
 		return { minX: Math.min(a.x, b.x), maxX: Math.max(a.x, b.x), minY: Math.min(a.y, b.y), maxY: Math.max(a.y, b.y) };
 	}
@@ -658,11 +767,21 @@ export class MapCanvas {
 		return this.controller.getData().gridType === "none" ? this.markersInRect(rect) : this.cellsInRect(rect);
 	}
 
+	/**
+	 * Same fog-visibility rule as `findTokenAtScreenPoint` — irrelevant to the edit-mode select tool
+	 * (fog is never active there), but view mode's Shift-drag marquee reuses this too, so a GM's
+	 * marquee can't scoop up an entity currently hidden by fog that a plain click on it couldn't
+	 * have selected either.
+	 */
 	private tokensInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
 		const out: string[] = [];
+		const fogActive = this.fogCurrentlyVisible();
 		for (const token of this.controller.getData().tokens) {
 			const c = this.footprintCenter(token);
-			if (c.x >= rect.minX && c.x <= rect.maxX && c.y >= rect.minY && c.y <= rect.maxY) out.push(token.id);
+			if (c.x < rect.minX || c.x > rect.maxX || c.y < rect.minY || c.y > rect.maxY) continue;
+			const isPlayer = (token.category ?? "entity") === "player";
+			if (fogActive && !isPlayer && !this.isEntityRevealedByFog(c)) continue;
+			out.push(token.id);
 		}
 		return out;
 	}
@@ -715,6 +834,211 @@ export class MapCanvas {
 			const center = this.cellCenter(key);
 			return center.x >= rect.minX && center.x <= rect.maxX && center.y >= rect.minY && center.y <= rect.maxY;
 		});
+	}
+
+	// ---- View mode: multi-token select / group move / distribute-into-area ----
+
+	/**
+	 * Ctrl+mousedown in view mode: remembers whatever token (if any) is under the pointer, for a
+	 * later toggle if this turns out to be a plain click, and always starts a distribute-paint stroke
+	 * — immediately painting the cell right under the pointer, exactly like the brush tool's own
+	 * `onPointerDown` paints its very first cell rather than waiting for the first `onPointerMove` —
+	 * which gesture this actually is is only known once `onPointerUp` sees whether the pointer moved
+	 * past `DRAG_THRESHOLD` (see `handleDistributePointerUp`).
+	 */
+	private handleViewCtrlPointerDown(px: number, py: number): void {
+		this.viewCtrlTokenHit = this.findTokenAtScreenPoint(px, py)?.id ?? null;
+		this.distributePaint = { cellKeys: new Set(), points: [], lastCellKey: null };
+		this.paintDistributeCellAt(px, py);
+		this.recomputeDistributePreview();
+		this.render();
+	}
+
+	/** Paints whatever cell (or, on grid type "none", raw point) is at `(px, py)` into the in-progress `distributePaint` stroke — a no-op if it's the same cell already painted last. */
+	private paintDistributeCellAt(px: number, py: number): void {
+		const paint = this.distributePaint;
+		if (!paint) return;
+		const world = screenToWorld(px, py, this.transform);
+		if (this.controller.getData().gridType === "none") {
+			paint.points.push(world);
+			return;
+		}
+		const key = this.cellKeyAt(world.x, world.y);
+		if (key === paint.lastCellKey) return;
+		paint.lastCellKey = key;
+		paint.cellKeys.add(key);
+	}
+
+	/** Ctrl+mouseup: a plain click toggles whatever token was under the pointer at mousedown; a drag commits (or, if the preview turned red, rejects) the distribute-into-area gesture computed live by `recomputeDistributePreview`. */
+	private handleDistributePointerUp(): void {
+		const hitId = this.viewCtrlTokenHit;
+		const preview = this.distributePreview;
+		this.viewCtrlTokenHit = null;
+		this.distributePaint = null;
+		this.distributePreview = null;
+
+		if (!this.dragMoved) {
+			if (hitId) this.controller.toggleMassSelection("token", hitId);
+			this.render();
+			return;
+		}
+		if (preview?.valid) {
+			this.commitDistribute(preview);
+		} else if (this.controller.massSelectedTokenIds.size > 0) {
+			new Notice("Pas assez de place dans la zone pour tous les pions.");
+		}
+		this.render();
+	}
+
+	/** Snapshots every mass-selected token's current footprint center so `onPointerMove` can drag them all together, preserving relative offsets — see `commitGroupDrag`. */
+	private startGroupDrag(anchorToken: Token, px: number, py: number): void {
+		const world = screenToWorld(px, py, this.transform);
+		const ids = this.controller.massSelectedTokenIds;
+		const entries = this.controller
+			.getData()
+			.tokens.filter((t) => ids.has(t.id))
+			.map((t) => ({ token: t, originWorld: this.footprintCenter(t) }));
+		this.draggingTokenGroup = { anchorTokenId: anchorToken.id, entries, pointerDownWorld: world, currentWorld: world };
+	}
+
+	/**
+	 * Commits (or, on a plain click, collapses) a group drag started by `startGroupDrag`. On grid
+	 * "none" every token's target is just its origin plus the drag delta (no collision concept, like
+	 * single-token free drag). On a celled grid the anchor token (the one actually clicked) resolves
+	 * its own target cell exactly like a single-token drop (`dropAnchorKey`, respecting its own
+	 * footprint/size snapping), and that anchor's cell delta is applied rigidly to every other
+	 * token's *original* cell — so the whole group moves as one block instead of each token
+	 * independently re-snapping to its own nearest cell.
+	 */
+	private commitGroupDrag(): void {
+		const group = this.draggingTokenGroup;
+		this.draggingTokenGroup = null;
+		if (!group) return;
+
+		if (!this.dragMoved) {
+			// Clicking (not dragging) a token that's part of a multi-selection collapses the selection
+			// down to just that one — same convention as clicking empty space clearing it entirely.
+			this.controller.clearMassSelection();
+			this.controller.selectToken(group.anchorTokenId);
+			return;
+		}
+
+		const dx = group.currentWorld.x - group.pointerDownWorld.x;
+		const dy = group.currentWorld.y - group.pointerDownWorld.y;
+		const data = this.controller.getData();
+
+		if (data.gridType === "none") {
+			const targets = new Map(group.entries.map((e) => [e.token.id, { x: e.originWorld.x + dx, y: e.originWorld.y + dy }]));
+			this.controller.moveTokensToPoints(targets);
+			this.render();
+			return;
+		}
+
+		const anchorEntry = group.entries.find((e) => e.token.id === group.anchorTokenId);
+		const anchorOriginKey = anchorEntry?.token.cellKey;
+		if (!anchorEntry || !anchorOriginKey) {
+			this.render();
+			return;
+		}
+		const anchorTargetKey = this.dropAnchorKey(anchorEntry.token, anchorEntry.originWorld.x + dx, anchorEntry.originWorld.y + dy);
+		const { a: oa, b: ob } = parseCellKey(anchorOriginKey);
+		const { a: ta, b: tb } = parseCellKey(anchorTargetKey);
+		const deltaA = ta - oa;
+		const deltaB = tb - ob;
+
+		const targets = new Map<string, string>();
+		for (const entry of group.entries) {
+			if (!entry.token.cellKey) continue;
+			const { a, b } = parseCellKey(entry.token.cellKey);
+			targets.set(entry.token.id, squareKey(a + deltaA, b + deltaB));
+		}
+		const moved = this.controller.moveTokensToCells(targets);
+		if (!moved) new Notice("Case déjà occupée par un pion.");
+		this.render();
+	}
+
+	/**
+	 * Recomputes the live preview for the Ctrl-drag distribute-into-area gesture: where each
+	 * mass-selected token would land if the stroke ended right now, and whether the whole batch
+	 * actually fits into whatever's been painted so far (see `distributePaint`/`paintDistributeCellAt`
+	 * — any shape, not just a rectangle). Tokens are ordered left-to-right then top-to-bottom (reading
+	 * order) by their *current* footprint center, and paired 1:1 with destinations sorted the same
+	 * way — so "leftmost token before → leftmost destination" holds regardless of where in the
+	 * selection each token sits.
+	 */
+	private recomputeDistributePreview(): void {
+		const paint = this.distributePaint;
+		if (!paint) {
+			this.distributePreview = null;
+			return;
+		}
+		const ids = this.controller.massSelectedTokenIds;
+		const data = this.controller.getData();
+		const tokens = data.tokens.filter((t) => ids.has(t.id));
+		if (tokens.length === 0) {
+			this.distributePreview = null;
+			return;
+		}
+		const readingOrder = (p: { x: number; y: number }, q: { x: number; y: number }) => p.x - q.x || p.y - q.y;
+		const ordered = [...tokens].sort((a, b) => readingOrder(this.footprintCenter(a), this.footprintCenter(b)));
+
+		if (data.gridType === "none") {
+			// No cells, no capacity limit: proportionally remap each token's position within the
+			// selection's own bounding box into the painted stroke's own bounding box.
+			if (paint.points.length === 0) {
+				this.distributePreview = null;
+				return;
+			}
+			const destMinX = Math.min(...paint.points.map((p) => p.x));
+			const destMaxX = Math.max(...paint.points.map((p) => p.x));
+			const destMinY = Math.min(...paint.points.map((p) => p.y));
+			const destMaxY = Math.max(...paint.points.map((p) => p.y));
+			const centers = tokens.map((t) => this.footprintCenter(t));
+			const minX = Math.min(...centers.map((c) => c.x));
+			const maxX = Math.max(...centers.map((c) => c.x));
+			const minY = Math.min(...centers.map((c) => c.y));
+			const maxY = Math.max(...centers.map((c) => c.y));
+			const spanX = Math.max(maxX - minX, 1e-6);
+			const spanY = Math.max(maxY - minY, 1e-6);
+			const points = ordered.map((t) => {
+				const c = this.footprintCenter(t);
+				const nx = (c.x - minX) / spanX;
+				const ny = (c.y - minY) / spanY;
+				return { x: destMinX + nx * (destMaxX - destMinX), y: destMinY + ny * (destMaxY - destMinY) };
+			});
+			this.distributePreview = { valid: true, cellKeys: null, points, assignment: ordered.map((t, i) => ({ tokenId: t.id, point: points[i] })) };
+			return;
+		}
+
+		const occupied = occupiedFootprintCells(data, ids);
+		const painted = [...paint.cellKeys].sort((k1, k2) => readingOrder(this.cellCenter(k1), this.cellCenter(k2)));
+		const free = painted.filter((k) => !occupied.has(k));
+		const n = ordered.length;
+		const valid = free.length >= n;
+		this.distributePreview = {
+			valid,
+			// Always highlight everything actually painted, regardless of shape or validity — WYSIWYG,
+			// like a brush stroke. Only the first `n` *free* cells (in reading order) are ever really
+			// assigned; painting more than needed just means the extras don't get used.
+			cellKeys: painted,
+			points: painted.map((k) => this.cellCenter(k)),
+			assignment: valid ? ordered.map((t, i) => ({ tokenId: t.id, cellKey: free[i] })) : null,
+		};
+	}
+
+	/** Applies a valid `distributePreview`'s assignment — see `recomputeDistributePreview`. */
+	private commitDistribute(preview: DistributePreview): void {
+		if (!preview.valid || !preview.assignment) return;
+		const data = this.controller.getData();
+		if (data.gridType === "none") {
+			const targets = new Map<string, { x: number; y: number }>();
+			for (const a of preview.assignment) if (a.point) targets.set(a.tokenId, a.point);
+			this.controller.moveTokensToPoints(targets);
+			return;
+		}
+		const targets = new Map<string, string>();
+		for (const a of preview.assignment) if (a.cellKey) targets.set(a.tokenId, a.cellKey);
+		if (!this.controller.moveTokensToCells(targets)) new Notice("Case déjà occupée par un pion.");
 	}
 
 	/**
@@ -1135,7 +1459,7 @@ export class MapCanvas {
 			const center = this.footprintCenter(token);
 			if (Math.hypot(world.x - center.x, world.y - center.y) > this.tokenRadius(token)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
-			if (fogActive && !isPlayer && !this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) continue;
+			if (fogActive && !isPlayer && !this.isEntityRevealedByFog(center)) continue;
 			return token;
 		}
 		return null;
@@ -1595,7 +1919,13 @@ export class MapCanvas {
 
 		this.drawTokens(ctx);
 		if (cellsVisible || noGrid || this.controller.selectedWallPointId) this.drawSelection(ctx);
-		if (this.controller.activeTool === "select") this.drawMassSelectionOverlay(ctx);
+		// The edit-mode select tool always wants the overlay (marquee mid-drag, or nothing selected
+		// yet); view mode needs it either once there's an actual token mass selection to outline, or
+		// while a fresh Shift-drag marquee is being drawn (that live rectangle must show up even
+		// before anything's been added to the selection — see `drawMassSelectionOverlay`'s own
+		// `marqueeWorld` handling at the bottom).
+		if (this.controller.activeTool === "select" || this.controller.massSelectedTokenIds.size > 0 || this.marqueeWorld) this.drawMassSelectionOverlay(ctx);
+		this.drawDistributePreview(ctx);
 		this.drawWallPreview(ctx);
 		if (this.activePing) this.drawPing(ctx);
 
@@ -1742,6 +2072,26 @@ export class MapCanvas {
 	/** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
 	private isLitByCache(cache: PlayerVisionRays[], worldX: number, worldY: number, useDim: boolean): boolean {
 		return isPointLit(cache, worldX, worldY, useDim);
+	}
+
+	/**
+	 * Whether an entity token at `center` should be shown despite fog: either the ordinary raycast
+	 * reach (`isLitByCache`, walls included) or, on top of that, simply standing within any player
+	 * token's own "rayon exploré" (`visionRadius`) — a straight-line distance check, walls or not, so
+	 * something right next to a player is always noticed even through a partial wall the raycast rule
+	 * itself would otherwise still dim/block at a distance. Callers still gate this on `fogActive` and
+	 * `!isPlayer` themselves — see `drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
+	 */
+	private isEntityRevealedByFog(center: { x: number; y: number }): boolean {
+		if (this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) return true;
+		const cellSize = this.cellVisualWidth();
+		for (const player of this.controller.getData().tokens) {
+			if ((player.category ?? "entity") !== "player") continue;
+			const playerCenter = this.footprintCenter(player);
+			const radius = (player.visionRadius ?? DEFAULT_VISION_RADIUS) * cellSize;
+			if (Math.hypot(center.x - playerCenter.x, center.y - playerCenter.y) <= radius) return true;
+		}
+		return false;
 	}
 
 	/** Translucent fill color for a player token's own vision-cone preview — see `drawTokenVisionZones`. */
@@ -2071,16 +2421,26 @@ export class MapCanvas {
 	private drawTokens(ctx: CanvasRenderingContext2D): void {
 		const data = this.controller.getData();
 		const fogActive = this.fogCurrentlyVisible();
+		const group = this.draggingTokenGroup;
+		const groupIds = group ? new Set(group.entries.map((e) => e.token.id)) : null;
 		for (const token of data.tokens) {
 			if (this.draggingToken?.token.id === token.id) continue;
+			if (groupIds?.has(token.id)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
 			const center = this.footprintCenter(token);
-			if (fogActive && !isPlayer && !this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) continue;
+			if (fogActive && !isPlayer && !this.isEntityRevealedByFog(center)) continue;
 			this.drawToken(ctx, center.x, center.y, token, token.id === this.controller.selectedTokenId);
 		}
 		if (this.draggingToken) {
 			const { token, currentWorld } = this.draggingToken;
 			this.drawToken(ctx, currentWorld.x, currentWorld.y, token, true);
+		}
+		if (group) {
+			const dx = group.currentWorld.x - group.pointerDownWorld.x;
+			const dy = group.currentWorld.y - group.pointerDownWorld.y;
+			for (const entry of group.entries) {
+				this.drawToken(ctx, entry.originWorld.x + dx, entry.originWorld.y + dy, entry.token, true);
+			}
 		}
 	}
 
@@ -2459,5 +2819,56 @@ export class MapCanvas {
 			ctx.stroke();
 			ctx.restore();
 		}
+	}
+
+	/**
+	 * The Ctrl-drag "distribute the selection into this area" gesture's live feedback. Deliberately
+	 * doesn't draw a bounding rectangle (that would read as a free-floating destination box,
+	 * independent of the grid) — instead it directly highlights every cell actually painted so far
+	 * (see `distributePaint`), exactly like `massSelectedCellKeys`' own cell outlines, all white
+	 * ("fits") or all red ("won't fit" — see `recomputeDistributePreview`). Shown from the very first
+	 * painted cell, even before `dragMoved` — a plain Ctrl+click that never turns into a drag clears
+	 * both fields before the next render, so nothing lingers. Grid type "none" has no cells to
+	 * highlight, so it falls back to one dot per token's proposed landing point instead.
+	 */
+	private drawDistributePreview(ctx: CanvasRenderingContext2D): void {
+		if (!this.distributePaint || !this.distributePreview) return;
+		const preview = this.distributePreview;
+		const fillStyle = preview.valid ? "rgba(224, 160, 32, 0.28)" : "rgba(192, 57, 43, 0.28)";
+		const strokeStyle = preview.valid ? "#e0a020" : "#c0392b";
+
+		ctx.save();
+		ctx.fillStyle = fillStyle;
+		ctx.strokeStyle = strokeStyle;
+		ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
+
+		if (preview.cellKeys) {
+			const data = this.controller.getData();
+			const cellSize = this.effectiveCellSize();
+			for (const key of preview.cellKeys) {
+				const { a, b } = parseCellKey(key);
+				ctx.beginPath();
+				if (data.gridType === "square") {
+					ctx.rect(a * cellSize, b * cellSize, cellSize, cellSize);
+				} else {
+					const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
+					const center = hexCellToWorldCenter(a, b, cellSize, orientation);
+					const corners = hexCorners(center.x, center.y, cellSize, orientation);
+					corners.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+					ctx.closePath();
+				}
+				ctx.fill();
+				ctx.stroke();
+			}
+		} else {
+			const dotRadius = Math.max(4, this.cellVisualWidth() * 0.12);
+			for (const p of preview.points) {
+				ctx.beginPath();
+				ctx.arc(p.x, p.y, dotRadius, 0, Math.PI * 2);
+				ctx.fill();
+				ctx.stroke();
+			}
+		}
+		ctx.restore();
 	}
 }

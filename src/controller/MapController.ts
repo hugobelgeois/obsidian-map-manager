@@ -1,4 +1,5 @@
 import { CellData, Marker, VisionBlockerType, WallPoint, WallSegment, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
+import { footprintCellKeys, occupiedFootprintCells } from "../grid/fog";
 import { WallShapeKind, wallShapeCorners } from "../grid/gridMath";
 import { addWallSegment, optimizeWallNetwork } from "../grid/wallOptimize";
 
@@ -126,6 +127,11 @@ export class MapController {
 	setMode(mode: MapMode): void {
 		if (this.mode === mode) return;
 		this.mode = mode;
+		// A leftover mass selection from the mode being left behind (e.g. cells mass-selected via the
+		// edit-mode "select" tool) would otherwise lock `massSelectionKind` and silently block a fresh
+		// token selection right after switching to view mode — see the view-mode multi-select gestures
+		// in MapCanvas.
+		this.clearMassSelection();
 		this.notify();
 	}
 
@@ -1041,6 +1047,53 @@ export class MapController {
 			if (token) {
 				token.x = x;
 				token.y = y;
+			}
+		});
+	}
+
+	/**
+	 * Bulk-repositions a set of tokens onto specific target cells, as one undo step — used both for
+	 * dragging a multi-token selection together (targets = each token's original cell rigidly
+	 * translated by the drag delta) and for the "distribute into an area" gesture (targets = an
+	 * arbitrary reading-order assignment onto free cells) — see `MapCanvas`'s view-mode multi-select
+	 * handling. Validates the whole batch atomically via `occupiedFootprintCells` (so a size>1
+	 * token's full block is respected, not just its anchor cell): fails with no change at all if any
+	 * target cell is occupied by a token outside `targets`, or if two targets collide with each
+	 * other — same spirit as `moveToken`'s single-token collision check, generalized to a batch.
+	 * Returns whether the batch applied.
+	 */
+	moveTokensToCells(targets: Map<string, string>): boolean {
+		if (targets.size === 0) return false;
+		const movingIds = new Set(targets.keys());
+		const occupied = occupiedFootprintCells(this.data, movingIds);
+		const claimed = new Set<string>();
+		for (const [tokenId, cellKey] of targets) {
+			const token = this.findToken(tokenId);
+			const size = token?.size ?? 1;
+			for (const key of footprintCellKeys(this.data, cellKey, size)) {
+				if (occupied.has(key) || claimed.has(key)) return false;
+				claimed.add(key);
+			}
+		}
+		this.update((data) => {
+			for (const token of data.tokens) {
+				const cellKey = targets.get(token.id);
+				if (cellKey !== undefined) token.cellKey = cellKey;
+			}
+		});
+		return true;
+	}
+
+	/** Same idea as `moveTokensToCells`, for grid type "none" — no collision concept (see `moveTokenFree`), so it always applies. */
+	moveTokensToPoints(targets: Map<string, { x: number; y: number }>): void {
+		if (targets.size === 0) return;
+		this.update((data) => {
+			for (const token of data.tokens) {
+				const point = targets.get(token.id);
+				if (point) {
+					token.x = point.x;
+					token.y = point.y;
+				}
 			}
 		});
 	}
