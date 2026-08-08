@@ -102,7 +102,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Animation du brouillard")
 			.setDesc(
-				"Fait légèrement trembler le bord du brouillard de guerre, au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. « Poussée » fait bouger chaque zone du brouillard indépendamment plutôt que l'ensemble d'un seul bloc."
+				"Fait légèrement trembler le bord du brouillard de guerre, au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. « poussée » fait bouger chaque zone du brouillard indépendamment plutôt que l'ensemble d'un seul bloc."
 			)
 			.addDropdown((dd) => {
 				dd.addOption("none", "Pas d'animation");

@@ -164,7 +164,7 @@ function hexCellNeighborEdges(cell: AxialCoord, cellSize: number, orientation: H
 				bestIndex = i;
 			}
 		}
-		return { edge, neighbor: (neighbors[bestIndex] ?? cell) as AxialCoord };
+		return { edge, neighbor: neighbors[bestIndex] ?? cell };
 	});
 }
 
