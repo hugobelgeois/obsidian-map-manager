@@ -1,4 +1,5 @@
 import { MapController } from "../controller/MapController";
+import { PathAnimationRoute } from "../render/MapCanvas";
 
 /**
  * One GM window/tab currently displaying a given map file, looked up by `MapPlayerMirrorView` (see
@@ -17,6 +18,8 @@ export interface MirrorSource {
 	onScrollChange: (cb: (scrollTop: number) => void) => () => void;
 	/** Subscribes to the source canvas's "look here" pings (see `MapCanvasOptions.onPing`); returns an unsubscribe function. */
 	onPing: (cb: (x: number, y: number) => void) => () => void;
+	/** Subscribes to the source canvas's "Animation" token-movement tweens (see `MapCanvasOptions.onPathAnimation`) so a mirror can replay them visually via its own `MapCanvas.playPathAnimationEcho`; returns an unsubscribe function. */
+	onPathAnimationStart: (cb: (routes: PathAnimationRoute[], speedWorldPerMs: number) => void) => () => void;
 }
 
 const sources = new Map<string, MirrorSource>();

@@ -7,7 +7,7 @@ import { registerMirrorSource } from "../platform/mirrorRegistry";
 import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
-import { MapCanvas } from "../render/MapCanvas";
+import { MapCanvas, PathAnimationRoute } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
 
@@ -110,12 +110,16 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const canvasHost = body.createDiv({ cls: "map-manager-canvas-host" });
 	const viewportListeners = new Set<() => void>();
 	const pingListeners = new Set<(x: number, y: number) => void>();
+	const pathAnimationListeners = new Set<(routes: PathAnimationRoute[], speedWorldPerMs: number) => void>();
 	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings, {
 		onViewportChange: () => {
 			for (const cb of viewportListeners) cb();
 		},
 		onPing: (x, y) => {
 			for (const cb of pingListeners) cb(x, y);
+		},
+		onPathAnimation: (routes, speedWorldPerMs) => {
+			for (const cb of pathAnimationListeners) cb(routes, speedWorldPerMs);
 		},
 	});
 	canvasRef = canvas;
@@ -134,6 +138,10 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		onPing: (cb) => {
 			pingListeners.add(cb);
 			return () => pingListeners.delete(cb);
+		},
+		onPathAnimationStart: (cb) => {
+			pathAnimationListeners.add(cb);
+			return () => pathAnimationListeners.delete(cb);
 		},
 	});
 	const infoPanel = new InfoPanel(

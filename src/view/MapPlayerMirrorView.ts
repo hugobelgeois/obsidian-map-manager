@@ -29,6 +29,7 @@ export class MapPlayerMirrorView extends ItemView {
 	private unsubscribeController: (() => void) | null = null;
 	private unsubscribeScroll: (() => void) | null = null;
 	private unsubscribePing: (() => void) | null = null;
+	private unsubscribePathAnimation: (() => void) | null = null;
 	private rootEl: HTMLElement;
 	private bodyEl: HTMLElement | null = null;
 
@@ -92,6 +93,7 @@ export class MapPlayerMirrorView extends ItemView {
 		// InfoPanel opening/closing (which narrows their viewport) into an unwanted camera shift here.
 		this.unsubscribeViewport = source.onViewportChange(() => this.canvasComp?.setMirrorCamera(source.getView()));
 		this.unsubscribePing = source.onPing((x, y) => this.canvasComp?.triggerPing(x, y));
+		this.unsubscribePathAnimation = source.onPathAnimationStart((routes, speedWorldPerMs) => this.canvasComp?.playPathAnimationEcho(routes, speedWorldPerMs));
 		this.unsubscribeController = source.controller.onChange(() => this.syncInfoPanel());
 		this.syncInfoPanel();
 	}
@@ -123,12 +125,14 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribeController?.();
 		this.unsubscribeScroll?.();
 		this.unsubscribePing?.();
+		this.unsubscribePathAnimation?.();
 		this.canvasComp = null;
 		this.infoPanelComp = null;
 		this.unsubscribeViewport = null;
 		this.unsubscribeController = null;
 		this.unsubscribeScroll = null;
 		this.unsubscribePing = null;
+		this.unsubscribePathAnimation = null;
 	}
 
 	async onClose(): Promise<void> {

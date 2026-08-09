@@ -7,21 +7,26 @@ import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
 import {
 	ABS_MIN_ZOOM,
+	Point,
 	SnapCandidate,
 	ViewTransform,
 	clamp,
+	directionAtArcLength,
 	getVisibleHexCells,
 	getVisibleSquareCells,
 	hexCellToWorldCenter,
 	hexCorners,
 	hexGridSnapCandidates,
 	hexWorldToCell,
+	pointAtArcLength,
+	polylineCumulativeLengths,
 	projectOntoSegment,
 	screenToWorld,
 	segmentIntersection,
 	squareFootprintAnchor,
 	squareGridSnapCandidates,
 	squareWorldToCell,
+	truncatePolyline,
 	wallShapeCorners,
 	worldToScreen,
 } from "../grid/gridMath";
@@ -35,6 +40,7 @@ import {
 	effectiveCellSize as fogEffectiveCellSize,
 	fogBucketSize as fogFogBucketSize,
 	footprintCenter as fogFootprintCenter,
+	footprintCellKeys,
 	isPointLit,
 	isWorldPointExplored as fogIsWorldPointExplored,
 	occupiedFootprintCells,
@@ -44,6 +50,14 @@ import {
 const DRAG_THRESHOLD = 4;
 /** How long a "ping" ring (see `triggerPing`) expands and fades before disappearing, in ms. */
 const PING_DURATION_MS = 1200;
+/** Animated token movement (view mode "Animation" toggle — see `drawingPath`/`pathAnimation`): a new sampled point is only appended to the in-progress path once the pointer has moved at least this fraction of a cell since the last one, keeping the point count (and thus the per-frame arc-length work) bounded without visibly faceting the drawn curve. */
+const PATH_SAMPLE_SPACING_RATIO = 0.15;
+/** Animated token movement: constant tween speed, in cells per second. */
+const PATH_ANIMATION_CELLS_PER_SEC = 3.5;
+/** Animated token movement: how many cells short of the drawn path's own end each successive follower (in "closest to the path's start" order) stops, so they end up queued single-file rather than stacked on the same spot. */
+const PATH_FOLLOW_GAP_CELLS = 1;
+/** Animated token movement collision resolution (`nearestFreeCell`): the BFS gives up and leaves a token where it collided past this many visited cells — generous enough for any realistically packed map without ever searching unboundedly. */
+const COLLISION_SEARCH_LIMIT = 400;
 /** Radius as a fraction of (cellVisualWidth * token.size): 0.475 → a diameter equal to 95% of the cell's width. */
 const TOKEN_SIZE_RATIO = 0.475;
 /** Below this on-screen cell size (in px), the grid/cell overlay auto-hides until zoomed back in. */
@@ -173,6 +187,43 @@ interface DraggingTokenGroup {
 	currentWorld: { x: number; y: number };
 }
 
+/**
+ * One token's full itinerary for the "Animation" token-movement gesture: a straight lead-in from its
+ * own position at the moment the path was drawn, onto the drawn path, then along it as far as this
+ * token's own rank allows (see `MapCanvas.startPathAnimation`) — `points[0]` is always that starting
+ * position, `points[points.length - 1]` is where it comes to rest. `cumulative`/`totalLength` are
+ * `polylineCumulativeLengths(points)`/its last entry, kept alongside rather than recomputed every
+ * animation frame. `finalRotation` is the direction `points` is heading at its very last point —
+ * baked in once here since a zero-length final segment (this token never actually moves) would
+ * otherwise have no direction of its own to fall back on.
+ *
+ * Exported so `mirrorRegistry`/`MapView`/`MapEmbed` can relay a whole tween (pure position/timing
+ * data, no canvas-specific state) to a player-mirror window's own `MapCanvas` — see
+ * `MapCanvasOptions.onPathAnimation`/`playPathAnimationEcho`.
+ */
+export interface PathAnimationRoute {
+	tokenId: string;
+	points: Point[];
+	cumulative: number[];
+	totalLength: number;
+	finalRotation: number;
+}
+
+/** An in-flight "Animation" token-movement tween — see `MapCanvas.startPathAnimation`/`runPathAnimationLoop`/`finishPathAnimation`. */
+interface PathAnimationState {
+	routes: PathAnimationRoute[];
+	startedAt: number;
+	/** World units per ms — every route tweens at the same constant speed (see `PATH_ANIMATION_CELLS_PER_SEC`), so a route's own remaining distance alone determines how much longer it keeps moving. */
+	speedWorldPerMs: number;
+	/**
+	 * Whether this instance's own copy of the tween is the one that commits final position/facing to
+	 * `MapController` once every route finishes (`finishPathAnimation`) — true for the canvas that
+	 * actually started the gesture, false for a player-mirror window's purely visual echo of it (see
+	 * `playPathAnimationEcho`), which just lets its local state lapse instead.
+	 */
+	commitOnFinish: boolean;
+}
+
 /** Live preview for the Ctrl-drag "distribute the selection into this area" gesture — see `MapCanvas.recomputeDistributePreview`. */
 interface DistributePreview {
 	valid: boolean;
@@ -214,6 +265,8 @@ export interface MapCanvasOptions {
 	onViewportChange?: () => void;
 	/** Called with the world position of a plain click (see `triggerPing`) so a mirror can show the same ping ring — a click isn't a `MapController` mutation either. */
 	onPing?: (x: number, y: number) => void;
+	/** Called whenever an "Animation" token-movement tween starts (see `startPathAnimation`) so a mirror can replay the same tween visually via `playPathAnimationEcho` — panning/dragging the tween itself never touches `MapController` until it finishes, so a mirror wouldn't otherwise see it move until the drop. */
+	onPathAnimation?: (routes: PathAnimationRoute[], speedWorldPerMs: number) => void;
 }
 
 export class MapCanvas {
@@ -310,6 +363,13 @@ export class MapCanvas {
 	/** True while "Seau à murs" is flood-filling from a click (see `runColorRegionWalls`) — guards against a second click starting an overlapping run before the first one's async image load/analysis finishes. */
 	private colorRegionWallsRunning = false;
 
+	/** View mode "Animation" mode only: the path being traced by a held-down drag on empty canvas (with a token selection already in place) — see `beginPathDraw`/`commitPathDraw`. `null` outside that gesture. */
+	private drawingPath: { points: Point[] } | null = null;
+	/** Non-null while the "Animation" mode's tween is actively running — see `startPathAnimation`/`runPathAnimationLoop`. */
+	private pathAnimation: PathAnimationState | null = null;
+	/** Non-null while `pathAnimation`'s own render loop is actively re-rendering every frame — same pattern as `pingAnimationFrameId`. */
+	private pathAnimationFrameId: number | null = null;
+
 	private unsubscribe: () => void;
 
 	private onContextMenu = (e: MouseEvent) => {
@@ -393,6 +453,19 @@ export class MapCanvas {
 		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
 		// selects the token instead of letting the click fall through to panning/tools.
 		const tokenHit = this.findTokenAtScreenPoint(px, py);
+
+		// "Animation" token movement (view mode only, the default and only way tokens tween — see
+		// CLAUDE.md/this class's own doc): a drag starting on empty canvas — not on a token itself,
+		// which keeps its own plain instant drag either way (see `tokenHit` below) — while there's
+		// already a token selection in place takes over the gesture to trace a path instead of
+		// panning. No selection yet just falls through to the ordinary tokenHit/pan handling below,
+		// unchanged. Ctrl/Shift-held drags never reach here at all (both already returned above), so
+		// this never fights the Ctrl-drag "distribute"/Shift-drag "marquee select" gestures.
+		if (this.controller.mode === "view" && !tokenHit && this.hasAnimatableTokenSelection()) {
+			this.beginPathDraw(px, py);
+			return;
+		}
+
 		if (tokenHit) {
 			if (this.controller.mode === "view") {
 				// A token already part of a real (2+) multi-selection drags the whole group together;
@@ -547,6 +620,19 @@ export class MapCanvas {
 			return;
 		}
 
+		// Same idea, for the "Animation" mode's path trace: sampled continuously (not just once
+		// `dragMoved` is known), but only every `PATH_SAMPLE_SPACING_RATIO` of a cell so the point
+		// count — and thus the per-frame arc-length work once the tween starts — stays bounded.
+		if (this.drawingPath) {
+			const world = screenToWorld(px, py, this.transform);
+			const last = this.drawingPath.points[this.drawingPath.points.length - 1];
+			if (!last || Math.hypot(world.x - last.x, world.y - last.y) >= this.cellVisualWidth() * PATH_SAMPLE_SPACING_RATIO) {
+				this.drawingPath.points.push(world);
+			}
+			this.render();
+			return;
+		}
+
 		if (!this.dragMoved) return;
 
 		// Shared by the edit-mode "select" tool's marquee and view mode's Shift-drag marquee — both
@@ -584,6 +670,14 @@ export class MapCanvas {
 		if (!this.dragging) return;
 		this.dragging = false;
 		if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
+
+		// "Animation" mode's path trace: checked first (even before the ping logic just below, which
+		// would otherwise also match a no-motion release of this same gesture) since `beginPathDraw`
+		// already consumed the mousedown that started it — see `onPointerDown`.
+		if (this.drawingPath) {
+			this.commitPathDraw();
+			return;
+		}
 
 		// A plain left-click on empty space (no edit tool armed, and not landing on a token/marker —
 		// those already have their own selection/info-panel feedback, a ping would be redundant)
@@ -714,6 +808,7 @@ export class MapCanvas {
 		this.viewCtrlTokenHit = null;
 		this.distributePaint = null;
 		this.distributePreview = null;
+		this.drawingPath = null;
 	};
 
 	/**
@@ -1049,6 +1144,211 @@ export class MapCanvas {
 		if (!this.controller.moveTokensToCells(targets)) new Notice("Case déjà occupée par un pion.");
 	}
 
+	// ---- View mode: "Animation" token movement (draw a path, tokens tween along it) ----
+
+	/** Whether the path-draw gesture has anything to animate right now — see `onPointerDown`'s "Animation" mode branch and `animatedSelectionTokenIds`. */
+	private hasAnimatableTokenSelection(): boolean {
+		if (this.controller.massSelectionKind === "token" && this.controller.massSelectedTokenIds.size > 0) return true;
+		return !!this.controller.selectedTokenId;
+	}
+
+	/** The tokens a path-draw gesture would animate: the current mass token selection if there is one, else the single selected token, else none. Same priority `hasAnimatableTokenSelection` checks. */
+	private animatedSelectionTokenIds(): string[] {
+		if (this.controller.massSelectionKind === "token" && this.controller.massSelectedTokenIds.size > 0) return [...this.controller.massSelectedTokenIds];
+		return this.controller.selectedTokenId ? [this.controller.selectedTokenId] : [];
+	}
+
+	private beginPathDraw(px: number, py: number): void {
+		this.drawingPath = { points: [screenToWorld(px, py, this.transform)] };
+	}
+
+	/** Pointer-up while a path was being traced: fewer than 2 sampled points means the pointer never actually moved (a plain click that happened to land where the gesture was armed) — a no-op, same as a click with nothing to drag. */
+	private commitPathDraw(): void {
+		const drawn = this.drawingPath;
+		this.drawingPath = null;
+		if (!drawn || drawn.points.length < 2) return;
+		this.startPathAnimation(drawn.points);
+	}
+
+	/**
+	 * Builds one `PathAnimationRoute` per animatable token and starts the tween loop. Each token's
+	 * own route is a straight lead-in from wherever it actually is onto the drawn path's first point,
+	 * then as much of the path itself as its rank allows — see the interface doc on
+	 * `PathAnimationRoute`/`PATH_FOLLOW_GAP_CELLS` for why rank (closest-to-the-path's-start-first)
+	 * shortens how far along the path each successive token gets to go, so they end up queued
+	 * single-file rather than stacked on the same final cell.
+	 */
+	private startPathAnimation(pathPoints: Point[]): void {
+		const pathStart = pathPoints[0];
+		if (!pathStart) return;
+		const ids = this.animatedSelectionTokenIds();
+		const tokens = this.controller.getData().tokens.filter((t) => ids.includes(t.id));
+		if (tokens.length === 0) return;
+
+		const ranked = tokens
+			.map((token) => {
+				const origin = this.footprintCenter(token);
+				return { token, origin, dist: Math.hypot(origin.x - pathStart.x, origin.y - pathStart.y) };
+			})
+			.sort((a, b) => a.dist - b.dist);
+
+		const pathCumulative = polylineCumulativeLengths(pathPoints);
+		const pathTotalLength = pathCumulative[pathCumulative.length - 1] ?? 0;
+		const gap = this.cellVisualWidth() * PATH_FOLLOW_GAP_CELLS;
+
+		const routes: PathAnimationRoute[] = ranked.map(({ token, origin }, rank) => {
+			const stopArc = Math.max(0, pathTotalLength - rank * gap);
+			const points = [origin, ...truncatePolyline(pathPoints, pathCumulative, stopArc)];
+			const cumulative = polylineCumulativeLengths(points);
+			const totalLength = cumulative[cumulative.length - 1] ?? 0;
+			const finalRotation = directionAtArcLength(points, cumulative, totalLength) ?? token.rotation ?? 0;
+			return { tokenId: token.id, points, cumulative, totalLength, finalRotation };
+		});
+
+		const speedWorldPerMs = (this.cellVisualWidth() * PATH_ANIMATION_CELLS_PER_SEC) / 1000;
+		this.playPathAnimation(routes, speedWorldPerMs, true);
+		// A mirror never touches `MapController` until this canvas's own `finishPathAnimation` commits
+		// (they share the same controller — see `mirrorRegistry`), so left alone it would only see the
+		// tokens jump once the tween is over. `routes`/`speedWorldPerMs` are pure position/timing data
+		// (no canvas-specific state), so relaying them lets a mirror replay the exact same tween on its
+		// own local clock — see `MapCanvasOptions.onPathAnimation`/`playPathAnimationEcho`.
+		this.options.onPathAnimation?.(routes, speedWorldPerMs);
+	}
+
+	/** Starts (or, for a mirror, replays) an "Animation" tween — shared by `startPathAnimation` and `playPathAnimationEcho`. */
+	private playPathAnimation(routes: PathAnimationRoute[], speedWorldPerMs: number, commitOnFinish: boolean): void {
+		this.pathAnimation = { routes, startedAt: performance.now(), speedWorldPerMs, commitOnFinish };
+		this.runPathAnimationLoop();
+	}
+
+	/**
+	 * Mirror-only: replays an "Animation" token-movement tween initiated on the source canvas — see
+	 * `MapCanvasOptions.onPathAnimation`/`MirrorSource.onPathAnimationStart` (wired up the same way
+	 * `triggerPing` already is for pings). Runs on this canvas's own `performance.now()` clock (a
+	 * popout window's clock has a different origin than the main window's — sharing a raw timestamp
+	 * across them would desync immediately), and never commits anything to `MapController`: the source
+	 * canvas's own `finishPathAnimation` already will, and both canvases share that same controller.
+	 */
+	playPathAnimationEcho(routes: PathAnimationRoute[], speedWorldPerMs: number): void {
+		this.playPathAnimation(routes, speedWorldPerMs, false);
+	}
+
+	/** Same self-contained start/stop `requestAnimationFrame` pattern as `triggerPing` — re-renders every frame until every route has covered its own `totalLength` at the shared speed, then hands off to `finishPathAnimation` (owner) or just lets the local echo lapse (mirror — see `PathAnimationState.commitOnFinish`). */
+	private runPathAnimationLoop(): void {
+		if (this.pathAnimationFrameId !== null) return;
+		const tick = () => {
+			const anim = this.pathAnimation;
+			if (!anim) {
+				this.pathAnimationFrameId = null;
+				return;
+			}
+			const elapsed = performance.now() - anim.startedAt;
+			const finished = anim.routes.every((route) => elapsed * anim.speedWorldPerMs >= route.totalLength);
+			if (finished) {
+				this.pathAnimationFrameId = null;
+				if (anim.commitOnFinish) {
+					this.finishPathAnimation();
+				} else {
+					this.pathAnimation = null;
+					this.render();
+				}
+				return;
+			}
+			this.render();
+			this.pathAnimationFrameId = requestAnimationFrame(tick);
+		};
+		this.pathAnimationFrameId = requestAnimationFrame(tick);
+	}
+
+	/**
+	 * Nearest cell to `fromKey` (BFS, 4-/6-connected same as the fill tool's flood — `neighborKeys`;
+	 * a hop blocked by a wall segment — `edgeBlocked` — is never taken, so the result is always
+	 * actually walkable to) whose whole footprint (`size`) is absent from `claimed`. `fromKey` itself
+	 * is tried first and returned as-is if it already fits. Bounded by `COLLISION_SEARCH_LIMIT`
+	 * visited cells; past that (a fully packed map with nowhere left to go) `fromKey` is returned
+	 * unchanged rather than searching forever — same "leave it where it collided" fallback
+	 * `moveTokensToCells`'s own rejection used to mean for the whole batch, now scoped to just the one
+	 * token that couldn't be placed. Used by `finishPathAnimation` to resolve two animated tokens (or
+	 * an animated token and a stationary one) ending their move on the same cell.
+	 */
+	private nearestFreeCell(fromKey: string, size: number, claimed: ReadonlySet<string>, wallSegments: ResolvedWallSegment[]): string {
+		const data = this.controller.getData();
+		const fits = (key: string) => footprintCellKeys(data, key, size).every((k) => !claimed.has(k));
+		if (fits(fromKey)) return fromKey;
+		const visited = new Set<string>([fromKey]);
+		const queue: string[] = [fromKey];
+		let visitedCount = 0;
+		while (queue.length > 0 && visitedCount < COLLISION_SEARCH_LIMIT) {
+			const key = queue.shift();
+			if (!key) break;
+			for (const n of this.neighborKeys(key)) {
+				if (visited.has(n) || this.edgeBlocked(key, n, wallSegments)) continue;
+				visited.add(n);
+				visitedCount++;
+				if (fits(n)) return n;
+				queue.push(n);
+				if (visitedCount >= COLLISION_SEARCH_LIMIT) break;
+			}
+		}
+		return fromKey;
+	}
+
+	/**
+	 * Commits every route's final position/facing in one batch, as one undo step
+	 * (`beginHistoryGroup`/`endHistoryGroup`). Position, on a celled grid, is resolved through
+	 * `nearestFreeCell` first (see its own doc) rather than handed straight to
+	 * `moveTokensToCells`: routes are already in priority order (closest-to-the-path's-start-first —
+	 * see `startPathAnimation`), so claiming each route's cell in that same order and nudging only a
+	 * later, colliding one out of the way — instead of `moveTokensToCells`'s own atomic all-or-nothing
+	 * collision check, which would otherwise reject the *entire* batch (leaving every token exactly
+	 * where it started) the instant any two of them land on the same cell — means the group still
+	 * ends up queued single-file even when `PATH_FOLLOW_GAP_CELLS` alone wasn't enough to keep them
+	 * apart (a short path, or one that curls back on itself). Grid type "none" has no collision
+	 * concept at all (`moveTokensToPoints`), so this only ever applies to celled grids. Then
+	 * `setTokenRotations` for facing.
+	 */
+	private finishPathAnimation(): void {
+		const anim = this.pathAnimation;
+		this.pathAnimation = null;
+		if (!anim || anim.routes.length === 0) return;
+		const data = this.controller.getData();
+
+		this.controller.beginHistoryGroup();
+		let moved = true;
+		if (data.gridType === "none") {
+			const targets = new Map<string, { x: number; y: number }>();
+			for (const route of anim.routes) {
+				const end = route.points[route.points.length - 1];
+				if (end) targets.set(route.tokenId, end);
+			}
+			this.controller.moveTokensToPoints(targets);
+		} else {
+			const wallSegments = this.resolveWallSegments();
+			const movingIds = new Set(anim.routes.map((r) => r.tokenId));
+			const claimed = occupiedFootprintCells(data, movingIds);
+			const targets = new Map<string, string>();
+			for (const route of anim.routes) {
+				const token = this.controller.findToken(route.tokenId);
+				const end = route.points[route.points.length - 1];
+				if (!token || !end) continue;
+				const size = token.size ?? 1;
+				const desiredKey = this.dropAnchorKey(token, end.x, end.y);
+				const finalKey = this.nearestFreeCell(desiredKey, size, claimed, wallSegments);
+				for (const key of footprintCellKeys(data, finalKey, size)) claimed.add(key);
+				targets.set(route.tokenId, finalKey);
+			}
+			moved = this.controller.moveTokensToCells(targets);
+			if (!moved) new Notice("Case déjà occupée par un pion.");
+		}
+		if (moved) {
+			const rotations = new Map(anim.routes.map((r) => [r.tokenId, r.finalRotation]));
+			this.controller.setTokenRotations(rotations);
+		}
+		this.controller.endHistoryGroup();
+
+		this.render();
+	}
+
 	/**
 	 * Double-clicking a wall segment's line (away from an existing point) inserts a new point right
 	 * there, splitting the segment in two — lets a straight wall line be reshaped without redrawing
@@ -1288,6 +1588,7 @@ export class MapCanvas {
 	destroy(): void {
 		if (this.animationFrameId !== null) cancelAnimationFrame(this.animationFrameId);
 		if (this.pingAnimationFrameId !== null) cancelAnimationFrame(this.pingAnimationFrameId);
+		if (this.pathAnimationFrameId !== null) cancelAnimationFrame(this.pathAnimationFrameId);
 		this.resizeObserver.disconnect();
 		if (!this.isMirror) {
 			this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -1877,10 +2178,14 @@ export class MapCanvas {
 		// use this frame's live vision reach, not just last frame's.
 		if (this.fogCurrentlyVisible()) {
 			const wallSegments = this.resolveWallSegments();
+			// A player token currently mid "Animation" tween (`currentAnimatedPose`) casts from its live
+			// interpolated position/facing instead of its still-uncommitted `cellKey`/`x,y`/`rotation` —
+			// otherwise fog would only ever unlock once the whole move commits, well after the tween
+			// that's supposed to be revealing it as it goes has already finished playing.
 			this.frameVisionCache = this.controller
 				.getData()
 				.tokens.filter((t) => (t.category ?? "entity") === "player")
-				.map((t) => this.castRaysForToken(t, wallSegments));
+				.map((t) => this.castRaysForToken(t, wallSegments, this.currentAnimatedPose(t.id) ?? undefined));
 		} else {
 			this.frameVisionCache = [];
 		}
@@ -1944,6 +2249,7 @@ export class MapCanvas {
 		if (this.controller.activeTool === "select" || this.controller.massSelectedTokenIds.size > 0 || this.marqueeWorld) this.drawMassSelectionOverlay(ctx);
 		this.drawDistributePreview(ctx);
 		this.drawWallPreview(ctx);
+		this.drawPathPreview(ctx);
 		if (this.activePing) this.drawPing(ctx);
 
 		ctx.restore();
@@ -2018,8 +2324,15 @@ export class MapCanvas {
 	 * long as the animation ran, worse the more zoomed out (a larger wobble/reach ratio) — a lasting
 	 * corruption, not a rendering glitch, hence surviving after the zoom/animation stopped. The
 	 * tremble is now applied only in `appendVisionFan`, purely to the drawn shape.
+	 *
+	 * `pose`, when given (see `currentAnimatedPose`), casts from that live interpolated
+	 * position/facing instead of the token's own committed data — and always recomputes rather than
+	 * reading/writing `playerVisionRaysCache`, since that cache is keyed on `MapController.dataVersion`
+	 * alone, which doesn't change while a tween is merely in flight (nothing's committed yet) and so
+	 * would otherwise just keep returning the pre-tween rays for every frame of the animation.
 	 */
-	private castRaysForToken(token: Token, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
+	private castRaysForToken(token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): PlayerVisionRays {
+		if (pose) return { ...castVisionRays(this.controller.getData(), token, wallSegments, pose), phase: tremblePhase(token.id) };
 		const version = this.controller.dataVersion;
 		const cached = this.playerVisionRaysCache.get(token.id);
 		const { center, rays } =
@@ -2109,7 +2422,7 @@ export class MapCanvas {
 		const cellSize = this.cellVisualWidth();
 		for (const player of this.controller.getData().tokens) {
 			if ((player.category ?? "entity") !== "player") continue;
-			const playerCenter = this.footprintCenter(player);
+			const playerCenter = this.currentAnimatedPose(player.id)?.center ?? this.footprintCenter(player);
 			const radius = (player.visionRadius ?? DEFAULT_VISION_RADIUS) * cellSize;
 			if (Math.hypot(center.x - playerCenter.x, center.y - playerCenter.y) <= radius) return true;
 		}
@@ -2435,6 +2748,27 @@ export class MapCanvas {
 	}
 
 	/**
+	 * Scales a pair of insets eroding a tile's two *opposite* edges (e.g. west/east) down together,
+	 * only when they'd otherwise overlap and flip the tile's width negative — a narrow corridor or an
+	 * isolated tile facing unexplored space on both opposite sides at once, the one case where the
+	 * fixed anti-bleed margin (`erosionInset` in `drawFog`, deliberately *not* capped on its own — see
+	 * the comment there) is large enough relative to the tile to fully erase it. Left untouched
+	 * (`[a, b]` unchanged) whenever there's room, which is the ordinary case — most eroded tiles border
+	 * unexplored space on only one side, where the full margin was never at risk of collapsing
+	 * anything and shrinking it would only needlessly weaken the anti-bleed protection near a real
+	 * boundary (a wall, most importantly). A small floor (`span * 0.1`) is always left standing rather
+	 * than letting the scale reach exactly 0, so a corridor thins down to a sliver instead of
+	 * disappearing outright.
+	 */
+	private fitOpposingInsets(a: number, b: number, span: number): [number, number] {
+		const avail = Math.max(0, span * 0.9);
+		const sum = a + b;
+		if (sum <= avail) return [a, b];
+		const scale = avail / sum;
+		return [a * scale, b * scale];
+	}
+
+	/**
 	 * Renders fog as: a coarse "ever explored" memory layer (square buckets, independent of grid
 	 * type/shape — see `FOG_BUCKET_SCALE`), with each player's traced vision fan punched out on top
 	 * (fully lit within `clearEnd`, dimmed-but-visible out to `dimEnd`). No per-grid-cell shape work.
@@ -2519,6 +2853,17 @@ export class MapCanvas {
 		// nowhere near that boundary left to visibly bleed light past. An edge shared with another
 		// revealed tile is left untouched, so two neighboring revealed tiles always keep touching
 		// seamlessly (no artificial grid lines cutting across an already fully-explored room).
+		//
+		// Deliberately *not* capped relative to `tile`: this is the same fixed screen-pixel margin
+		// wherever it's applied, on purpose — a wall (or any other genuine unexplored boundary) needs
+		// that full margin to keep the blur from visibly bleeding past it regardless of how coarse the
+		// memory tile grid happens to be at the current zoom. Weakening it broadly (e.g. capping it to
+		// a fraction of `tile`) was tried and made *that* leak worse — it doesn't just affect the rare
+		// tile eroded on two opposite sides, it also shrinks the margin on the far more common tile
+		// eroded on only one side, where there was never any risk of collapsing to begin with. Only the
+		// two-opposite-sides case (a corridor/isolated tile narrower than twice this margin) needs
+		// scaling down, and `fitOpposingInsets` below does that alone, per axis, only when it's
+		// actually needed to keep the tile from vanishing — see its own doc comment.
 		const erosionInset = FOG_LEAK_INSET_PX / this.transform.zoom;
 
 		for (let by = by0; by <= by1; by++) {
@@ -2554,10 +2899,16 @@ export class MapCanvas {
 				const right = (bx + 1) * tile + jitterX + overlap;
 				const top = by * tile + jitterY - overlap;
 				const bottom = (by + 1) * tile + jitterY + overlap;
-				const x0 = isRevealedTile(bx - 1, by) ? left : left + erosionInset;
-				const x1 = isRevealedTile(bx + 1, by) ? right : right - erosionInset;
-				const y0 = isRevealedTile(bx, by - 1) ? top : top + erosionInset;
-				const y1 = isRevealedTile(bx, by + 1) ? bottom : bottom - erosionInset;
+				const westInset = isRevealedTile(bx - 1, by) ? 0 : erosionInset;
+				const eastInset = isRevealedTile(bx + 1, by) ? 0 : erosionInset;
+				const northInset = isRevealedTile(bx, by - 1) ? 0 : erosionInset;
+				const southInset = isRevealedTile(bx, by + 1) ? 0 : erosionInset;
+				const [insetW, insetE] = this.fitOpposingInsets(westInset, eastInset, right - left);
+				const [insetN, insetS] = this.fitOpposingInsets(northInset, southInset, bottom - top);
+				const x0 = left + insetW;
+				const x1 = right - insetE;
+				const y0 = top + insetN;
+				const y1 = bottom - insetS;
 				exploredPath.rect(x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0));
 			}
 		}
@@ -2625,9 +2976,11 @@ export class MapCanvas {
 		const fogActive = this.fogCurrentlyVisible();
 		const group = this.draggingTokenGroup;
 		const groupIds = group ? new Set(group.entries.map((e) => e.token.id)) : null;
+		const animatingIds = this.pathAnimation ? new Set(this.pathAnimation.routes.map((r) => r.tokenId)) : null;
 		for (const token of data.tokens) {
 			if (this.draggingToken?.token.id === token.id) continue;
 			if (groupIds?.has(token.id)) continue;
+			if (animatingIds?.has(token.id)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
 			const center = this.footprintCenter(token);
 			if (fogActive && !isPlayer && !this.isEntityRevealedByFog(center)) continue;
@@ -2644,6 +2997,19 @@ export class MapCanvas {
 				this.drawToken(ctx, entry.originWorld.x + dx, entry.originWorld.y + dy, entry.token, true);
 			}
 		}
+		// "Animation" token movement mode: drawn at each route's current interpolated position/facing
+		// (see `startPathAnimation`) rather than the token's own still-uncommitted `cellKey`/`x,y` —
+		// same "override the render, leave the data alone until it's dropped" precedent as
+		// `draggingToken`/`draggingTokenGroup` above, including ignoring fog (a GM sees their own
+		// in-flight move regardless — see those two for the same choice).
+		if (this.pathAnimation) {
+			for (const route of this.pathAnimation.routes) {
+				const token = data.tokens.find((t) => t.id === route.tokenId);
+				const pose = this.currentAnimatedPose(route.tokenId);
+				if (!token || !pose) continue;
+				this.drawToken(ctx, pose.center.x, pose.center.y, { ...token, rotation: pose.direction }, true);
+			}
+		}
 	}
 
 	/**
@@ -2654,6 +3020,25 @@ export class MapCanvas {
 	 */
 	private footprintCenter(token: Token): { x: number; y: number } {
 		return fogFootprintCenter(this.controller.getData(), token);
+	}
+
+	/**
+	 * `token`'s live interpolated position/facing if it's currently mid an "Animation" token-movement
+	 * tween (`pathAnimation`), else `null` — a single source of truth for "where does this token
+	 * actually read as being *right now*, tween or not", shared by the token's own draw call, the fog
+	 * vision cache (`frameVisionCache`, so it unlocks fog as the tween runs rather than only once it
+	 * commits), and `isEntityRevealedByFog`'s proximity check (so a moving player also reveals nearby
+	 * entities live, not just once it stops).
+	 */
+	private currentAnimatedPose(tokenId: string): { center: Point; direction: number } | null {
+		const route = this.pathAnimation?.routes.find((r) => r.tokenId === tokenId);
+		if (!route) return null;
+		const elapsed = performance.now() - (this.pathAnimation?.startedAt ?? 0);
+		const arc = clamp(elapsed * (this.pathAnimation?.speedWorldPerMs ?? 0), 0, route.totalLength);
+		const center = pointAtArcLength(route.points, route.cumulative, arc);
+		const token = this.controller.findToken(tokenId);
+		const direction = directionAtArcLength(route.points, route.cumulative, arc) ?? token?.rotation ?? 0;
+		return { center, direction };
 	}
 
 	private tokenRadius(token: Token): number {
@@ -2800,6 +3185,22 @@ export class MapCanvas {
 		ctx.beginPath();
 		ctx.moveTo(tail.x, tail.y);
 		ctx.lineTo(this.wallPreview.x, this.wallPreview.y);
+		ctx.stroke();
+		ctx.restore();
+	}
+
+	/** The "Animation" mode's in-progress path trace (`drawingPath`) — a dashed line, own color so it doesn't read as a wall (see `drawWallPreview`, same dash/line-width scaling conventions). */
+	private drawPathPreview(ctx: CanvasRenderingContext2D): void {
+		const points = this.drawingPath?.points;
+		if (!points || points.length < 2) return;
+		ctx.save();
+		ctx.strokeStyle = "rgba(37, 99, 235, 0.9)";
+		ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
+		ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
+		ctx.lineJoin = "round";
+		ctx.lineCap = "round";
+		ctx.beginPath();
+		points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
 		ctx.stroke();
 		ctx.restore();
 	}

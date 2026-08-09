@@ -1105,6 +1105,17 @@ export class MapController {
 		});
 	}
 
+	/** Bulk-sets specific tokens' `rotation` in one shot, keyed by id — used by `MapCanvas`'s animated token-movement feature to commit each token's final facing (see its `finishPathAnimation`) alongside its final position, both wrapped in the same `beginHistoryGroup`/`endHistoryGroup` so the whole animated move undoes as one step. */
+	setTokenRotations(rotations: Map<string, number>): void {
+		if (rotations.size === 0) return;
+		this.update((data) => {
+			for (const token of data.tokens) {
+				const rotation = rotations.get(token.id);
+				if (rotation !== undefined) token.rotation = rotation;
+			}
+		});
+	}
+
 	removeToken(tokenId: string): void {
 		this.update((data) => {
 			data.tokens = data.tokens.filter((t) => t.id !== tokenId);

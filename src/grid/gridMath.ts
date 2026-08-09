@@ -290,6 +290,72 @@ export function projectOntoSegment(x: number, y: number, a: Point, b: Point): Po
 	return { x: a.x + t * abx, y: a.y + t * aby };
 }
 
+// ---------------- Polyline arc-length math (animated token-movement path following) ----------------
+
+/** Running arc length at each point of `points` (same length — `[0]` is always 0). Feeds `pointAtArcLength`/`directionAtArcLength`/`truncatePolyline` below, which all take this alongside `points` rather than recomputing it themselves. */
+export function polylineCumulativeLengths(points: Point[]): number[] {
+	const out: number[] = [0];
+	let total = 0;
+	for (let i = 1; i < points.length; i++) {
+		const a = points[i - 1];
+		const b = points[i];
+		if (a && b) total += Math.hypot(b.x - a.x, b.y - a.y);
+		out.push(total);
+	}
+	return out;
+}
+
+/** The straddling segment index `i` (so the point lies between `points[i]` and `points[i + 1]`) for arc length `arc`, clamped to the polyline's own span. Shared by `pointAtArcLength`/`directionAtArcLength`. */
+function segmentIndexAtArcLength(cumulative: number[], arc: number): number {
+	const total = cumulative[cumulative.length - 1] ?? 0;
+	const clamped = clamp(arc, 0, total);
+	let i = 0;
+	while (i < cumulative.length - 2 && (cumulative[i + 1] ?? 0) < clamped) i++;
+	return i;
+}
+
+/** Point on the polyline at `arc` (clamped to `[0, total length]`), linearly interpolated between the two points straddling it. `cumulative` must be `polylineCumulativeLengths(points)`. `points` must have at least one point. */
+export function pointAtArcLength(points: Point[], cumulative: number[], arc: number): Point {
+	const first = points[0];
+	if (!first || points.length === 1) return first ?? { x: 0, y: 0 };
+	const i = segmentIndexAtArcLength(cumulative, arc);
+	const a = points[i];
+	const b = points[i + 1];
+	if (!a || !b) return a ?? first;
+	const segLen = (cumulative[i + 1] ?? 0) - (cumulative[i] ?? 0);
+	const t = segLen > 0 ? clamp((clamp(arc, 0, cumulative[cumulative.length - 1] ?? 0) - (cumulative[i] ?? 0)) / segLen, 0, 1) : 0;
+	return { x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) };
+}
+
+/**
+ * Direction (degrees, 0 = east, increasing clockwise — same convention as `Token.rotation`; the
+ * canvas' own y-down coordinate space means a plain `atan2(dy, dx)` already reads clockwise, no
+ * sign flip needed) the polyline is heading at `arc` — the straddling segment's own bearing.
+ * `null` only if every point coincides (nothing to point toward at all).
+ */
+export function directionAtArcLength(points: Point[], cumulative: number[], arc: number): number | null {
+	if (points.length < 2) return null;
+	const i = segmentIndexAtArcLength(cumulative, arc);
+	const a = points[i];
+	const b = points[i + 1];
+	if (!a || !b) return null;
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	if (dx === 0 && dy === 0) return null;
+	return (Math.atan2(dy, dx) * 180) / Math.PI;
+}
+
+/** `points` truncated to its first `arc` world units of length (clamped to its own total length) — the cut itself lands exactly on the interpolated point, not just the nearest sampled one. */
+export function truncatePolyline(points: Point[], cumulative: number[], arc: number): Point[] {
+	if (points.length === 0) return [];
+	const total = cumulative[cumulative.length - 1] ?? 0;
+	const clamped = clamp(arc, 0, total);
+	const i = segmentIndexAtArcLength(cumulative, clamped);
+	const kept = points.slice(0, i + 1);
+	kept.push(pointAtArcLength(points, cumulative, clamped));
+	return kept;
+}
+
 /** Corner (priority 0), midpoint (priority 1) and nearest-projected-point (priority 2) candidates for each edge of a closed polygon (`corners`, in order). */
 function polygonSnapCandidates(corners: Point[], x: number, y: number): SnapCandidate[] {
 	const candidates: SnapCandidate[] = corners.map((c) => ({ x: c.x, y: c.y, priority: 0 }));

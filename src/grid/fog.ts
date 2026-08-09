@@ -231,13 +231,18 @@ function traceRays(
  * (`token.rotation` — see `drawTokenFacingArrow`), full angle `token.visionAngle` — a player's
  * vision is tied to their token's facing, not a separate value, so turning the token turns what it
  * can see. Purely geometric (world units) — no cosmetic tremble, see `VisionRays`.
+ *
+ * `pose`, when given, overrides where the cone is cast from/toward instead of the token's own
+ * committed `cellKey`/`x,y`/`rotation` — used by `MapCanvas` to keep fog reveal following a token's
+ * live interpolated position during the "Animation" token-movement tween instead of jumping only
+ * once the move commits (see `MapCanvas.currentAnimatedPose`).
  */
-export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[]): VisionRays {
-	const center = footprintCenter(data, token);
+export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
+	const center = pose?.center ?? footprintCenter(data, token);
 	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
 	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
-	const direction = token.rotation ?? DEFAULT_TOKEN_ROTATION;
+	const direction = pose?.direction ?? token.rotation ?? DEFAULT_TOKEN_ROTATION;
 	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
 	return { center, rays: traceRays(center, radius, range, halfAngle, direction, wallSegments, wallAdjacency) };
 }

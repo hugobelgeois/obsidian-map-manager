@@ -7,7 +7,7 @@ import { registerMirrorSource } from "../platform/mirrorRegistry";
 import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
-import { MapCanvas } from "../render/MapCanvas";
+import { MapCanvas, PathAnimationRoute } from "../render/MapCanvas";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
 
@@ -27,6 +27,8 @@ export class MapView extends TextFileView {
 	private scrollListeners: Set<(scrollTop: number) => void> = new Set();
 	/** Player mirror windows subscribed to this view's "look here" pings via `registerMirrorSource`'s `onPing`. */
 	private pingListeners: Set<(x: number, y: number) => void> = new Set();
+	/** Player mirror windows subscribed to this view's "Animation" token-movement tweens via `registerMirrorSource`'s `onPathAnimationStart`. */
+	private pathAnimationListeners: Set<(routes: PathAnimationRoute[], speedWorldPerMs: number) => void> = new Set();
 	private rootEl: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
@@ -110,6 +112,9 @@ export class MapView extends TextFileView {
 			onPing: (x, y) => {
 				for (const cb of this.pingListeners) cb(x, y);
 			},
+			onPathAnimation: (routes, speedWorldPerMs) => {
+				for (const cb of this.pathAnimationListeners) cb(routes, speedWorldPerMs);
+			},
 		});
 		if (this.file) {
 			this.unregisterMirror = registerMirrorSource(this.file.path, {
@@ -126,6 +131,10 @@ export class MapView extends TextFileView {
 				onPing: (cb) => {
 					this.pingListeners.add(cb);
 					return () => this.pingListeners.delete(cb);
+				},
+				onPathAnimationStart: (cb) => {
+					this.pathAnimationListeners.add(cb);
+					return () => this.pathAnimationListeners.delete(cb);
 				},
 			});
 		}
