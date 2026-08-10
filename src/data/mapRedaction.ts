@@ -7,18 +7,25 @@ import { CELLED_GRID_TYPES, CellsByGridType, Layer, MapFileData } from "./mapDat
  * no vault access, safe to run outside Obsidian too.
  *
  * Rules (confirmed with the map's owner):
- * - `fogEnabled === false` → nothing is redacted, the whole map is exported as-is.
+ * - `fogEnabled === false` → nothing is redacted, the whole map is exported as-is — except "light"
+ *   tokens (see below), which are never exported regardless of fog.
  * - cell content (zone/stamp/label/links) → kept only if the cell's center was ever explored.
  * - markers (stamps) → kept if explored OR currently within a player's vision.
  * - "entity" tokens → kept only if currently within a player's vision (even if the ground under
  *   them was explored before — they can walk back out of sight).
  * - "player" tokens → always kept.
+ * - "light" tokens → never kept, fog on or off: a pure light fixture, not something a player ever
+ *   sees directly — same rule as the live player-mirror canvas (`MapCanvas.isLightTokenHiddenFromMirror`).
+ *   Its actual `lightRadius` effect (hiding fog, revealing nearby entities) is a live-view-only
+ *   concept, deliberately not reflected here — this snapshot's own vision (`isLitWorld` below) still
+ *   comes from real player vision alone, same as `Token.visionRadius`'s own scope decision.
  * - wall points/segments → always stripped: the public viewer never re-traces vision (it just
  *   paints the exported `exploredCells` as a static mask), and keeping wall geometry around would
  *   otherwise leak the shape of unexplored rooms.
  */
 export function buildPublicSnapshot(data: MapFileData): MapFileData {
 	const clone = structuredClone(data);
+	clone.tokens = clone.tokens.filter((token) => (token.category ?? "entity") !== "light");
 	if (!clone.fogEnabled) return clone;
 
 	const exploredSet = new Set(clone.exploredCells);

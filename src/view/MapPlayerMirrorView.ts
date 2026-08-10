@@ -15,9 +15,17 @@ export const VIEW_TYPE_MAP_PLAYER_MIRROR = "map-manager-player-mirror-view";
  * otherwise touch `MapController`. Fog here follows its own toggle, independent of the source's own
  * fog setting (see `MapCanvasOptions.forceFog`/`MapController.playerMirrorFogEnabled`), and entity
  * token vision zones only show here while the GM has separately opted in (both toggled from the
- * player-window dropdown in `Toolbar`, defaulting to fog-on/vision-off). The InfoPanel itself only appears here while the GM has
+ * player-window dropdown in `Toolbar`, defaulting to fog-on/vision-off) — this is also the only
+ * canvas where fog actually hides entity tokens at all; the GM's own source canvas always shows
+ * every one of them (see `MapCanvas.entitiesHiddenByFog`). "light" category tokens never render
+ * here regardless of any of that (`MapCanvas.isLightTokenHiddenFromMirror`) — only their light
+ * itself is ever felt by a player. The InfoPanel itself only appears here while the GM has
  * it toggled on (the "eye" button in `InfoPanel`, `MapController.showInfoToPlayers`) — since that
  * flag and the current selection both live on the shared controller, this just mirrors it live too.
+ * It's also the one InfoPanel instance built with `forPlayers: true`, so regardless of what the GM's
+ * own copy of that same selection would show them (full edit controls, or the reduced-but-still-GM-facing
+ * "Vue" panel — see `InfoPanel.renderPlayerPanel`), this one only ever shows a selected token's stat
+ * block and tabs, nothing else.
  */
 export class MapPlayerMirrorView extends ItemView {
 	private filePath: string | null = null;
@@ -106,7 +114,7 @@ export class MapPlayerMirrorView extends ItemView {
 			this.infoPanelComp = new InfoPanel(
 				this.bodyEl,
 				this.app,
-				{ assetsFolder: this.plugin.settings.assetsFolder, settings: this.plugin.settings },
+				{ assetsFolder: this.plugin.settings.assetsFolder, settings: this.plugin.settings, forPlayers: true },
 				this.controller
 			);
 			this.unsubscribeScroll = this.source.onScrollChange((scrollTop) => this.infoPanelComp?.setScrollTop(scrollTop));

@@ -1,7 +1,7 @@
 import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { FogAnimationMode, MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, DEFAULT_VISION_RADIUS, Marker, Token, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, resolveEyeCones, squareKey } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, DEFAULT_VISION_RADIUS, Marker, Token, WallPoint, WallSegment, hexKey, isCellEmpty, parseCellKey, resolveEyeCones, resolveLightRadius, squareKey } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
@@ -34,6 +34,7 @@ import {
 	ResolvedWallSegment,
 	VisionRays,
 	castEntityConeRays,
+	castLightRays,
 	castVisionRays,
 	cellCenter as fogCellCenter,
 	cellVisualWidth as fogCellVisualWidth,
@@ -287,6 +288,15 @@ export class MapCanvas {
 
 	/** Every player token's traced vision rays, recomputed once per `render()` and reused by both `drawFog` and `drawTokens`. */
 	private frameVisionCache: PlayerVisionRays[] = [];
+	/**
+	 * Every token's (any category) traced `lightRadius` reach, recomputed once per `render()` —
+	 * mirrors `frameVisionCache` but for `Token.lightRadius` instead of a player's own vision cone.
+	 * Reused by `drawFog` (to hide fog without writing to `exploredCells` — see `drawFog`'s doc
+	 * comment) and `isEntityRevealedByFog` (so a lit entity is noticed regardless of any player's own
+	 * vision). Wall-aware (`castLightRays`), unlike the plain distance check `visionRadius`'s own
+	 * "rayon exploré" fallback still uses.
+	 */
+	private frameLightCache: PlayerVisionRays[] = [];
 
 	/**
 	 * Memoizes the actual (expensive) ray/wall tracing behind `castRaysForToken`/`castEntityConeVision`,
@@ -299,6 +309,8 @@ export class MapCanvas {
 	 */
 	private playerVisionRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 	private entityConeRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
+	/** Same memoization as `playerVisionRaysCache`, for `castLightRaysForToken` — keyed by token id, any category. */
+	private lightRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 
 	/** Offscreen buffer fog is composited on before being drawn onto the main canvas as one image — see the constructor comment. */
 	private fogCanvas: HTMLCanvasElement = document.createElement("canvas");
@@ -874,12 +886,14 @@ export class MapCanvas {
 	 * Same fog-visibility rule as `findTokenAtScreenPoint` — irrelevant to the edit-mode select tool
 	 * (fog is never active there), but view mode's Shift-drag marquee reuses this too, so a GM's
 	 * marquee can't scoop up an entity currently hidden by fog that a plain click on it couldn't
-	 * have selected either.
+	 * have selected either. Only actually gates anything on the player-mirror canvas — see
+	 * `entitiesHiddenByFog`.
 	 */
 	private tokensInRect(rect: { minX: number; maxX: number; minY: number; maxY: number }): string[] {
 		const out: string[] = [];
-		const fogActive = this.fogCurrentlyVisible();
+		const fogActive = this.entitiesHiddenByFog();
 		for (const token of this.controller.getData().tokens) {
+			if (this.isLightTokenHiddenFromMirror(token)) continue;
 			const c = this.footprintCenter(token);
 			if (c.x < rect.minX || c.x > rect.maxX || c.y < rect.minY || c.y > rect.maxY) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
@@ -1760,11 +1774,12 @@ export class MapCanvas {
 	private findTokenAtScreenPoint(px: number, py: number): Token | null {
 		const world = screenToWorld(px, py, this.transform);
 		const data = this.controller.getData();
-		const fogActive = this.fogCurrentlyVisible();
+		const fogActive = this.entitiesHiddenByFog();
 		const tokens = data.tokens;
 		for (let i = tokens.length - 1; i >= 0; i--) {
 			const token = tokens[i];
 			if (!token) continue;
+			if (this.isLightTokenHiddenFromMirror(token)) continue;
 			const center = this.footprintCenter(token);
 			if (Math.hypot(world.x - center.x, world.y - center.y) > this.tokenRadius(token)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
@@ -2090,6 +2105,29 @@ export class MapCanvas {
 	}
 
 	/**
+	 * Whether fog should currently hide *entity* tokens from view (`findTokenAtScreenPoint`/
+	 * `tokensInRect`/`drawTokens`) — unlike the fog overlay itself (`fogCurrentlyVisible`, which the
+	 * GM's own canvas also draws, so they can track explored/unexplored ground and player vision),
+	 * entity-hiding only ever applies on the actual player-facing mirror canvas (`isMirror`, see
+	 * `MapPlayerMirrorView`): the GM always sees every entity token on their own canvas regardless of
+	 * fog, player vision, or `lightRadius`.
+	 */
+	private entitiesHiddenByFog(): boolean {
+		return this.isMirror && this.fogCurrentlyVisible();
+	}
+
+	/**
+	 * A "light" category token is a pure light fixture, never a piece on the board — invisible on the
+	 * player-facing mirror canvas unconditionally (fog on or off, lit or not, unlike an entity's own
+	 * fog-gated visibility), while still fully visible/selectable on the GM's own canvas so it can be
+	 * placed and moved. Its `lightRadius` effect itself is unaffected either way — this only gates the
+	 * token's own on-canvas marker (`drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`).
+	 */
+	private isLightTokenHiddenFromMirror(token: Token): boolean {
+		return this.isMirror && (token.category ?? "entity") === "light";
+	}
+
+	/**
 	 * The active fog tremble mode right now: the setting has to be something other than "none", and
 	 * zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a render every
 	 * frame while zoomed out that far is the one combination that's shown fog visibly breaking near
@@ -2186,8 +2224,14 @@ export class MapCanvas {
 				.getData()
 				.tokens.filter((t) => (t.category ?? "entity") === "player")
 				.map((t) => this.castRaysForToken(t, wallSegments, this.currentAnimatedPose(t.id) ?? undefined));
+			// Any token, any category, with an effective light radius > 0 — see `frameLightCache`'s own doc comment.
+			this.frameLightCache = this.controller
+				.getData()
+				.tokens.filter((t) => resolveLightRadius(t) > 0)
+				.map((t) => this.castLightRaysForToken(t, wallSegments, this.currentAnimatedPose(t.id) ?? undefined));
 		} else {
 			this.frameVisionCache = [];
+			this.frameLightCache = [];
 		}
 
 		this.drawBackgrounds(ctx);
@@ -2341,6 +2385,16 @@ export class MapCanvas {
 		return { center, rays, phase: tremblePhase(token.id) };
 	}
 
+	/** Same idea as `castRaysForToken`, for a token's `lightRadius` reach (`castLightRays`, any category) — see `drawTokenLightZones`/`drawFog`'s `frameLightCache` use. */
+	private castLightRaysForToken(token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): PlayerVisionRays {
+		if (pose) return { ...castLightRays(this.controller.getData(), token, wallSegments, pose), phase: tremblePhase(token.id) };
+		const version = this.controller.dataVersion;
+		const cached = this.lightRaysCache.get(token.id);
+		const { center, rays } = cached && cached.version === version ? cached.result : castLightRays(this.controller.getData(), token, wallSegments);
+		if (!cached || cached.version !== version) this.lightRaysCache.set(token.id, { version, result: { center, rays } });
+		return { center, rays, phase: tremblePhase(token.id) };
+	}
+
 	/** Same idea as `castRaysForToken`, for one of an entity's `resolveEyeCones` cones — see `drawEntityEyeCones`. */
 	private castEntityConeVision(token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
 		const version = this.controller.dataVersion;
@@ -2410,15 +2464,18 @@ export class MapCanvas {
 	}
 
 	/**
-	 * Whether an entity token at `center` should be shown despite fog: either the ordinary raycast
-	 * reach (`isLitByCache`, walls included) or, on top of that, simply standing within any player
-	 * token's own "rayon exploré" (`visionRadius`) — a straight-line distance check, walls or not, so
-	 * something right next to a player is always noticed even through a partial wall the raycast rule
-	 * itself would otherwise still dim/block at a distance. Callers still gate this on `fogActive` and
-	 * `!isPlayer` themselves — see `drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
+	 * Whether an entity token at `center` should be shown despite fog: the ordinary raycast reach
+	 * (`isLitByCache` against `frameVisionCache`, walls included), or simply standing within any
+	 * player token's own "rayon exploré" (`visionRadius`) — a straight-line distance check, walls or
+	 * not, so something right next to a player is always noticed even through a partial wall the
+	 * raycast rule itself would otherwise still dim/block at a distance — or standing within any
+	 * token's (any category) traced `lightRadius` reach (`isLitByCache` against `frameLightCache`),
+	 * which unlike the other two *does* stop at a wall (see `castLightRays`). Callers still gate this
+	 * on `fogActive` and `!isPlayer` themselves — see `drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
 	 */
 	private isEntityRevealedByFog(center: { x: number; y: number }): boolean {
 		if (this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) return true;
+		if (this.isLitByCache(this.frameLightCache, center.x, center.y, false)) return true;
 		const cellSize = this.cellVisualWidth();
 		for (const player of this.controller.getData().tokens) {
 			if ((player.category ?? "entity") !== "player") continue;
@@ -2469,7 +2526,10 @@ export class MapCanvas {
 	 * this always drew (`castVisionRays`, `dimEnd` — reaches past a "dim"/partial wall, matching what
 	 * its real fog memory would eventually show once explored); an entity token instead draws both of
 	 * `resolveEyeCones`'s cones via `drawEntityEyeCones`, each using `clearEnd` — an entity has no
-	 * fog-memory concept, so a "partial" wall stops its sight exactly like an opaque one.
+	 * fog-memory concept, so a "partial" wall stops its sight exactly like an opaque one. Either
+	 * category also gets `drawTokenLightZones`'s amber wall-aware fan underneath when it has a
+	 * `lightRadius` set — see `Token.lightRadius`/`isEntityRevealedByFog`/`drawFog`'s `frameLightCache`
+	 * use for the actual reveal rule this previews.
 	 */
 	private drawTokenVisionZones(ctx: CanvasRenderingContext2D): void {
 		const wallSegments = this.resolveWallSegments();
@@ -2477,19 +2537,53 @@ export class MapCanvas {
 		if (this.effectiveMode() === "edit") {
 			const selected = this.controller.getData().tokens.find((t) => t.id === this.controller.selectedTokenId);
 			if (!selected) return;
-			if ((selected.category ?? "entity") === "entity") {
+			this.drawTokenLightZones([selected], wallSegments, ctx);
+			const category = selected.category ?? "entity";
+			// "light" tokens have no vision/eye-cone shape of their own — only `drawTokenLightZones`
+			// above applies to them (see `Token.category`'s doc comment).
+			if (category === "entity") {
 				this.drawEntityEyeCones([selected], wallSegments, ctx);
-				return;
+			} else if (category === "player") {
+				const path = new Path2D();
+				this.appendVisionFan(path, this.castRaysForToken(selected, wallSegments), true, "none", 0);
+				ctx.fillStyle = MapCanvas.PLAYER_VISION_ZONE_COLOR;
+				ctx.fill(path);
 			}
-			const path = new Path2D();
-			this.appendVisionFan(path, this.castRaysForToken(selected, wallSegments), true, "none", 0);
-			ctx.fillStyle = MapCanvas.PLAYER_VISION_ZONE_COLOR;
-			ctx.fill(path);
 			return;
 		}
 
-		const entities = this.controller.getData().tokens.filter((t) => (t.category ?? "entity") === "entity");
-		this.drawEntityEyeCones(entities, wallSegments, ctx);
+		const allTokens = this.controller.getData().tokens;
+		this.drawTokenLightZones(allTokens, wallSegments, ctx);
+		this.drawEntityEyeCones(
+			allTokens.filter((t) => (t.category ?? "entity") === "entity"),
+			wallSegments,
+			ctx
+		);
+	}
+
+	/** Translucent fill color for a token's own `lightRadius` preview — warm/amber, distinct from the vision-cone red/blue so it reads as "light" rather than "sight". */
+	private static readonly TOKEN_LIGHT_ZONE_COLOR = "rgba(250, 204, 21, 0.2)";
+
+	/**
+	 * Wall-aware (`castLightRaysForToken`/`castLightRays`, blocked by opaque and "dim" walls alike)
+	 * fan preview of every `tokens` token's `lightRadius`, any category — batched into a single
+	 * `Path2D`/fill regardless of how many tokens are on screen, same as `drawEntityEyeCones`. Tokens
+	 * with no light radius set contribute nothing. This is the exact shape `drawFog` also punches
+	 * through the real fog overlay for (see `frameLightCache`), just drawn as a GM preview instead —
+	 * live-tracking a token's `currentAnimatedPose` during an in-flight move the same way.
+	 */
+	private drawTokenLightZones(tokens: Token[], wallSegments: ResolvedWallSegment[], ctx: CanvasRenderingContext2D): void {
+		const path = new Path2D();
+		let any = false;
+		for (const token of tokens) {
+			if (resolveLightRadius(token) <= 0) continue;
+			any = true;
+			const vision = this.castLightRaysForToken(token, wallSegments, this.currentAnimatedPose(token.id) ?? undefined);
+			this.appendVisionFan(path, vision, false, "none", 0);
+		}
+		if (!any) return;
+		ctx.fillStyle = MapCanvas.TOKEN_LIGHT_ZONE_COLOR;
+		ctx.fill(path);
 	}
 
 	/**
@@ -2557,6 +2651,9 @@ export class MapCanvas {
 	 * - Current live vision keeps its natural round/fan shape: the same precise, ungridded polygon
 	 *   `drawFog` itself traces (`appendVisionFan`, unanimated) — snapping *this* part to cells too
 	 *   would stair-step the field of view's own outline along the grid instead of leaving it smooth.
+	 * - Current `lightRadius` reach (`frameLightCache`) is unioned in the same way as vision, for the
+	 *   same reason: a wall standing at the edge of a lit-but-not-actually-seen area still needs its
+	 *   shadow patch skipped there, or the blackout would visibly punch a hole back into the light.
 	 *
 	 * Deliberately independent of `drawFog`'s own drawing (no jitter/tremble, no `markExplored` side
 	 * effect — that stays `drawFog`'s alone).
@@ -2604,6 +2701,9 @@ export class MapCanvas {
 		}
 
 		for (const vision of this.frameVisionCache) this.appendVisionFan(path, vision, true, "none", 0);
+		// A wall standing inside a light's own (already wall-blocked) reach must not get its shadow
+		// patch redrawn over that same light — see `frameLightCache`.
+		for (const vision of this.frameLightCache) this.appendVisionFan(path, vision, true, "none", 0);
 		return path;
 	}
 
@@ -2771,12 +2871,18 @@ export class MapCanvas {
 	/**
 	 * Renders fog as: a coarse "ever explored" memory layer (square buckets, independent of grid
 	 * type/shape — see `FOG_BUCKET_SCALE`), with each player's traced vision fan punched out on top
-	 * (fully lit within `clearEnd`, dimmed-but-visible out to `dimEnd`). No per-grid-cell shape work.
-	 * Draws onto the offscreen fog buffer (see `renderFogLayer`), never the main canvas directly.
+	 * (fully lit within `clearEnd`, dimmed-but-visible out to `dimEnd`), then every token's
+	 * `lightRadius` fan (`frameLightCache`) punched fully transparent on top of *that* — a light
+	 * hides the fog exactly like being seen would, but deliberately never joins `newlyExplored` below,
+	 * so it never gets written to `exploredCells`: unlike real vision, its reveal is temporary and
+	 * disappears the moment the light source moves on or its `lightRadius` drops back to 0 (see
+	 * `Token.lightRadius`'s own doc comment). No per-grid-cell shape work. Draws onto the offscreen
+	 * fog buffer (see `renderFogLayer`), never the main canvas directly.
 	 */
 	private drawFog(ctx: CanvasRenderingContext2D, rect: { minX: number; minY: number; maxX: number; maxY: number }): void {
 		const exploredSet = this.controller.getExploredSet();
 		const cache = this.frameVisionCache;
+		const lightCache = this.frameLightCache;
 		const baseBucket = this.fogBucketSize();
 		const tile = this.fogIterationBucketSize(rect);
 		const mode = this.activeFogAnimationMode();
@@ -2966,14 +3072,31 @@ export class MapCanvas {
 			ctx.fillStyle = "rgba(0, 0, 0, 1)";
 			ctx.fill(clearFan);
 		}
+
+		if (lightCache.length > 0) {
+			// A single tier, always fully see-through — unlike a player's own vision, a light source
+			// has no "explored/dim" memory tint to fall back to once it moves on: it's either
+			// currently reaching a point or it isn't. Same anti-bleed `dimInset` idea as the vision fan
+			// above, so a wall-blocked light's own blurred edge can't visibly bleed past the wall it
+			// already stopped at (`castLightRays`).
+			const lightFan = new Path2D();
+			const lightInset = FOG_LEAK_INSET_PX / this.transform.zoom;
+			for (const vision of lightCache) this.appendVisionFan(lightFan, vision, false, mode, time, lightInset);
+			ctx.globalCompositeOperation = "destination-out";
+			ctx.fillStyle = "rgba(0, 0, 0, 1)";
+			ctx.fill(lightFan);
+		}
 		ctx.restore();
 
+		// `newlyExplored`/`markExplored` are driven only by `cache` (real player vision) above — never
+		// by `lightCache` — so a light source hides the fog for as long as it's around without ever
+		// writing to `exploredCells` (see `Token.lightRadius`'s own doc comment).
 		if (newlyExplored.length > 0) this.controller.markExplored(newlyExplored);
 	}
 
 	private drawTokens(ctx: CanvasRenderingContext2D): void {
 		const data = this.controller.getData();
-		const fogActive = this.fogCurrentlyVisible();
+		const fogActive = this.entitiesHiddenByFog();
 		const group = this.draggingTokenGroup;
 		const groupIds = group ? new Set(group.entries.map((e) => e.token.id)) : null;
 		const animatingIds = this.pathAnimation ? new Set(this.pathAnimation.routes.map((r) => r.tokenId)) : null;
@@ -2981,6 +3104,7 @@ export class MapCanvas {
 			if (this.draggingToken?.token.id === token.id) continue;
 			if (groupIds?.has(token.id)) continue;
 			if (animatingIds?.has(token.id)) continue;
+			if (this.isLightTokenHiddenFromMirror(token)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
 			const center = this.footprintCenter(token);
 			if (fogActive && !isPlayer && !this.isEntityRevealedByFog(center)) continue;
@@ -3045,7 +3169,40 @@ export class MapCanvas {
 		return this.cellVisualWidth() * (token.size ?? 1) * TOKEN_SIZE_RATIO;
 	}
 
+	/** Fixed glyph/color for every "light" category token's own marker — see `drawLightToken`. */
+	private static readonly LIGHT_TOKEN_ICON = "💡";
+	private static readonly LIGHT_TOKEN_FILL = "rgba(250, 204, 21, 0.92)";
+	private static readonly LIGHT_TOKEN_BORDER = "#a16207";
+
+	/**
+	 * A "light" category token's own on-canvas marker — GM canvas only, see
+	 * `isLightTokenHiddenFromMirror`/`drawTokens` for why it never reaches here on the player-facing
+	 * mirror. Deliberately ignores every per-token customization `drawToken` would otherwise draw
+	 * (`icon`/`image`/`label`/`color`/`rotation`): a light token has none of those to configure to
+	 * begin with (see `Token.category`'s own doc comment on why it's the one category with nothing to
+	 * set beyond `lightRadius`), so its marker is always this same fixed glyph.
+	 */
+	private drawLightToken(ctx: CanvasRenderingContext2D, cx: number, cy: number, token: Token, selected: boolean): void {
+		const r = this.tokenRadius(token);
+		ctx.beginPath();
+		ctx.arc(cx, cy, r, 0, Math.PI * 2);
+		ctx.fillStyle = MapCanvas.LIGHT_TOKEN_FILL;
+		ctx.fill();
+		ctx.lineWidth = selected ? Math.max(2.5, 4 / this.transform.zoom) : Math.max(1.5, 2.5 / this.transform.zoom);
+		ctx.strokeStyle = selected ? lightenColor(MapCanvas.LIGHT_TOKEN_BORDER, 0.55) : MapCanvas.LIGHT_TOKEN_BORDER;
+		ctx.stroke();
+		ctx.textAlign = "center";
+		ctx.textBaseline = "middle";
+		ctx.fillStyle = "#000000";
+		ctx.font = `${Math.max(10, r * 2 * 0.42)}px sans-serif`;
+		ctx.fillText(MapCanvas.LIGHT_TOKEN_ICON, cx, cy);
+	}
+
 	private drawToken(ctx: CanvasRenderingContext2D, cx: number, cy: number, token: Token, selected: boolean): void {
+		if ((token.category ?? "entity") === "light") {
+			this.drawLightToken(ctx, cx, cy, token, selected);
+			return;
+		}
 		const r = this.tokenRadius(token);
 		const diameter = r * 2;
 		const imageEntry = token.image ? this.tokenImages.get(token.id) : undefined;

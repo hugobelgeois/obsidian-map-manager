@@ -30,6 +30,7 @@ export async function extractLayerToNewMap(app: App, sourceFile: TFile, data: Ma
 		minZoom: data.minZoom,
 		maxZoom: data.maxZoom,
 		fogEnabled: data.fogEnabled,
+		fogFrozen: data.fogFrozen,
 		exploredCells: [],
 	};
 

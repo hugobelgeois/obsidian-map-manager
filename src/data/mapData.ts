@@ -91,7 +91,15 @@ export interface TokenTemplate {
 	defaultTabNames?: string[];
 }
 
-export type TokenCategory = "player" | "entity";
+/**
+ * "light" is a pure light fixture, not a character: it never renders on the player-facing mirror
+ * canvas at all (see `MapCanvas.isLightTokenHiddenFromMirror`) — only its `lightRadius` effect
+ * (hiding fog, revealing nearby entities) is ever felt there — and it has nothing to configure
+ * beyond `lightRadius` itself (no icon/image/name/rotation/size/color/template/tabs/vision — see
+ * `InfoPanel.renderTokenPanel`, which skips straight from the category picker to the light-radius
+ * field for this category).
+ */
+export type TokenCategory = "player" | "entity" | "light";
 
 /** One note tab on a player token (see `getTokenTabs`) — e.g. "Statistiques"/"Inventaire"/"Histoire", freely renamed/added/removed per token. */
 export interface TokenTab {
@@ -167,6 +175,36 @@ export interface Token {
 	/** Omnidirectional "always lit" radius, in cells, regardless of facing — shared by both categories, see `visionAngle` (player) and `resolveEyeCones` (entity). */
 	visionRadius?: number;
 	/**
+	 * Radius (in cells), any category, within which this token's own "light" reveals every entity
+	 * token inside it, even when none of them sit inside any player's vision cone — wall-aware
+	 * (opaque or "dim" alike; see `castLightRays` in `fog.ts`), unlike the walls-blind straight-line
+	 * `visionRadius` fallback it otherwise resembles (see `MapCanvas.isEntityRevealedByFog`). Also
+	 * visually hides the fog overlay whether or not a player can actually see that far (`drawFog`'s
+	 * `frameLightCache` punch), but deliberately never feeds `exploredCells`: the area goes dark
+	 * again the moment the light source moves away or is removed, unlike real vision. `0`/unset (the
+	 * default) means the token casts no light.
+	 */
+	lightRadius?: number;
+	/**
+	 * Whether this token's light is currently switched on — defaults to `true` (on) when unset, so
+	 * existing `lightRadius` values keep behaving exactly as they did before this field existed.
+	 * Deliberately separate from `lightRadius` itself so flipping it off/on (e.g. a torch being
+	 * doused/relit mid-session, editable in "Vue" mode too — see `InfoPanel.renderLightRadiusField`)
+	 * never loses the configured radius the way setting `lightRadius` back to `0` would. See
+	 * `resolveLightRadius`, the one place that actually combines this with `lightRadius`/
+	 * `lightRadiusLinkedToVision` into the effective reach everything else reads.
+	 */
+	lightEnabled?: boolean;
+	/**
+	 * Player-only: when `true`, the *effective* light radius (`resolveLightRadius`) always tracks
+	 * this token's own `visionRadius` ("rayon exploré") instead of its stored `lightRadius` — so a
+	 * player is exactly as visible as far as they can see. Toggled from the "🔗" button next to
+	 * `lightRadius` in `InfoPanel` (player tokens only — an entity/light token has no "rayon exploré"
+	 * concept worth linking to). `lightRadius` itself is left untouched while linked (dormant, not
+	 * overwritten) so unlinking has something sensible to fall back to.
+	 */
+	lightRadiusLinkedToVision?: boolean;
+	/**
 	 * Entity-only: how far each of the token's two eye cones sits from its facing (`rotation`), in
 	 * degrees, one clockwise and one counter-clockwise — `0` (the default) puts both cones on top of
 	 * each other pointing straight ahead, like a single forward-facing cone; larger values spread
@@ -201,6 +239,9 @@ export const DEFAULT_VISION_ANGLE = 90;
 export const DEFAULT_VISION_RANGE = 6;
 export const DEFAULT_VISION_RADIUS = 1;
 export const DEFAULT_TOKEN_ROTATION = 0;
+
+/** Default `Token.lightRadius` — `0` means the entity casts no light. */
+export const DEFAULT_LIGHT_RADIUS = 0;
 
 /** Default `Token.sideEyeAngle` — how far each of an entity's two eye cones sits from its facing, in degrees. `0` collapses them onto a single forward direction. See `resolveEyeCones`. */
 export const DEFAULT_SIDE_EYE_ANGLE = 0;
@@ -246,6 +287,32 @@ export function resolveEyeCones(token: Token): EntityEyeCone[] {
 		{ direction: facing - sideAngle, ...tierAngles },
 		{ direction: facing + sideAngle, ...tierAngles },
 	];
+}
+
+/**
+ * The radius `token`'s light is *configured* to use whenever it's switched on — a linked player
+ * token's own `visionRadius` ("rayon exploré", see `lightRadiusLinkedToVision`'s own doc comment)
+ * instead of its stored `lightRadius`, or `lightRadius` itself (defaulting to `DEFAULT_LIGHT_RADIUS`)
+ * otherwise. Deliberately ignores `lightEnabled` — see `resolveLightRadius`, which layers that gate
+ * on top — so a temporarily switched-off light still reports the number it'll come back on at
+ * (`InfoPanel.renderLightRadiusField`'s radius input reads this, not `resolveLightRadius`, so
+ * toggling the light off never makes that field flash to `0`).
+ */
+export function configuredLightRadius(token: Token): number {
+	if ((token.category ?? "entity") === "player" && token.lightRadiusLinkedToVision) {
+		return token.visionRadius ?? DEFAULT_VISION_RADIUS;
+	}
+	return token.lightRadius ?? DEFAULT_LIGHT_RADIUS;
+}
+
+/**
+ * The light radius actually in effect for `token` right now (cells) — `configuredLightRadius`,
+ * gated by `lightEnabled`. Every reader of a token's *actual* light (`castLightRays`, `MapCanvas`'s
+ * `frameLightCache`/`drawTokenLightZones`) calls this instead of reading `lightRadius` directly.
+ */
+export function resolveLightRadius(token: Token): number {
+	if (token.lightEnabled === false) return 0;
+	return configuredLightRadius(token);
 }
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
@@ -306,6 +373,16 @@ export interface MapFileData {
 	/** Fog of war, active in view mode only. */
 	fogEnabled: boolean;
 	/**
+	 * "Brouillard figé" ("frozen fog", toolbar fog dropdown): while `true`, `MapController.markExplored`
+	 * is a no-op — a player's own vision still lights up their immediate surroundings live exactly as
+	 * always (`MapCanvas`'s `frameVisionCache` punch-through doesn't read this at all), but none of it
+	 * gets written into `exploredCells` any more, so ground they've already walked back out of goes
+	 * dark again instead of staying revealed. Independent of `fogEnabled` itself (freezing while fog
+	 * is off does nothing observable) and of `Token.lightRadius` (which already never touched
+	 * `exploredCells` either way). Defaults to `false`.
+	 */
+	fogFrozen: boolean;
+	/**
 	 * "Ever explored" fog memory, as coarse world-space bucket keys ("bx,by") — not grid cells.
 	 * Fog is traced by ray/path tracing rather than tested per grid cell (see MapCanvas), and this
 	 * memory grid is deliberately coarser than the visible grid and independent of grid type/shape.
@@ -363,6 +440,7 @@ export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 		minZoom: clampZoomSetting(defaults.minZoom),
 		maxZoom: clampZoomSetting(defaults.maxZoom),
 		fogEnabled: false,
+		fogFrozen: false,
 		exploredCells: [],
 	};
 }
@@ -432,7 +510,7 @@ function parseWallSegmentArray(raw: unknown, points: WallPoint[]): WallSegment[]
 }
 
 function isTokenCategory(value: unknown): value is TokenCategory {
-	return value === "player" || value === "entity";
+	return value === "player" || value === "entity" || value === "light";
 }
 
 function parseTokenTab(value: unknown): TokenTab | null {
@@ -463,6 +541,9 @@ function parseToken(value: unknown): Token | null {
 		visionAngle: typeof value.visionAngle === "number" ? value.visionAngle : undefined,
 		visionRange: typeof value.visionRange === "number" ? value.visionRange : undefined,
 		visionRadius: typeof value.visionRadius === "number" && value.visionRadius >= 0 ? value.visionRadius : undefined,
+		lightRadius: typeof value.lightRadius === "number" && value.lightRadius >= 0 ? value.lightRadius : undefined,
+		lightEnabled: typeof value.lightEnabled === "boolean" ? value.lightEnabled : undefined,
+		lightRadiusLinkedToVision: typeof value.lightRadiusLinkedToVision === "boolean" ? value.lightRadiusLinkedToVision : undefined,
 		sideEyeAngle: typeof value.sideEyeAngle === "number" ? value.sideEyeAngle : undefined,
 		detectionAngle: typeof value.detectionAngle === "number" ? value.detectionAngle : undefined,
 		binocularAngle: typeof value.binocularAngle === "number" ? value.binocularAngle : undefined,
@@ -607,12 +688,13 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	const maxZoom = clampZoomSetting(typeof p.maxZoom === "number" ? p.maxZoom : defaults.maxZoom);
 
 	const fogEnabled = typeof p.fogEnabled === "boolean" ? p.fogEnabled : false;
+	const fogFrozen = typeof p.fogFrozen === "boolean" ? p.fogFrozen : false;
 	// Pre-v11 files stored `exploredCells` as grid-cell keys (grid tracing); v11 switched to coarse
 	// world-space bucket keys (ray tracing), a different coordinate system, so old memory is dropped
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 14, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, exploredCells };
+	return { version: 14, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

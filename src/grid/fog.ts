@@ -7,6 +7,7 @@ import {
 	Token,
 	VisionBlockerType,
 	parseCellKey,
+	resolveLightRadius,
 	squareKey,
 } from "../data/mapData";
 import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, pointSegmentDistance, raySegmentDistance } from "./gridMath";
@@ -265,6 +266,26 @@ export function castEntityConeRays(data: MapFileData, token: Token, direction: n
 export function buildVisionCache(data: MapFileData): VisionRays[] {
 	const wallSegments = resolveWallSegments(data);
 	return data.tokens.filter((t) => (t.category ?? "entity") === "player").map((t) => castVisionRays(data, t, wallSegments));
+}
+
+/**
+ * A token's "light" reach (`resolveLightRadius`, any category — see the field's doc comment in
+ * `mapData.ts`): a plain omnidirectional radius, fully blocked by any wall it meets, opaque or
+ * "dim" alike. Reuses `traceRays` with `range` pinned at 0, so every angle falls outside its
+ * (otherwise inactive) directional cone and gets the plain `radius` reach — the same path a "dim"
+ * wall takes outside a vision cone's own proximity exception, i.e. it blocks fully, unlike a vision
+ * cone's own reach which can peer through a "dim" wall up close (see `traceRays`'s doc comment).
+ * Light itself has no such exception: there's no cone here to be "up close and inside" to begin
+ * with, so it never gets one either.
+ *
+ * `pose` mirrors `castVisionRays`'s own parameter — lets a light source keep tracking a token's
+ * live interpolated position during an in-flight "Animation" move tween.
+ */
+export function castLightRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
+	const center = pose?.center ?? footprintCenter(data, token);
+	const radius = resolveLightRadius(token) * cellVisualWidth(data);
+	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
+	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments, wallAdjacency) };
 }
 
 /** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */

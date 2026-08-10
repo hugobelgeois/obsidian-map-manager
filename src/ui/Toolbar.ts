@@ -341,7 +341,11 @@ export class Toolbar {
 		}
 	}
 
-	/** Fog dropdown: icon-only trigger, panel holds the activate/deactivate toggle plus a reset action while fog is on. */
+	/**
+	 * Fog dropdown: icon-only trigger, panel holds the activate/deactivate toggle plus, while fog is
+	 * on, the "Brouillard figé" toggle (`MapController.toggleFogFrozen`/`MapFileData.fogFrozen` — see
+	 * its own doc comment) and a reset action.
+	 */
 	private renderFogDropdown(container: HTMLElement, data: MapFileData): void {
 		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-fog-dropdown" });
 		wrapper.toggleClass("is-open", this.fogMenuOpen);
@@ -365,6 +369,11 @@ export class Toolbar {
 		toggleBtn.toggleClass("is-active", data.fogEnabled);
 		toggleBtn.onclick = () => this.controller.toggleFog();
 		if (data.fogEnabled) {
+			const freezeBtn = panel.createEl("button", { text: "Brouillard figé", cls: "map-manager-btn" });
+			freezeBtn.toggleClass("is-active", data.fogFrozen);
+			setTooltip(freezeBtn, "La vision des joueurs ne débloque plus le brouillard tant que c'est activé.");
+			freezeBtn.onclick = () => this.controller.toggleFogFrozen();
+
 			const resetFogBtn = panel.createEl("button", { text: "Réinitialiser le brouillard", cls: "map-manager-btn" });
 			resetFogBtn.onclick = () => this.controller.resetFog();
 		}

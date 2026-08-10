@@ -1165,6 +1165,11 @@ export class MapController {
 		this.update((data) => (data.fogEnabled = !data.fogEnabled));
 	}
 
+	/** "Brouillard figé" (toolbar fog dropdown) — see `MapFileData.fogFrozen`'s own doc comment for what this actually changes. */
+	toggleFogFrozen(): void {
+		this.update((data) => (data.fogFrozen = !data.fogFrozen));
+	}
+
 	resetFog(): void {
 		this.update((data) => (data.exploredCells = []));
 	}
@@ -1176,8 +1181,13 @@ export class MapController {
 		return this.exploredSetCache.set;
 	}
 
-	/** Adds newly-lit cells to the persisted "ever explored" set. No-op (and no save) if nothing is new. */
+	/**
+	 * Adds newly-lit cells to the persisted "ever explored" set. No-op (and no save) if nothing is
+	 * new, or if `fogFrozen` is on — see `MapFileData.fogFrozen`'s own doc comment: live vision still
+	 * works exactly as before, this just stops growing the permanent memory it would otherwise feed.
+	 */
 	markExplored(cellKeys: Iterable<string>): void {
+		if (this.data.fogFrozen) return;
 		const existing = this.getExploredSet();
 		const toAdd: string[] = [];
 		for (const key of cellKeys) {
