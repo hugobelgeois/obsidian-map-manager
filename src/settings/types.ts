@@ -28,6 +28,8 @@ export interface MapManagerSettings {
 	autoPublishDelaySeconds: number;
 	/** Degree increment for a token's rotation dial (see `InfoPanel.makeRotationDialField`) — both its jog-dial slider and its paired number input step by this amount. */
 	tokenRotationStep: number;
+	/** Side length (px) a vault image is downscaled/cropped to when picked as a pion "logo" — see `resizeImageToSquare`/`InfoPanel.pickVaultTokenImage`. */
+	tokenImageSize: number;
 }
 
 export const DEFAULT_ZONE_TYPES: ZoneType[] = [
@@ -40,7 +42,16 @@ export const DEFAULT_ZONE_TYPES: ZoneType[] = [
 	{ id: "danger", name: "Danger", color: "#c62828" },
 ];
 
+/**
+ * Reserved id for the one template every "player" category token is locked to (see
+ * `InfoPanel.renderTokenPanel`'s "Modèle de statistiques" field) — modifiable like any other
+ * template (name/fields/default tabs) from Settings, but never removable from there (see
+ * `SettingsTab`), since a player token always needs to resolve to *some* template.
+ */
+export const PLAYER_TEMPLATE_ID = "player";
+
 export const DEFAULT_TOKEN_TEMPLATES: TokenTemplate[] = [
+	{ id: PLAYER_TEMPLATE_ID, name: "Joueur", fields: ["vie", "classe", "niveau"], reserved: true },
 	{ id: "character", name: "Personnage", fields: ["vie", "magie", "force"] },
 	{ id: "monster", name: "Monstre", fields: ["vie", "degats", "defense"] },
 ];
@@ -58,4 +69,5 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	fogAnimationMode: "none",
 	autoPublishDelaySeconds: 10,
 	tokenRotationStep: 10,
+	tokenImageSize: 256,
 };

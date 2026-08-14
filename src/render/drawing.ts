@@ -85,10 +85,12 @@ export function drawMarker(ctx: CanvasRenderingContext2D, marker: Marker, cellSi
 
 /**
  * Small arrowhead poking out of a token's rim, pointing wherever it's currently facing
- * (`token.rotation`, degrees, 0 = east, increasing clockwise). For a player token this is also the
- * exact direction `castVisionRays` points its fog vision cone — a single facing drives both, so the
- * arrow always shows exactly what the token can see. Drawn on every token regardless of category or
- * whether `rotation` was ever explicitly set (defaults to facing east) — see `drawToken`.
+ * (`token.rotation`, degrees, 0 = east, increasing clockwise). For an entity token this is also the
+ * exact direction `castEntityConeRays` points its eye cone(s) — a single facing drives both, so the
+ * arrow always shows exactly what the entity can see. Drawn on every token regardless of category or
+ * whether `rotation` was ever explicitly set (defaults to facing east) — see `drawToken`. `rotation`
+ * is no longer editable for "player" tokens (their fog reveal is omnidirectional, via `lightRadius`),
+ * so their arrow just stays wherever it was left (east, unless set by an old map file).
  */
 export function drawTokenFacingArrow(ctx: CanvasRenderingContext2D, cx: number, cy: number, radius: number, rotationDeg: number, color: string): void {
 	const rad = (rotationDeg * Math.PI) / 180;

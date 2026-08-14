@@ -1,21 +1,23 @@
 import { CellData, Marker, VisionBlockerType, WallPoint, WallSegment, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
-import { footprintCellKeys, occupiedFootprintCells } from "../grid/fog";
+import { footprintCellKeys, footprintCenter, occupiedFootprintCells, worldPointToCellKey } from "../grid/fog";
 import { WallShapeKind, wallShapeCorners } from "../grid/gridMath";
 import { addWallSegment, optimizeWallNetwork } from "../grid/wallOptimize";
+import { ClipboardToken, getTokenClipboard, setTokenClipboard, stripPlacementFields } from "./tokenClipboard";
 
 export type MapControllerListener = () => void;
 
 export type MapMode = "edit" | "view";
 
-export type EditTool = "none" | "brush" | "fill" | "wall" | "select";
+export type EditTool = "none" | "brush" | "fill" | "wall";
 
 /**
- * What kind of object the "select" tool's mass selection currently holds — set by whichever kind
- * gets clicked/marquee-selected first, and locked until the selection is cleared (see
- * `toggleMassSelection`/`addMassSelection`). "wallSegment" is deliberately just segments, not whole
- * connected wall shapes (unlike the single-select wall-point editor) — each line is its own bulk-editable
- * unit. "stamp" means a grid cell on celled grid types, or a `Marker` on grid type "none" — whichever
- * one actually exists for the map's current grid type.
+ * What kind of object the current mass selection holds — set by whichever kind gets ctrl+clicked/
+ * shift-marquee'd first, and locked until the selection is cleared (see
+ * `toggleMassSelection`/`addMassSelection`). Ctrl+click/shift-drag mass-select tokens and stamps in
+ * either mode; wall segments only in edit mode (see `MapCanvas`). "wallSegment" is deliberately just
+ * segments, not whole connected wall shapes (unlike the single-select wall-point editor) — each line
+ * is its own bulk-editable unit. "stamp" means a grid cell on celled grid types, or a `Marker` on
+ * grid type "none" — whichever one actually exists for the map's current grid type.
  */
 export type MassSelectionKind = "token" | "wallSegment" | "stamp";
 
@@ -35,6 +37,8 @@ export class MapController {
 	mode: MapMode;
 	/** Whether the grid/cell overlay is shown in view mode (edit mode always shows it). Session-only, not persisted. */
 	showCells = true;
+	/** Whether the zone-color overlay is painted (edit mode's "Zones" group only — grid lines/tokens/stamps stay visible either way). Session-only, not persisted. */
+	showZones = true;
 	/** Whether the InfoPanel (whatever is currently selected) also renders on a player mirror window — see InfoPanel's "eye" button and `MapPlayerMirrorView`. Session-only, not persisted. */
 	showInfoToPlayers = false;
 	/** Whether entity tokens' vision zones (see `MapCanvas.drawTokenVisionZones`) also render on a player mirror window — normally a GM-only tactical hint, so this defaults off. Session-only, not persisted. See the player-window dropdown in `Toolbar`. */
@@ -55,17 +59,18 @@ export class MapController {
 	/**
 	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
 	 * (brush) or flood-filled from a click (fill). Session-only, not persisted. `brushZoneMode` is
-	 * "keep" (untouched), "clear" (remove the zone), or a zoneTypeId to apply.
+	 * "clear" (remove the zone) or a zoneTypeId to apply — no "leave untouched" option, so the toolbar
+	 * select (`Toolbar.renderZonesGroup`) always has a real effect from the moment the brush is armed.
 	 */
 	activeTool: EditTool = "none";
 	brushRadius = 0;
-	brushZoneMode = "keep";
+	brushZoneMode = "clear";
 
 	/**
-	 * The "select" tool's mass selection (edit mode): which kind is locked (see `MassSelectionKind`),
-	 * plus one id set per kind — only the set matching `massSelectionKind` is ever non-empty. Session-only,
-	 * not persisted. See `toggleMassSelection`/`addMassSelection`/`clearMassSelection` and the mass
-	 * mutators further below.
+	 * The current ctrl+click/shift-drag mass selection (see `MassSelectionKind`): which kind is
+	 * locked, plus one id set per kind — only the set matching `massSelectionKind` is ever non-empty.
+	 * Session-only, not persisted. See `toggleMassSelection`/`addMassSelection`/`clearMassSelection`
+	 * and the mass mutators further below.
 	 */
 	massSelectionKind: MassSelectionKind | null = null;
 	massSelectedTokenIds: Set<string> = new Set();
@@ -127,16 +132,21 @@ export class MapController {
 	setMode(mode: MapMode): void {
 		if (this.mode === mode) return;
 		this.mode = mode;
-		// A leftover mass selection from the mode being left behind (e.g. cells mass-selected via the
-		// edit-mode "select" tool) would otherwise lock `massSelectionKind` and silently block a fresh
-		// token selection right after switching to view mode — see the view-mode multi-select gestures
-		// in MapCanvas.
+		// A leftover mass selection from the mode being left behind (e.g. wall segments mass-selected
+		// in edit mode, a kind view mode never uses) would otherwise lock `massSelectionKind` and
+		// silently block a fresh token selection right after switching modes — see the ctrl+click/
+		// shift-drag mass-select gestures in MapCanvas.
 		this.clearMassSelection();
 		this.notify();
 	}
 
 	toggleShowCells(): void {
 		this.showCells = !this.showCells;
+		this.notify();
+	}
+
+	toggleShowZones(): void {
+		this.showZones = !this.showZones;
 		this.notify();
 	}
 
@@ -417,8 +427,8 @@ export class MapController {
 
 	setActiveTool(tool: EditTool): void {
 		const next = this.activeTool === tool ? "none" : tool;
-		// Leftover mass selection from a previous "select" session never carries over into a fresh
-		// one, same spirit as the wall tool resetting its in-progress chain on activation below.
+		// Leftover mass selection from before a drawing tool (brush/fill/wall) was armed never carries
+		// over once it's active, same spirit as the wall tool resetting its in-progress chain below.
 		if (next !== this.activeTool) this.clearMassSelection();
 		this.activeTool = next;
 		// A fresh activation of the wall tool always starts an unconnected chain and cancels any
@@ -449,7 +459,6 @@ export class MapController {
 
 	/** Applies the current brush zone type to one cell (called continuously while painting/filling). */
 	paintCell(key: string): void {
-		if (this.brushZoneMode === "keep") return;
 		const zoneMode = this.brushZoneMode;
 		this.updateCell(key, (cell) => {
 			if (zoneMode === "clear") cell.zoneTypeId = undefined;
@@ -801,15 +810,14 @@ export class MapController {
 	}
 
 	/**
-	 * Merges a batch of freshly-detected wall points/segments — "Murs magiques" (`detectMagicWalls`,
-	 * traces existing wall linework) or "Seau à murs" (`detectColorRegionWalls`, walls off a flood-
-	 * filled color region) — into the active layer: each incoming point is first reconciled onto
-	 * whichever existing layer point already sits at (essentially) the same spot rather than stacked
-	 * as a near-duplicate — the detector built its candidate network independently, so it has no idea
-	 * which grid corners the layer's own hand-drawn walls already occupy — then every incoming segment
-	 * is committed exactly like a manual chain click (`addWallSegment`), so it reconciles against
-	 * whatever's already there (crossings split, overlaps merged, opaque winning over dim) instead of
-	 * just stacking on top.
+	 * Merges a batch of freshly-detected wall points/segments — currently only "Seau à murs"
+	 * (`detectColorRegionWalls`, walls off a flood-filled color region), despite the method's name —
+	 * into the active layer: each incoming point is first reconciled onto whichever existing layer
+	 * point already sits at (essentially) the same spot rather than stacked as a near-duplicate — the
+	 * detector built its candidate network independently, so it has no idea which grid corners the
+	 * layer's own hand-drawn walls already occupy — then every incoming segment is committed exactly
+	 * like a manual chain click (`addWallSegment`), so it reconciles against whatever's already there
+	 * (crossings split, overlaps merged, opaque winning over dim) instead of just stacking on top.
 	 */
 	applyMagicWalls(points: WallPoint[], segments: WallSegment[]): void {
 		this.update((data) => {
@@ -834,7 +842,7 @@ export class MapController {
 		});
 	}
 
-	// ---- Mass selection ("select" tool, edit mode) ----
+	// ---- Mass selection (ctrl+click/shift-drag — see MapCanvas) ----
 
 	/**
 	 * "stamp" is backed by two different sets depending on the map's current grid type (cells on a
@@ -863,7 +871,7 @@ export class MapController {
 		this.notify();
 	}
 
-	/** A plain click on one object while the "select" tool is active: toggles it in/out, locking `massSelectionKind` on the first hit and unlocking it again once every set empties. Ignored if a different kind is already locked. */
+	/** A ctrl+click on one object: toggles it in/out, locking `massSelectionKind` on the first hit and unlocking it again once every set empties. Ignored if a different kind is already locked. */
 	toggleMassSelection(kind: MassSelectionKind, id: string): void {
 		if (this.massSelectionKind && this.massSelectionKind !== kind) return;
 		const set = this.resolveMassSet(kind);
@@ -873,7 +881,7 @@ export class MapController {
 		this.notify();
 	}
 
-	/** A marquee-drag drop while the "select" tool is active: unions `ids` into the matching set (never replaces), locking `massSelectionKind` the same way `toggleMassSelection` does. Ignored if a different kind is already locked. */
+	/** A shift-drag marquee drop: unions `ids` into the matching set (never replaces), locking `massSelectionKind` the same way `toggleMassSelection` does. Ignored if a different kind is already locked. */
 	addMassSelection(kind: MassSelectionKind, ids: Iterable<string>): void {
 		if (this.massSelectionKind && this.massSelectionKind !== kind) return;
 		const set = this.resolveMassSet(kind);
@@ -1121,6 +1129,82 @@ export class MapController {
 			data.tokens = data.tokens.filter((t) => t.id !== tokenId);
 		});
 		if (this.selectedTokenId === tokenId) this.selectToken(null);
+	}
+
+	// ---- Clipboard (tokens only — see tokenClipboard.ts) ----
+
+	/** Whatever token(s) are currently selected — the mass token selection if one is locked in, else the single selected token, else none. Backs `copySelectedTokens` (Ctrl+C — see `MapCanvas.onKeyDown`). */
+	getSelectedTokens(): Token[] {
+		if (this.massSelectionKind === "token" && this.massSelectedTokenIds.size > 0) {
+			return this.data.tokens.filter((t) => this.massSelectedTokenIds.has(t.id));
+		}
+		const single = this.getSelectedToken();
+		return single ? [single] : [];
+	}
+
+	/**
+	 * Copies whatever token(s) `getSelectedTokens` currently returns into the shared clipboard (see
+	 * `tokenClipboard.ts`) — single or mass selection alike. Each token's `id`/`cellKey`/`x`/`y` are
+	 * dropped in favor of a world-pixel offset from the selection's own centroid (`footprintCenter`),
+	 * so `pasteTokens` can drop the whole group anywhere — including on a different map, with a
+	 * different grid type/cell size — while keeping their relative layout. Returns how many tokens
+	 * were copied (0 if nothing was selected, in which case the clipboard is left untouched).
+	 */
+	copySelectedTokens(): number {
+		const tokens = this.getSelectedTokens();
+		if (tokens.length === 0) return 0;
+		const centers = tokens.map((t) => footprintCenter(this.data, t));
+		const cx = centers.reduce((sum, c) => sum + c.x, 0) / centers.length;
+		const cy = centers.reduce((sum, c) => sum + c.y, 0) / centers.length;
+		const clipboardTokens: ClipboardToken[] = tokens.map((token, i) => {
+			const center = centers[i] ?? { x: cx, y: cy };
+			return { ...stripPlacementFields(token), offsetX: center.x - cx, offsetY: center.y - cy };
+		});
+		setTokenClipboard(clipboardTokens);
+		return clipboardTokens.length;
+	}
+
+	/**
+	 * Pastes the shared clipboard's tokens (see `copySelectedTokens`), centered on world point
+	 * `(x, y)` — each token lands at `(x, y)` plus its own stored offset from the copied selection's
+	 * centroid, so a multi-token copy keeps its relative layout. Works regardless of which map/grid
+	 * type/cell size this controller's data uses: each position resolves onto a cell
+	 * (`worldPointToCellKey`) on a celled grid, or stays a free point on grid type "none" — exactly
+	 * like a fresh manual placement (see `addToken`/`addFreeToken`). A cell paste that would land on
+	 * an already-occupied cell is skipped rather than failing the whole batch, same "best effort"
+	 * spirit as `applyMagicWalls`. The newly pasted tokens become the new selection (single or mass,
+	 * matching however many were actually placed). Returns how many tokens were placed.
+	 */
+	pasteTokens(x: number, y: number): number {
+		const clipboardTokens = getTokenClipboard();
+		if (clipboardTokens.length === 0) return 0;
+		const placedIds: string[] = [];
+		this.update((data) => {
+			for (const ct of clipboardTokens) {
+				const { offsetX, offsetY, ...rest } = ct;
+				const px = x + offsetX;
+				const py = y + offsetY;
+				if (data.gridType === "none") {
+					const token: Token = { ...rest, id: generateLocalId("token"), x: px, y: py };
+					data.tokens.push(token);
+					placedIds.push(token.id);
+					continue;
+				}
+				const key = worldPointToCellKey(data, px, py);
+				if (this.getTokenAt(key)) continue;
+				const token: Token = { ...rest, id: generateLocalId("token"), cellKey: key };
+				data.tokens.push(token);
+				placedIds.push(token.id);
+			}
+		});
+		if (placedIds.length === 1 && placedIds[0]) {
+			this.selectToken(placedIds[0]);
+		} else if (placedIds.length > 1) {
+			this.massSelectionKind = "token";
+			this.massSelectedTokenIds = new Set(placedIds);
+			this.notify();
+		}
+		return placedIds.length;
 	}
 
 	// ---- Markers (free-floating stamps, grid type "none" only, scoped to the active layer) ----

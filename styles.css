@@ -192,6 +192,56 @@
 	max-width: 200px;
 }
 
+/* Pinned to the far right of the toolbar row — the last item, so it stays clear of everything else
+   even as the row wraps at narrow widths. */
+.map-manager-info-dropdown {
+	margin-left: auto;
+}
+
+/* Opens growing leftward from the trigger instead of the default rightward growth (`left: 0`) — the
+   trigger itself sits at the toolbar's right edge, so a panel growing right would spill off-screen. */
+.map-manager-info-dropdown-panel {
+	left: auto;
+	right: 0;
+	width: 280px;
+	max-height: 70vh;
+	overflow-y: auto;
+}
+
+.map-manager-info-section-title {
+	font-size: 0.75em;
+	text-transform: uppercase;
+	letter-spacing: 0.03em;
+	color: var(--text-muted);
+	margin-top: 0.5em;
+}
+
+.map-manager-info-section-title:first-of-type {
+	margin-top: 0;
+}
+
+.map-manager-info-shortcut-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3em;
+}
+
+.map-manager-info-shortcut-row {
+	display: flex;
+	flex-direction: column;
+	gap: 0.1em;
+	font-size: 0.8em;
+}
+
+.map-manager-info-shortcut-keys {
+	font-family: var(--font-monospace, monospace);
+	color: var(--text-normal);
+}
+
+.map-manager-info-shortcut-desc {
+	color: var(--text-muted);
+}
+
 .map-manager-btn-danger {
 	color: var(--text-error);
 }
@@ -244,6 +294,13 @@
 	cursor: grab;
 }
 
+/* Focusable so Ctrl+C/Ctrl+V/Échap work (see MapCanvas's onKeyDown) — no visible focus ring, matching
+   every other click-driven tool on this canvas (brush/fill recolor the cursor instead). */
+.map-manager-canvas:focus,
+.map-manager-canvas:focus-visible {
+	outline: none;
+}
+
 .map-manager-canvas:active {
 	cursor: grabbing;
 }
@@ -261,9 +318,6 @@
 	cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26"><text x="0" y="20" font-size="20">🪣</text></svg>') 2 22, crosshair;
 }
 
-.map-manager-canvas.is-select-tool {
-	cursor: crosshair;
-}
 
 .map-manager-infopanel {
 	flex: 0 0 0;
@@ -431,6 +485,31 @@
 	font-weight: 600;
 }
 
+/* Vue MJ's static (non-editable) pion header — see InfoPanel.renderTokenLogoAndName. */
+.map-manager-token-view-header {
+	display: flex;
+	align-items: center;
+	gap: 0.5em;
+	margin-bottom: 0.75em;
+}
+
+.map-manager-token-view-logo {
+	width: 1.8em;
+	height: 1.8em;
+	border-radius: var(--radius-s, 4px);
+	object-fit: cover;
+}
+
+.map-manager-token-view-logo-icon {
+	font-size: 1.6em;
+	line-height: 1;
+}
+
+.map-manager-token-view-name {
+	font-weight: 600;
+	font-size: 1.05em;
+}
+
 .map-manager-view-empty,
 .map-manager-view-error {
 	color: var(--text-muted);
@@ -472,7 +551,6 @@
 }
 
 .map-manager-fog-dropdown-panel,
-.map-manager-zoom-dropdown-panel,
 .map-manager-player-window-dropdown-panel {
 	width: 220px;
 }
@@ -579,49 +657,3 @@
 	min-width: 0;
 }
 
-.map-manager-magic-walls-modal .map-manager-magic-walls-summary {
-	display: flex;
-	align-items: center;
-	gap: 0.6em;
-	margin: 0.8em 0;
-}
-
-.map-manager-magic-walls-swatch {
-	width: 1.4em;
-	height: 1.4em;
-	flex: 0 0 auto;
-	border-radius: var(--radius-s, 4px);
-	border: 1px solid var(--background-modifier-border);
-	background-color: var(--map-manager-magic-walls-color, transparent);
-}
-
-.map-manager-magic-walls-hint {
-	color: var(--text-muted);
-	font-size: 0.9em;
-}
-
-.map-manager-magic-walls-buttons {
-	display: flex;
-	justify-content: flex-end;
-	gap: 0.5em;
-	margin-top: 1em;
-}
-
-.map-manager-magic-walls-color-row {
-	display: flex;
-	align-items: center;
-	gap: 0.4em;
-}
-
-.map-manager-magic-walls-color-swatch {
-	width: 1.2em;
-	height: 1.2em;
-	flex: 0 0 auto;
-	border-radius: var(--radius-s, 4px);
-	border: 1px dashed var(--background-modifier-border);
-}
-
-.map-manager-magic-walls-color-swatch.is-set {
-	border-style: solid;
-	background-color: var(--map-manager-magic-walls-color);
-}

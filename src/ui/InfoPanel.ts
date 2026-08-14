@@ -1,4 +1,4 @@
-import { App, Component, MarkdownRenderer, TFile, resolveSubpath, setIcon, setTooltip } from "obsidian";
+import { App, Component, MarkdownRenderer, Notice, TFile, resolveSubpath, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import {
 	CellData,
@@ -7,8 +7,6 @@ import {
 	DEFAULT_SIDE_EYE_ANGLE,
 	DEFAULT_TOKEN_COLOR,
 	DEFAULT_TOKEN_ROTATION,
-	DEFAULT_VISION_ANGLE,
-	DEFAULT_VISION_RADIUS,
 	DEFAULT_VISION_RANGE,
 	Marker,
 	TOKEN_SIZES,
@@ -27,8 +25,8 @@ import {
 	WallSegment,
 } from "../data/mapData";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
-import { MapManagerSettings } from "../settings/types";
-import { ensureFolder, sanitizeFileName } from "../utils";
+import { resizeImageToSquare } from "../platform/resizeImage";
+import { MapManagerSettings, PLAYER_TEMPLATE_ID } from "../settings/types";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 import { HeadingSuggestModal } from "./HeadingSuggestModal";
 
@@ -47,6 +45,12 @@ export interface InfoPanelDeps {
 	 * reduced "Vue"-mode panel (`renderTokenViewPanel`, still GM-facing per its own doc comment).
 	 */
 	forPlayers?: boolean;
+}
+
+/** Sets a token's category, locking it onto the reserved "Joueur" template when switching to "player" — see `PLAYER_TEMPLATE_ID`. Shared by the single-token and mass-selection category pickers. */
+function applyTokenCategory(t: Token, value: TokenCategory): void {
+	t.category = value;
+	if (value === "player") t.templateId = PLAYER_TEMPLATE_ID;
 }
 
 const MIN_PANEL_WIDTH = 220;
@@ -157,16 +161,25 @@ export class InfoPanel {
 		this.renderComponents = [];
 	}
 
-	/** Header shared by every selection type (token/marker/wall point/cell): a title, an "eye" toggle that mirrors this whole panel onto a player window (see `MapController.showInfoToPlayers`/`MapPlayerMirrorView`), and a close button. */
-	private renderPanelHeader(title: string, onClose: () => void): void {
+	/**
+	 * Header shared by every selection type (token/marker/wall point/cell): a title, an optional "eye"
+	 * toggle that mirrors this whole panel onto a player window (see
+	 * `MapController.showInfoToPlayers`/`MapPlayerMirrorView`), and a close button. The eye toggle is
+	 * scoped to pion/tampon/case panels (`showEyeToggle` default `true`) — dropped for wall
+	 * point/segment panels (`showEyeToggle: false`), since wall geometry is never shown to players at
+	 * all (see CLAUDE.md's "Public viewer" section).
+	 */
+	private renderPanelHeader(title: string, onClose: () => void, showEyeToggle = true): void {
 		const header = this.el.createDiv({ cls: "map-manager-infopanel-header" });
 		header.createEl("h4", { text: title });
 		const actions = header.createDiv({ cls: "map-manager-infopanel-header-actions" });
-		const eyeBtn = actions.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(eyeBtn, this.controller.showInfoToPlayers ? "eye" : "eye-off");
-		setTooltip(eyeBtn, this.controller.showInfoToPlayers ? "Masquer ce panneau sur la fenêtre joueur" : "Afficher ce panneau sur la fenêtre joueur");
-		eyeBtn.toggleClass("is-active", this.controller.showInfoToPlayers);
-		eyeBtn.onclick = () => this.controller.toggleShowInfoToPlayers();
+		if (showEyeToggle) {
+			const eyeBtn = actions.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(eyeBtn, this.controller.showInfoToPlayers ? "eye" : "eye-off");
+			setTooltip(eyeBtn, this.controller.showInfoToPlayers ? "Masquer ce panneau sur la fenêtre joueur" : "Afficher ce panneau sur la fenêtre joueur");
+			eyeBtn.toggleClass("is-active", this.controller.showInfoToPlayers);
+			eyeBtn.onclick = () => this.controller.toggleShowInfoToPlayers();
+		}
 		const closeBtn = actions.createEl("button", { text: "✕", cls: "map-manager-btn map-manager-btn-icon" });
 		closeBtn.onclick = onClose;
 	}
@@ -181,14 +194,10 @@ export class InfoPanel {
 			return;
 		}
 
-		// The "select" tool's mass-edit panel always wins over any stale single-selection while the
-		// tool is active — even for a selection of exactly one object, kept simple as one dedicated
-		// bulk panel rather than merging with the full single-item editors below. A token mass
-		// selection also wins outside the edit-mode select tool: view mode's own Shift-marquee/Ctrl+click
-		// gestures (see MapCanvas) build the very same `massSelectedTokenIds`, without ever touching
-		// `activeTool` — wall-segment/stamp mass selections stay tool-gated since view mode never
-		// populates those sets.
-		if (this.controller.massSelectionKind === "token" || (this.controller.activeTool === "select" && this.controller.massSelectionKind)) {
+		// A locked mass selection (ctrl+click/shift-drag — see MapCanvas) always wins over any stale
+		// single-selection, in either mode — kept simple as one dedicated bulk panel rather than
+		// merging with the full single-item editors below, even for a selection of exactly one object.
+		if (this.controller.massSelectionKind) {
 			this.renderMassSelectionPanel();
 			return;
 		}
@@ -223,7 +232,7 @@ export class InfoPanel {
 			const found = this.controller.findWallPoint(this.controller.selectedWallPointId);
 			if (found) {
 				this.setOpen(true);
-				this.renderPanelHeader("Point de mur", () => this.controller.selectWallPoint(null));
+				this.renderPanelHeader("Point de mur", () => this.controller.selectWallPoint(null), false);
 
 				this.renderWallPointPanel(found.id);
 				return;
@@ -234,7 +243,7 @@ export class InfoPanel {
 			const found = this.controller.getSelectedWallSegment();
 			if (found) {
 				this.setOpen(true);
-				this.renderPanelHeader("Segment de mur", () => this.controller.selectWallSegment(null));
+				this.renderPanelHeader("Segment de mur", () => this.controller.selectWallSegment(null), false);
 
 				this.renderWallSegmentPanel(found);
 				return;
@@ -255,7 +264,7 @@ export class InfoPanel {
 		this.renderPanelHeader(`Case ${key}`, () => this.controller.selectCell(null));
 
 		if (this.controller.mode === "edit") {
-			this.renderEditMode(key, cell, this.deps.settings.defaultZoneTypes);
+			this.renderEditMode(key, cell);
 		} else {
 			this.renderViewMode(cell);
 		}
@@ -279,7 +288,7 @@ export class InfoPanel {
 		this.renderTokenTabsReadOnly(token);
 	}
 
-	// ---- Mass selection ("select" tool, edit mode only) ----
+	// ---- Mass selection (ctrl+click/shift-drag — see MapCanvas — either mode) ----
 
 	/**
 	 * Dispatches to one of the three bulk field sets. Every control in all three follows one rule so
@@ -331,17 +340,6 @@ export class InfoPanel {
 		// picker to `renderLightRadiusField`, same as the single-token panel does.
 		const allLight = categories.size === 1 && categories.has("light");
 
-		if (!allLight) {
-			const iconField = this.el.createDiv({ cls: "map-manager-field" });
-			iconField.createEl("label", { text: "Icône" });
-			const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
-			for (const s of QUICK_TOKEN_ICONS) {
-				const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
-				if (tokens.every((t) => t.icon === s)) btn.addClass("is-active");
-				btn.onclick = () => this.controller.massUpdateTokens((t) => (t.icon = s));
-			}
-		}
-
 		const categoryField = this.el.createDiv({ cls: "map-manager-field" });
 		categoryField.createEl("label", { text: "Catégorie" });
 		const categorySelect = categoryField.createEl("select");
@@ -356,12 +354,14 @@ export class InfoPanel {
 		categorySelect.value = "";
 		categorySelect.onchange = () => {
 			const value = categorySelect.value;
-			if (value === "player" || value === "entity" || value === "light") this.controller.massUpdateTokens((t) => (t.category = value));
+			if (value === "player" || value === "entity" || value === "light") {
+				this.controller.massUpdateTokens((t) => applyTokenCategory(t, value));
+			}
 		};
 
 		const seed = tokens[0];
 		if (allLight) {
-			if (seed) this.renderLightRadiusField(seed, false, (mutator) => this.controller.massUpdateTokens(mutator));
+			if (seed) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
 			const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 			const deleteBtn = footer.createEl("button", {
 				text: tokens.length > 1 ? "Supprimer les pions" : "Supprimer le pion",
@@ -371,19 +371,13 @@ export class InfoPanel {
 			return;
 		}
 
-		if (categories.size === 1) {
-			this.renderMassVisionFields(tokens, [...categories][0] as TokenCategory);
-		} else {
-			this.el.createDiv({
-				cls: "map-manager-view-empty",
-				text: "Sélection mixte : changez d'abord la catégorie pour éditer la vision.",
-			});
-		}
-		// Unlike vision, light means the same thing for every category, so it's shown here regardless
-		// of whether the selection mixes categories — only the "link to vision radius" button is
-		// player-only (see `renderLightRadiusField`), shown only for a selection of players alone.
-		if (seed) {
-			this.renderLightRadiusField(seed, categories.size === 1 && categories.has("player"), (mutator) => this.controller.massUpdateTokens(mutator));
+		const iconField = this.el.createDiv({ cls: "map-manager-field" });
+		iconField.createEl("label", { text: "Logo" });
+		const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
+		for (const s of QUICK_TOKEN_ICONS) {
+			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
+			if (tokens.every((t) => t.icon === s)) btn.addClass("is-active");
+			btn.onclick = () => this.controller.massUpdateTokens((t) => (t.icon = s));
 		}
 
 		const sizeField = this.el.createDiv({ cls: "map-manager-field" });
@@ -407,6 +401,21 @@ export class InfoPanel {
 		colorInput.value = tokens[0]?.color ?? DEFAULT_TOKEN_COLOR;
 		colorInput.onchange = () => this.controller.massUpdateTokens((t) => (t.color = colorInput.value));
 
+		// Light means the same thing for every category, so it's shown here regardless of whether the
+		// selection mixes categories.
+		if (seed) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
+
+		// Vision (entity-only — see `renderMassVisionFields`). Nothing shown at all for a selection
+		// that's entirely players — there's no vision concept left to edit for them.
+		if (categories.size === 1 && categories.has("entity")) {
+			this.renderMassVisionFields(tokens);
+		} else if (categories.size > 1) {
+			this.el.createDiv({
+				cls: "map-manager-view-empty",
+				text: "Sélection mixte : changez d'abord la catégorie pour éditer la vision.",
+			});
+		}
+
 		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 		const deleteBtn = footer.createEl("button", {
 			text: tokens.length > 1 ? "Supprimer les pions" : "Supprimer le pion",
@@ -416,59 +425,55 @@ export class InfoPanel {
 	}
 
 	/**
-	 * Mirrors `renderVisionFields`, but every control writes via `massUpdateTokens` instead of a single
-	 * token id, and each field's starting position is seeded from `tokens[0]` (only a visual default
-	 * for where the slider/input starts — nothing is written until the user actually interacts with
-	 * it, so an untouched field never overwrites a token whose value differed from the seed).
+	 * Mirrors `renderVisionFields` (entity-only — see its own doc comment), but every control writes
+	 * via `massUpdateTokens` instead of a single token id, and each field's starting position is
+	 * seeded from `tokens[0]` (only a visual default for where the slider/input starts — nothing is
+	 * written until the user actually interacts with it, so an untouched field never overwrites a
+	 * token whose value differed from the seed).
 	 */
-	private renderMassVisionFields(tokens: Token[], category: TokenCategory): void {
+	private renderMassVisionFields(tokens: Token[]): void {
 		const seed = tokens[0];
 		if (!seed) return;
-		const isPlayer = category === "player";
 		const wrap = this.el.createDiv({ cls: "map-manager-field" });
-		wrap.createEl("label", { text: isPlayer ? "Vision (brouillard de guerre)" : "Vision (zone visible par le MJ uniquement)" });
+		wrap.createEl("label", { text: "Vision (zone visible par le meneur de jeu uniquement)" });
 		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
 
-		if (isPlayer) {
-			this.makeSliderField(row, "Angle (°)", seed.visionAngle ?? DEFAULT_VISION_ANGLE, 1, 360, (v) => this.controller.massUpdateTokens((t) => (t.visionAngle = v)), 10);
-		} else {
-			this.makeSliderField(
-				row,
-				"Angle des yeux (°)",
-				seed.sideEyeAngle ?? DEFAULT_SIDE_EYE_ANGLE,
-				0,
-				180,
-				(v) => this.controller.massUpdateTokens((t) => (t.sideEyeAngle = v)),
-				10
-			);
-			this.makeSliderField(
-				row,
-				"Détection (°)",
-				seed.detectionAngle ?? DEFAULT_EYE_TIER_ANGLES.detectionAngle,
-				1,
-				360,
-				(v) => this.controller.massUpdateTokens((t) => (t.detectionAngle = v)),
-				10
-			);
-			this.makeSliderField(
-				row,
-				"Binoculaire (°)",
-				seed.binocularAngle ?? DEFAULT_EYE_TIER_ANGLES.binocularAngle,
-				1,
-				360,
-				(v) => this.controller.massUpdateTokens((t) => (t.binocularAngle = v)),
-				10
-			);
-			this.makeSliderField(
-				row,
-				"Monoculaire (°)",
-				seed.monocularAngle ?? DEFAULT_EYE_TIER_ANGLES.monocularAngle,
-				1,
-				360,
-				(v) => this.controller.massUpdateTokens((t) => (t.monocularAngle = v)),
-				10
-			);
-		}
+		this.makeSliderField(
+			row,
+			"Angle des yeux (°)",
+			seed.sideEyeAngle ?? DEFAULT_SIDE_EYE_ANGLE,
+			0,
+			180,
+			(v) => this.controller.massUpdateTokens((t) => (t.sideEyeAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Détection (°)",
+			seed.detectionAngle ?? DEFAULT_EYE_TIER_ANGLES.detectionAngle,
+			1,
+			360,
+			(v) => this.controller.massUpdateTokens((t) => (t.detectionAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Binoculaire (°)",
+			seed.binocularAngle ?? DEFAULT_EYE_TIER_ANGLES.binocularAngle,
+			1,
+			360,
+			(v) => this.controller.massUpdateTokens((t) => (t.binocularAngle = v)),
+			10
+		);
+		this.makeSliderField(
+			row,
+			"Monoculaire (°)",
+			seed.monocularAngle ?? DEFAULT_EYE_TIER_ANGLES.monocularAngle,
+			1,
+			360,
+			(v) => this.controller.massUpdateTokens((t) => (t.monocularAngle = v)),
+			10
+		);
 
 		const makeNumberInput = (labelText: string, value: number, onChange: (v: number) => void) => {
 			const field = row.createDiv({ cls: "map-manager-field-inline" });
@@ -481,43 +486,28 @@ export class InfoPanel {
 			};
 		};
 		makeNumberInput("Portée (cases)", seed.visionRange ?? DEFAULT_VISION_RANGE, (v) => this.controller.massUpdateTokens((t) => (t.visionRange = Math.max(0, v))));
-		// While a player token's light is linked to its own vision radius (`lightRadiusLinkedToVision`
-		// — see `renderLightRadiusField`), editing this field also keeps `lightRadius` in step, same
-		// two-way sync as editing the light field itself does.
-		makeNumberInput(isPlayer ? "Rayon exploré (cases)" : "Rayon (cases)", seed.visionRadius ?? DEFAULT_VISION_RADIUS, (v) =>
-			this.controller.massUpdateTokens((t) => {
-				t.visionRadius = Math.max(0, v);
-				if (isPlayer && t.lightRadiusLinkedToVision) t.lightRadius = Math.max(0, v);
-			})
-		);
 	}
 
 	/**
-	 * `token.lightRadius` editor (see `Token.lightRadius`/`resolveLightRadius`/`MapCanvas.isEntityRevealedByFog`/
-	 * `drawFog`'s `frameLightCache` use), any category — a radius (in cells) within which this token's
-	 * own light reveals every entity token around it and hides the fog, blocked by walls, without ever
-	 * unlocking it permanently. Shown (and fully editable) in both edit and "Vue" mode — a light is
-	 * something a GM plausibly wants to flip mid-session (a torch lighting/going out), not just set up
-	 * ahead of time — see the callers in `renderTokenPanel`/`renderTokenViewPanel`.
+	 * `token.lightRadius` editor (see `Token.lightRadius`/`resolveLightRadius`/`castLightRays`), any
+	 * category — a radius (in cells) within which this token's own light reveals every entity token
+	 * around it and hides the fog, blocked by walls. For "player" tokens this is now also the *only*
+	 * source of their fog reveal (no more directional vision cone), including what permanently marks
+	 * `exploredCells` — see `FogRenderer.recomputeFrame`. Shown (and fully editable) in both edit and
+	 * "Vue" mode — a light is something a GM plausibly wants to flip mid-session (a torch lighting/
+	 * going out), not just set up ahead of time — see the callers in `renderTokenPanel`/`renderTokenViewPanel`.
 	 *
-	 * Three controls, left to right:
-	 * - An on/off checkbox (`lightEnabled`, defaults to on) — switches the light off without losing
-	 *   the configured radius, unlike setting the radius itself to `0` would (reads `configuredLightRadius`,
-	 *   not `resolveLightRadius`, so this stays showing that configured number even while off).
-	 * - The radius number input (`lightRadius`) — always editable, even while linked (see below):
-	 *   editing it while linked also writes `visionRadius`, so the two stay in step either way you
-	 *   edit them (`renderVisionFields`'s own "Rayon exploré" field does the same in reverse).
-	 * - Player tokens only (`showLinkButton`): a "🔗" toggle for `lightRadiusLinkedToVision`. Turning
-	 *   it on immediately copies the token's current `visionRadius` into `lightRadius` so both fields
-	 *   agree right away; turning it off just stops future edits from propagating (nothing to freeze —
-	 *   they're already equal by then).
+	 * Two controls: an on/off checkbox (`lightEnabled`, defaults to on) — switches the light off
+	 * without losing the configured radius, unlike setting the radius itself to `0` would (reads
+	 * `configuredLightRadius`, not `resolveLightRadius`, so this stays showing that configured number
+	 * even while off) — and the radius number input (`lightRadius`) itself.
 	 *
 	 * `seed` supplies the displayed starting values (only, same convention as `renderMassVisionFields`
 	 * — nothing is written until a control is actually touched); `update` is either a single-token
 	 * `updateToken` or a `massUpdateTokens` closure — each token in a mass update reads/writes its own
 	 * fields, only `seed` (for what to initially display) is shared across the whole selection.
 	 */
-	private renderLightRadiusField(seed: Token, showLinkButton: boolean, update: (mutator: (token: Token) => void) => void): void {
+	private renderLightRadiusField(seed: Token, update: (mutator: (token: Token) => void) => void): void {
 		const wrap = this.el.createDiv({ cls: "map-manager-field" });
 		wrap.createEl("label", { text: "Lumière (cache le brouillard, bloquée par les murs)" });
 		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
@@ -529,8 +519,6 @@ export class InfoPanel {
 		enabledLabel.appendText(" Activée");
 		enabledCheckbox.onchange = () => update((t) => (t.lightEnabled = enabledCheckbox.checked));
 
-		const linked = showLinkButton && !!seed.lightRadiusLinkedToVision;
-
 		const radiusField = row.createDiv({ cls: "map-manager-field-inline" });
 		radiusField.createEl("label", { text: "Rayon (cases)" });
 		const input = radiusField.createEl("input", { type: "number" });
@@ -538,28 +526,8 @@ export class InfoPanel {
 		input.onchange = () => {
 			const v = parseFloat(input.value);
 			if (Number.isNaN(v)) return;
-			update((t) => {
-				t.lightRadius = Math.max(0, v);
-				if (showLinkButton && t.lightRadiusLinkedToVision) t.visionRadius = Math.max(0, v);
-			});
+			update((t) => (t.lightRadius = Math.max(0, v)));
 		};
-
-		if (showLinkButton) {
-			const linkBtn = row.createDiv({ cls: "map-manager-field-inline" }).createEl("button", {
-				text: linked ? "🔗 Lié au rayon exploré" : "🔗 Lier au rayon exploré",
-				cls: linked ? "map-manager-btn is-active" : "map-manager-btn",
-			});
-			linkBtn.title = "Aligne automatiquement le rayon de lumière sur le rayon exploré (vision) de ce joueur — modifiable dans les deux sens tant que c'est lié.";
-			linkBtn.onclick = () =>
-				update((t) => {
-					if (linked) {
-						t.lightRadiusLinkedToVision = false;
-					} else {
-						t.lightRadiusLinkedToVision = true;
-						t.lightRadius = t.visionRadius ?? DEFAULT_VISION_RADIUS;
-					}
-				});
-		}
 	}
 
 	/** Bulk blocker-type editor for mass-selected wall *segments* — unlike the single-point editor, this never touches a whole connected shape, only exactly the segments in the selection. */
@@ -588,31 +556,14 @@ export class InfoPanel {
 		deleteBtn.onclick = () => this.controller.massRemoveWallSegments();
 	}
 
-	/** Bulk editor for mass-selected "stamps": grid cells on a celled grid type, or `Marker`s on grid type "none". */
+	/**
+	 * Bulk editor for mass-selected "stamps": grid cells on a celled grid type, or `Marker`s on grid
+	 * type "none" — no zone-type field, same as the single-cell panel (`renderEditMode`'s own doc
+	 * comment): zone type is exclusively painted with the toolbar's brush/fill tool.
+	 */
 	private renderMassStampPanel(isNoneGrid: boolean): void {
-		if (!isNoneGrid) {
-			const zoneField = this.el.createDiv({ cls: "map-manager-field" });
-			zoneField.createEl("label", { text: "Type de zone" });
-			const select = zoneField.createEl("select");
-			const keepOpt = select.createEl("option", { text: "— ne pas changer —" });
-			keepOpt.value = "__keep__";
-			const noneOpt = select.createEl("option", { text: "— aucun —" });
-			noneOpt.value = "__none__";
-			for (const z of this.deps.settings.defaultZoneTypes) {
-				const opt = select.createEl("option", { text: z.name });
-				opt.value = z.id;
-			}
-			select.value = "__keep__";
-			select.onchange = () => {
-				const value = select.value;
-				if (value === "__keep__") return;
-				const zoneTypeId = value === "__none__" ? undefined : value;
-				this.controller.massUpdateCells((c) => (c.zoneTypeId = zoneTypeId));
-			};
-		}
-
 		const stampField = this.el.createDiv({ cls: "map-manager-field" });
-		stampField.createEl("label", { text: "Tampon" });
+		stampField.createEl("label", { text: "Logo" });
 		const quickRow = stampField.createDiv({ cls: "map-manager-stamp-row" });
 		for (const s of QUICK_STAMPS) {
 			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
@@ -660,23 +611,16 @@ export class InfoPanel {
 
 	// ---- Cells ----
 
-	private renderEditMode(key: string, cell: CellData, zoneTypes: { id: string; name: string }[]): void {
-		// Zone type
-		const zoneField = this.el.createDiv({ cls: "map-manager-field" });
-		zoneField.createEl("label", { text: "Type de zone" });
-		const select = zoneField.createEl("select");
-		const noneOpt = select.createEl("option", { text: "— aucun —" });
-		noneOpt.value = "";
-		for (const z of zoneTypes) {
-			const opt = select.createEl("option", { text: z.name });
-			opt.value = z.id;
-			if (cell.zoneTypeId === z.id) opt.selected = true;
-		}
-		select.onchange = () => this.updateCell(key, (c) => (c.zoneTypeId = select.value || undefined));
-
+	/**
+	 * This is now purely a tampon (stamp/label/links) editor — zone type is exclusively painted with
+	 * the toolbar's "Pinceau" brush/fill tool (see `Toolbar.renderZonesGroup`), not edited here, so
+	 * there's no `zoneTypeId` field. "Vider la case" still clears it along with everything else, since
+	 * that's a blanket reset rather than a live zone-type editor.
+	 */
+	private renderEditMode(key: string, cell: CellData): void {
 		// Stamp
 		const stampField = this.el.createDiv({ cls: "map-manager-field" });
-		stampField.createEl("label", { text: "Tampon" });
+		stampField.createEl("label", { text: "Logo" });
 		const quickRow = stampField.createDiv({ cls: "map-manager-stamp-row" });
 		for (const s of QUICK_STAMPS) {
 			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
@@ -754,7 +698,7 @@ export class InfoPanel {
 
 	private renderMarkerEditPanel(marker: Marker): void {
 		const stampField = this.el.createDiv({ cls: "map-manager-field" });
-		stampField.createEl("label", { text: "Tampon" });
+		stampField.createEl("label", { text: "Logo" });
 		const quickRow = stampField.createDiv({ cls: "map-manager-stamp-row" });
 		for (const s of QUICK_STAMPS) {
 			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
@@ -856,14 +800,16 @@ export class InfoPanel {
 		const lightOpt = categorySelect.createEl("option", { text: "Lumière" });
 		lightOpt.value = "light";
 		categorySelect.value = category;
-		categorySelect.onchange = () =>
-			this.controller.updateToken(token.id, (t) => (t.category = categorySelect.value === "player" || categorySelect.value === "light" ? categorySelect.value : "entity"));
+		categorySelect.onchange = () => {
+			const value = categorySelect.value === "player" || categorySelect.value === "light" ? categorySelect.value : "entity";
+			this.controller.updateToken(token.id, (t) => applyTokenCategory(t, value));
+		};
 
 		// "light" is a pure light fixture with nothing to configure beyond its radius — see
 		// `TokenCategory`'s own doc comment. Everything else below (icon/image/name/rotation/vision/
 		// size/color/template/tabs) only makes sense for an actual character.
 		if (category === "light") {
-			this.renderLightRadiusField(token, false, (mutator) => this.controller.updateToken(token.id, mutator));
+			this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 			const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 			const deleteBtn = footer.createEl("button", { text: "Supprimer le pion", cls: "map-manager-btn map-manager-btn-danger" });
 			deleteBtn.onclick = () => this.controller.removeToken(token.id);
@@ -871,22 +817,18 @@ export class InfoPanel {
 		}
 
 		const iconField = this.el.createDiv({ cls: "map-manager-field" });
-		iconField.createEl("label", { text: "Icône" });
+		iconField.createEl("label", { text: "Logo" });
 		const quickRow = iconField.createDiv({ cls: "map-manager-stamp-row" });
 		for (const s of QUICK_TOKEN_ICONS) {
 			const btn = quickRow.createEl("button", { text: s, cls: "map-manager-stamp-btn" });
 			if (token.icon === s) btn.addClass("is-active");
 			btn.onclick = () => this.controller.updateToken(token.id, (t) => (t.icon = token.icon === s ? "" : s));
 		}
-
-		const imageField = this.el.createDiv({ cls: "map-manager-field" });
-		imageField.createEl("label", { text: "Image du pion (remplace l'icône)" });
-		const chooseBtn = imageField.createEl("button", { text: "Image du vault", cls: "map-manager-btn" });
-		chooseBtn.onclick = () => this.pickVaultTokenImage(token);
-		const importBtn = imageField.createEl("button", { text: "Importer une image", cls: "map-manager-btn" });
-		importBtn.onclick = () => this.importTokenImageFromDisk(token);
+		const imageRow = iconField.createDiv({ cls: "map-manager-field-inline" });
+		const chooseBtn = imageRow.createEl("button", { text: "Image du vault", cls: "map-manager-btn" });
+		chooseBtn.onclick = () => void this.pickVaultTokenImage(token);
 		if (token.image) {
-			const clearBtn = imageField.createEl("button", { text: "Retirer l'image", cls: "map-manager-btn" });
+			const clearBtn = imageRow.createEl("button", { text: "Retirer l'image", cls: "map-manager-btn" });
 			clearBtn.onclick = () => this.controller.updateToken(token.id, (t) => (t.image = undefined));
 		}
 
@@ -896,10 +838,6 @@ export class InfoPanel {
 		nameInput.value = token.label ?? "";
 		nameInput.placeholder = "Nom du personnage";
 		nameInput.onchange = () => this.controller.updateToken(token.id, (t) => (t.label = nameInput.value || undefined));
-
-		this.renderRotationField(token);
-		this.renderVisionFields(token, category);
-		this.renderLightRadiusField(token, category === "player", (mutator) => this.controller.updateToken(token.id, mutator));
 
 		const sizeField = this.el.createDiv({ cls: "map-manager-field" });
 		sizeField.createEl("label", { text: "Taille" });
@@ -917,19 +855,42 @@ export class InfoPanel {
 		colorInput.value = token.color ?? DEFAULT_TOKEN_COLOR;
 		colorInput.onchange = () => this.controller.updateToken(token.id, (t) => (t.color = colorInput.value));
 
+		this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
+
+		// Vision (rotation + eye-cone shape), entity-only — a player's fog reveal is their light above,
+		// omnidirectional, no facing to configure.
+		if (category === "entity") {
+			this.renderRotationField(token);
+			this.renderVisionFields(token);
+		}
+
 		const templateField = this.el.createDiv({ cls: "map-manager-field" });
 		templateField.createEl("label", { text: "Modèle de statistiques" });
-		const templateSelect = templateField.createEl("select");
-		const noneOpt = templateSelect.createEl("option", { text: "— aucun —" });
-		noneOpt.value = "";
-		for (const t of this.deps.settings.defaultTokenTemplates) {
-			const opt = templateSelect.createEl("option", { text: t.name });
-			opt.value = t.id;
-			if (token.templateId === t.id) opt.selected = true;
+		if (category === "player") {
+			// Always the "Joueur" template — locked, only editable from Settings (name/fields/tabs),
+			// never a per-token choice — see `PLAYER_TEMPLATE_ID`.
+			const playerTemplate = this.deps.settings.defaultTokenTemplates.find((t) => t.id === PLAYER_TEMPLATE_ID);
+			const lockedSelect = templateField.createEl("select");
+			lockedSelect.disabled = true;
+			const opt = lockedSelect.createEl("option", { text: playerTemplate?.name ?? "Joueur" });
+			opt.selected = true;
+		} else {
+			// Never offered to an "entity" token — reserved for players (see above). Defaults to the
+			// first remaining template as long as nothing's been picked yet.
+			const selectableTemplates = this.deps.settings.defaultTokenTemplates.filter((t) => !t.reserved);
+			const templateSelect = templateField.createEl("select");
+			const noneOpt = templateSelect.createEl("option", { text: "— aucun —" });
+			noneOpt.value = "";
+			for (const t of selectableTemplates) {
+				const opt = templateSelect.createEl("option", { text: t.name });
+				opt.value = t.id;
+			}
+			const effectiveId = token.templateId ?? selectableTemplates[0]?.id ?? "";
+			templateSelect.value = effectiveId;
+			templateSelect.onchange = () => this.controller.updateToken(token.id, (t) => (t.templateId = templateSelect.value || undefined));
 		}
-		templateSelect.onchange = () => this.controller.updateToken(token.id, (t) => (t.templateId = templateSelect.value || undefined));
-		if (this.deps.settings.defaultTokenTemplates.length === 0) {
-			templateField.createDiv({ cls: "map-manager-view-empty", text: "Aucun modèle défini (Réglages du plugin)." });
+		if (category === "entity" && this.deps.settings.defaultTokenTemplates.every((t) => t.reserved)) {
+			templateField.createDiv({ cls: "map-manager-view-empty", text: "Aucun modèle défini pour les entités (Réglages du plugin)." });
 		}
 
 		this.renderTokenTabsEditor(token);
@@ -940,27 +901,39 @@ export class InfoPanel {
 	}
 
 	/**
-	 * View mode ("Vue", still GM-facing — see `MapCanvas.drawTokenVisionZones`) only shows what's
-	 * needed mid-session: rotation (any category — for a player this is also their vision cone's
-	 * facing, see `castVisionRays`; for an entity it's what its own GM-only vision zone points, and
-	 * that zone is exactly what's drawn continuously here instead of only-while-selected like edit
-	 * mode), light (`renderLightRadiusField`, any category — a torch is exactly the kind of thing a
-	 * GM plausibly wants to flip mid-session, unlike the rest of a token's setup), and tabs'
-	 * read-only content (stats/inventory/story/... — see `renderTokenTabsReadOnly`, which applies to
-	 * both categories). Everything else (icon/image/name/category/size/color/template picker/vision
-	 * shape/delete) is edit-only. A "light" token has neither a facing nor tabs to begin with (see
-	 * `TokenCategory`'s own doc comment), so it gets neither — just its light field and a short note.
+	 * View mode ("Vue", still GM-facing) only shows what's needed mid-session: a static logo+name
+	 * header (`renderTokenLogoAndName`), rotation (entity-only — its own GM-only vision zone points
+	 * wherever this faces, drawn continuously here instead of only-while-selected like edit mode; a
+	 * player's fog reveal is their light, omnidirectional, with no facing to show), light
+	 * (`renderLightRadiusField`, any category — a torch is exactly the kind of thing a GM plausibly
+	 * wants to flip mid-session, unlike the rest of a token's setup), and tabs' read-only content
+	 * (stats/inventory/story/... — see `renderTokenTabsReadOnly`, which applies to both categories).
+	 * Everything else (icon/image/category/size/color/template picker/vision shape/delete) is
+	 * edit-only. A "light" token has neither a facing nor tabs to begin with (see `TokenCategory`'s
+	 * own doc comment), so it gets neither — just its light field and a short note.
 	 */
 	private renderTokenViewPanel(token: Token): void {
 		const category = token.category ?? "entity";
 		if (category === "light") {
 			this.el.createDiv({ cls: "map-manager-view-empty", text: "Source de lumière — invisible pour les joueurs." });
-			this.renderLightRadiusField(token, false, (mutator) => this.controller.updateToken(token.id, mutator));
+			this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 			return;
 		}
-		this.renderRotationField(token);
-		this.renderLightRadiusField(token, category === "player", (mutator) => this.controller.updateToken(token.id, mutator));
+		this.renderTokenLogoAndName(token);
+		if (category === "entity") this.renderRotationField(token);
+		this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 		this.renderTokenTabsReadOnly(token);
+	}
+
+	/** Static (non-editable) logo + name header for a token, Vue MJ only — the editable equivalent lives in `renderTokenPanel`'s own "Logo"/"Nom" fields. */
+	private renderTokenLogoAndName(token: Token): void {
+		const row = this.el.createDiv({ cls: "map-manager-token-view-header" });
+		if (token.image) {
+			row.createEl("img", { cls: "map-manager-token-view-logo", attr: { src: this.app.vault.adapter.getResourcePath(token.image) } });
+		} else if (token.icon) {
+			row.createSpan({ cls: "map-manager-token-view-logo-icon", text: token.icon });
+		}
+		row.createSpan({ cls: "map-manager-token-view-name", text: token.label || "(sans nom)" });
 	}
 
 	// ---- Token tabs (Statistiques/Inventaire/Histoire by default, customizable per token, any category) ----
@@ -1078,34 +1051,33 @@ export class InfoPanel {
 		}
 	}
 
-	private pickVaultTokenImage(token: Token): void {
+	/**
+	 * Loads `file` and writes a resized/cropped copy (see `resizeImageToSquare`,
+	 * `settings.tokenImageSize`) rather than pointing `token.image` straight at the picked file — a
+	 * large source image (a full-resolution character portrait, say) shouldn't get stored and
+	 * reloaded at full resolution just to be drawn as a small icon.
+	 */
+	private async pickVaultTokenImage(token: Token): Promise<void> {
 		const files = this.app.vault.getFiles().filter((f) => IMAGE_EXTENSIONS.includes(f.extension.toLowerCase()));
 		new FileSuggestModal(
 			this.app,
 			files,
-			(file: TFile) => this.controller.updateToken(token.id, (t) => (t.image = file.path)),
+			(file: TFile) => {
+				void (async () => {
+					try {
+						const resizedPath = await resizeImageToSquare(this.app, file.path, this.deps.settings.tokenImageSize, this.deps.assetsFolder);
+						this.controller.updateToken(token.id, (t) => (t.image = resizedPath));
+					} catch (e) {
+						console.error("Map Manager: échec du redimensionnement de l'image du pion", e);
+						new Notice(e instanceof Error ? e.message : "Échec du redimensionnement de l'image.");
+					}
+				})();
+			},
 			"Choisir une image du vault..."
 		).open();
 	}
 
-	private importTokenImageFromDisk(token: Token): void {
-		const input = document.createElement("input");
-		input.type = "file";
-		input.accept = "image/*";
-		input.onchange = async () => {
-			const file = input.files?.[0];
-			if (!file) return;
-			const buffer = await file.arrayBuffer();
-			const folder = this.deps.assetsFolder || "Map Assets";
-			await ensureFolder(this.app, folder);
-			const path = `${folder}/${Date.now()}-${sanitizeFileName(file.name)}`;
-			const created = await this.app.vault.createBinary(path, buffer);
-			this.controller.updateToken(token.id, (t) => (t.image = created.path));
-		};
-		input.click();
-	}
-
-	/** The token's own facing arrow (any category — see `drawTokenFacingArrow`), independent of a player's vision cone direction. */
+	/** The token's own facing arrow (entity-only in the UI — see `drawTokenFacingArrow`). */
 	private renderRotationField(token: Token): void {
 		const wrap = this.el.createDiv({ cls: "map-manager-field" });
 		this.makeRotationDialField(wrap, "Rotation (°, 0=est, horaire)", token.rotation ?? DEFAULT_TOKEN_ROTATION, (v) =>
@@ -1114,18 +1086,14 @@ export class InfoPanel {
 	}
 
 	/**
-	 * Range/radius (see `visionRange`/`visionRadius` in `mapData.ts`) are shared fields for either
-	 * category, but the cone shape itself diverges: a player gets the single `visionAngle` slider it
-	 * always had, lighting up the fog for real (`castVisionRays`/`drawFog`) as well as showing a
-	 * GM-only preview when selected in edit mode; an entity instead gets `renderEntityEyeFields`'s
-	 * eye-angle + 3-tier controls, only ever a GM-only hint (`MapCanvas.drawTokenVisionZones`), never
-	 * touching fog. Either way the direction itself is `token.rotation` (see `renderRotationField`)
-	 * — the cone(s) just point wherever the token is facing, nothing to configure here beyond shape/reach.
+	 * Entity-only (see `renderTokenPanel`) — `renderEntityEyeFields`'s eye-angle + 3-tier controls,
+	 * only ever a GM-only hint, never touching fog, plus `visionRange` (reach). The direction itself
+	 * is `token.rotation` (see `renderRotationField`) — the cone(s) just point wherever the token is
+	 * facing, nothing to configure here beyond shape/reach.
 	 */
-	private renderVisionFields(token: Token, category: TokenCategory): void {
-		const isPlayer = category === "player";
+	private renderVisionFields(token: Token): void {
 		const wrap = this.el.createDiv({ cls: "map-manager-field" });
-		wrap.createEl("label", { text: isPlayer ? "Vision (brouillard de guerre)" : "Vision (zone visible par le MJ uniquement)" });
+		wrap.createEl("label", { text: "Vision (zone visible par le meneur de jeu uniquement)" });
 		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
 
 		const makeNumberInput = (labelText: string, value: number, onChange: (v: number) => void) => {
@@ -1139,32 +1107,8 @@ export class InfoPanel {
 			};
 		};
 
-		if (isPlayer) {
-			this.makeSliderField(
-				row,
-				"Angle (°)",
-				token.visionAngle ?? DEFAULT_VISION_ANGLE,
-				1,
-				360,
-				(v) => this.controller.updateToken(token.id, (t) => (t.visionAngle = v)),
-				10
-			);
-		} else {
-			this.renderEntityEyeFields(token, row);
-		}
-
-		makeNumberInput("Portée (cases)", token.visionRange ?? DEFAULT_VISION_RANGE, (v) =>
-			this.controller.updateToken(token.id, (t) => (t.visionRange = Math.max(0, v)))
-		);
-		// While this player token's light is linked to its own vision radius
-		// (`lightRadiusLinkedToVision` — see `renderLightRadiusField`), editing this field also keeps
-		// `lightRadius` in step, same two-way sync as editing the light field itself does.
-		makeNumberInput(isPlayer ? "Rayon exploré (cases)" : "Rayon (cases)", token.visionRadius ?? DEFAULT_VISION_RADIUS, (v) =>
-			this.controller.updateToken(token.id, (t) => {
-				t.visionRadius = Math.max(0, v);
-				if (isPlayer && t.lightRadiusLinkedToVision) t.lightRadius = Math.max(0, v);
-			})
-		);
+		this.renderEntityEyeFields(token, row);
+		makeNumberInput("Portée (cases)", token.visionRange ?? DEFAULT_VISION_RANGE, (v) => this.controller.updateToken(token.id, (t) => (t.visionRange = Math.max(0, v))));
 	}
 
 	/**

@@ -31,7 +31,14 @@ export class MapDrawer {
 		return this.getTransform();
 	}
 
-	drawGridAndCells(ctx: CanvasRenderingContext2D): void {
+	/**
+	 * `zonesVisible` gates only the zone-color tint (edit mode's "Zones" group toggle,
+	 * `MapController.showZones`/`toggleShowZones`) — grid lines, stamps/labels, and link badges below
+	 * are unaffected by it, always drawn whenever this whole method runs (see `MapCanvas.cellsCurrentlyVisible`).
+	 * Computed by the caller (mirror-safe, via `effectiveMode()`) rather than read from
+	 * `controller.mode`/`showZones` directly here, same pattern as `drawWalls`'s own `mode` parameter.
+	 */
+	drawGridAndCells(ctx: CanvasRenderingContext2D, zonesVisible: boolean): void {
 		const data = this.controller.getData();
 		if (data.gridType === "none") return;
 		const cellSize = this.hit.effectiveCellSize();
@@ -48,7 +55,7 @@ export class MapDrawer {
 				const y = c.b * cellSize;
 				for (const layer of visibleLayers) {
 					const cell = layer.cellsByGridType[data.gridType][key];
-					if (cell?.zoneTypeId) this.fillZone(ctx, this.settings.defaultZoneTypes, cell.zoneTypeId, () => ctx.rect(x, y, cellSize, cellSize));
+					if (cell?.zoneTypeId && zonesVisible) this.fillZone(ctx, this.settings.defaultZoneTypes, cell.zoneTypeId, () => ctx.rect(x, y, cellSize, cellSize));
 				}
 				ctx.strokeStyle = gridColor;
 				ctx.strokeRect(x, y, cellSize, cellSize);
@@ -71,7 +78,7 @@ export class MapDrawer {
 				};
 				for (const layer of visibleLayers) {
 					const cell = layer.cellsByGridType[data.gridType][key];
-					if (cell?.zoneTypeId) this.fillZone(ctx, this.settings.defaultZoneTypes, cell.zoneTypeId, drawPath);
+					if (cell?.zoneTypeId && zonesVisible) this.fillZone(ctx, this.settings.defaultZoneTypes, cell.zoneTypeId, drawPath);
 				}
 				ctx.beginPath();
 				drawPath();
@@ -169,9 +176,13 @@ export class MapDrawer {
 	 * per-cell blocker badges used) plus each point's handle, drawn whenever the grid/cell overlay
 	 * would be (matches the old badges' visibility, hence the `cellsVisible` param — `MapCanvas.render()`
 	 * already computes it once per frame). Point handles only show while actively placing walls or with
-	 * one selected — otherwise just the lines, so authored walls read as map geometry.
+	 * one selected — otherwise just the lines, so authored walls read as map geometry. Never drawn on a
+	 * player-mirror window (`isMirror`) — walls still block vision/line-of-sight there via
+	 * `getWallSegments()` elsewhere, but the authored geometry itself must stay invisible to players.
+	 * The GM's own tabs (edit and View) keep showing it, same as before.
 	 */
-	drawWalls(ctx: CanvasRenderingContext2D, cellsVisible: boolean, mode: MapMode, draggingWallPoint: DraggingWallPoint | null): void {
+	drawWalls(ctx: CanvasRenderingContext2D, cellsVisible: boolean, mode: MapMode, isMirror: boolean, draggingWallPoint: DraggingWallPoint | null): void {
+		if (isMirror) return;
 		const data = this.controller.getData();
 		if (!cellsVisible && data.gridType !== "none") return;
 		const showHandles =

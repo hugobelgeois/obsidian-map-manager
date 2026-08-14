@@ -1,5 +1,6 @@
 import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
+import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
 import { DEFAULT_TOKEN_COLOR, Token, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
@@ -66,7 +67,7 @@ interface DraggingToken {
 	currentWorld: { x: number; y: number };
 }
 
-/** View mode only: a multi-selected group of tokens being dragged together — see `MapCanvas.startGroupDrag`/`commitGroupDrag`. */
+/** A multi-selected group of tokens being dragged together, either mode — see `MapCanvas.startGroupDrag`/`commitGroupDrag`. */
 interface DraggingTokenGroup {
 	anchorTokenId: string;
 	entries: { token: Token; originWorld: { x: number; y: number } }[];
@@ -195,27 +196,24 @@ export class MapCanvas {
 	private pointerDownAt = { x: 0, y: 0 };
 	private lastPointer = { x: 0, y: 0 };
 
-	/** "select" tool only: whatever object (if any) sat directly under the pointer on down — resolved into a toggle on a plain click, or ignored in favor of `marqueeWorld` once the drag exceeds `DRAG_THRESHOLD`. See `handleSelectPointerDown`. */
-	private selectPointerHit: { kind: MassSelectionKind; id: string } | null = null;
+	/** Ctrl+mousedown only, both modes: whatever object (if any) sat directly under the pointer — resolved into a toggle on a plain ctrl+click, or just dropped in favor of the distribute-paint drag (tokens only) once the drag exceeds `DRAG_THRESHOLD`. See `handleMassSelectCtrlPointerDown`. */
+	private massSelectCtrlHit: { kind: MassSelectionKind; id: string } | null = null;
 	/**
-	 * The live marquee rectangle (world space) while dragging — `null` outside a marquee drag. Shared
-	 * by the edit-mode "select" tool (see `handleSelectPointerDown`) and view mode's Shift-drag
-	 * multi-token select (see `onPointerDown`'s `e.shiftKey` branch). See `onPointerMove`/
+	 * The live marquee rectangle (world space) while dragging — `null` outside a marquee drag. Shift
+	 * held down, either mode — see `onPointerDown`'s `e.shiftKey` branch. See `onPointerMove`/
 	 * `drawMassSelectionOverlay`.
 	 */
 	private marqueeWorld: { start: { x: number; y: number }; current: { x: number; y: number } } | null = null;
 
-	/** View mode only: a token's whole selected group being dragged together, preserving relative offsets — see `startGroupDrag`/`commitGroupDrag`. */
+	/** A token's whole selected group being dragged together, preserving relative offsets, either mode — see `startGroupDrag`/`commitGroupDrag`. */
 	private draggingTokenGroup: DraggingTokenGroup | null = null;
-	/** View mode only: whatever token (if any) sat under the pointer at a Ctrl+mousedown — resolved into a toggle on a plain Ctrl+click, or ignored in favor of the distribute-paint drag once past `DRAG_THRESHOLD`. See `handleViewCtrlPointerDown`. */
-	private viewCtrlTokenHit: string | null = null;
 	/**
-	 * View mode only: "distribute the selection into this area" — works like the brush tool, painting
-	 * whatever cell the pointer is over into the area as the Ctrl-drag moves (any resulting shape, not
-	 * just a rectangle), rather than dragging out a bounding box. `cellKeys` accumulates every distinct
-	 * cell painted so far (celled grids); `points` accumulates the raw pointer path (grid type "none",
-	 * which has no cells to paint — see `recomputeDistributePreview`'s proportional-remap branch).
-	 * `null` outside that gesture. See `handleViewCtrlPointerDown`/`recomputeDistributePreview`.
+	 * "Distribute the selection into this area" (ctrl+drag, either mode) — works like the brush tool,
+	 * painting whatever cell the pointer is over into the area as the drag moves (any resulting shape,
+	 * not just a rectangle), rather than dragging out a bounding box. `cellKeys` accumulates every
+	 * distinct cell painted so far (celled grids); `points` accumulates the raw pointer path (grid
+	 * type "none", which has no cells to paint — see `recomputeDistributePreview`'s proportional-remap
+	 * branch). `null` outside that gesture. See `handleMassSelectCtrlPointerDown`/`recomputeDistributePreview`.
 	 */
 	private distributePaint: { cellKeys: Set<string>; points: { x: number; y: number }[]; lastCellKey: string | null } | null = null;
 	/** Live preview for the distribute-paint gesture, recomputed on every cell/point painted — see `recomputeDistributePreview`. */
@@ -253,24 +251,62 @@ export class MapCanvas {
 		const px = e.clientX - rect.left;
 		const py = e.clientY - rect.top;
 
+		// "Placer un pion ici" is always on offer, so this always overrides the browser's own context
+		// menu — unlike `showContextMenu`'s "Coller ici", which depends on an async clipboard read.
+		e.preventDefault();
+		void this.showContextMenu(e, px, py);
+	};
+
+	/**
+	 * Builds and shows the right-click menu — split out from `onContextMenu` (which must call
+	 * `e.preventDefault()` synchronously to suppress the browser's own menu) because deciding whether
+	 * to offer "Coller ici" needs an async read of the real OS clipboard first, so it isn't shown for
+	 * clipboard content that wouldn't actually paste anything (see `parseClipboardTokens`).
+	 */
+	private async showContextMenu(e: MouseEvent, px: number, py: number): Promise<void> {
+		await this.refreshClipboardFromSystem();
+
 		const menu = new Menu();
-		let hasItem = false;
-		// Markers are freeform (grid type "none" only, see `Marker`), map-structure objects — edit mode only.
-		if (this.controller.mode === "edit" && this.controller.getData().gridType === "none") {
-			menu.addItem((item) => item.setTitle("Placer un tampon ici").setIcon("map-pin").onClick(() => this.addMarkerAt(px, py)));
-			hasItem = true;
+		// Placing a tampon is map-structure — edit mode only — regardless of grid type; see `addStampAt`
+		// for the grid-type-"none" (freeform `Marker`) vs. celled-grid (a cell's own `stamp` field) split.
+		if (this.controller.mode === "edit") {
+			menu.addItem((item) => item.setTitle("Placer un tampon ici").setIcon("map-pin").onClick(() => this.addStampAt(px, py)));
 		}
 		// Tokens can be dropped in both modes — a GM adding a monster/NPC mid-session (view mode)
 		// needs this as much as one building the map out (edit mode).
 		menu.addItem((item) => item.setTitle("Placer un pion ici").setIcon("user").onClick(() => this.addTokenAt(px, py)));
-		hasItem = true;
-		// Nothing to offer (e.g. edit mode on a celled grid) — let the browser's own context menu show.
-		if (!hasItem) return;
-		e.preventDefault();
+		// Only offered once the clipboard refresh above found something valid to paste — see this
+		// method's own doc.
+		if (hasTokenClipboard()) {
+			menu.addItem((item) => item.setTitle("Coller ici").setIcon("clipboard-paste").onClick(() => void this.pasteTokensAtScreenPoint(px, py)));
+		}
 		menu.showAtMouseEvent(e);
-	};
+	}
+
+	/**
+	 * Refreshes the in-memory token clipboard (see `tokenClipboard.ts`) from the real OS clipboard, so
+	 * a paste picks up tokens copied in a *previous* Obsidian session, or copied via Ctrl+C on a
+	 * *different* open map, not just this same session's in-memory copy. Shared by `showContextMenu`
+	 * (deciding whether to offer "Coller ici") and `pasteTokensAtWorldPoint` (the actual paste) — a
+	 * soft failure (denied/unavailable clipboard: sandboxed webview, missing permission, mobile...)
+	 * just leaves the in-memory clipboard as whatever it already was.
+	 */
+	private async refreshClipboardFromSystem(): Promise<void> {
+		try {
+			const text = await navigator.clipboard.readText();
+			const tokens = parseClipboardTokens(text);
+			if (tokens) setTokenClipboard(tokens);
+		} catch (err) {
+			console.warn("Map Manager: lecture du presse-papier système impossible, utilisation du presse-papier interne", err);
+		}
+	}
 
 	private onPointerDown = (e: PointerEvent) => {
+		// Grabs keyboard focus so Ctrl+C/Ctrl+V (see `onKeyDown`) work right after interacting with the
+		// map, without an extra dedicated click just to focus it first. `preventScroll` avoids the
+		// page jumping to bring the canvas into view — it's already what was just clicked.
+		this.canvas.focus({ preventScroll: true });
+
 		// Right-click is handled entirely by `onContextMenu` (undo last wall point) while the wall
 		// tool is active — skip the normal drag/click machinery below for it.
 		if (e.button === 2 && this.controller.activeTool === "wall") return;
@@ -291,31 +327,23 @@ export class MapCanvas {
 		// handled in onPointerMove's final `else` branch, same as a left-click on empty space.
 		if (e.button !== 0) return;
 
-		// The "select" tool gets its own entirely separate branch — it never falls through to the
-		// token/marker/wall-point/brush/fill/wall handling below, which assumes a different tool is
-		// active. See `handleSelectPointerDown`.
-		if (this.controller.mode === "edit" && this.controller.activeTool === "select") {
-			this.handleSelectPointerDown(px, py);
-			return;
-		}
-
-		// View mode's own multi-token select gestures take priority over the plain token-drag/pan
-		// handling below — Ctrl (toggle-on-click / paint-the-distribute-area-on-drag) and Shift
-		// (marquee select) each get their own branch, mutually exclusive with everything else a click
-		// could do.
-		if (this.controller.mode === "view" && e.ctrlKey) {
-			this.handleViewCtrlPointerDown(px, py);
-			return;
-		}
-		if (this.controller.mode === "view" && e.shiftKey) {
+		// Mass-select gestures (ctrl+click toggle / shift-drag marquee) take priority over the plain
+		// token-drag/pan handling below, in both modes — but only while no drawing tool (brush/fill/
+		// wall) is armed, same as brush/fill/wall themselves only ever apply in edit mode. Ctrl also
+		// arms the "distribute the selection into this area" drag (see `handleMassSelectCtrlPointerDown`),
+		// mutually exclusive with everything else a click could do.
+		if (this.controller.activeTool === "none" && e.shiftKey) {
 			const world = screenToWorld(px, py, this.transform);
 			this.marqueeWorld = { start: world, current: world };
 			return;
 		}
+		if (this.controller.activeTool === "none" && e.ctrlKey) {
+			this.handleMassSelectCtrlPointerDown(px, py);
+			return;
+		}
 
-		// Tokens are selectable in both modes, but only draggable/movable in view mode — edit mode
-		// is for the map's structure (grid, zones, layers, markers, brush/fill), so a hit there just
-		// selects the token instead of letting the click fall through to panning/tools.
+		// Tokens are selectable and draggable/movable in both modes — unlike the grid/zones/walls,
+		// pion placement isn't "map structure" reserved to edit mode.
 		const tokenHit = this.hit.findTokenAtScreenPoint(px, py);
 
 		// "Animation" token movement (view mode only, the default and only way tokens tween — see
@@ -331,19 +359,15 @@ export class MapCanvas {
 		}
 
 		if (tokenHit) {
-			if (this.controller.mode === "view") {
-				// A token already part of a real (2+) multi-selection drags the whole group together;
-				// otherwise this click starts fresh — any previous multi-selection is dropped so a plain
-				// drag only ever moves the one token actually under the pointer.
-				if (this.controller.massSelectionKind === "token" && this.controller.massSelectedTokenIds.has(tokenHit.id) && this.controller.massSelectedTokenIds.size > 1) {
-					this.startGroupDrag(tokenHit, px, py);
-				} else {
-					if (this.controller.massSelectedTokenIds.size > 0) this.controller.clearMassSelection();
-					this.draggingToken = { token: tokenHit, currentWorld: screenToWorld(px, py, this.transform) };
-				}
+			// A token already part of a real (2+) multi-selection drags the whole group together;
+			// otherwise this click starts fresh — any previous multi-selection is dropped so a plain
+			// drag only ever moves the one token actually under the pointer. `onPointerUp` decides
+			// between a plain click (select) and an actual drag (move) once `dragMoved` is known.
+			if (this.controller.massSelectionKind === "token" && this.controller.massSelectedTokenIds.has(tokenHit.id) && this.controller.massSelectedTokenIds.size > 1) {
+				this.startGroupDrag(tokenHit, px, py);
 			} else {
-				this.controller.selectToken(tokenHit.id);
-				this.toolConsumedClick = true;
+				if (this.controller.massSelectedTokenIds.size > 0) this.controller.clearMassSelection();
+				this.draggingToken = { token: tokenHit, currentWorld: screenToWorld(px, py, this.transform) };
 			}
 			return;
 		}
@@ -405,24 +429,17 @@ export class MapCanvas {
 	};
 
 	/**
-	 * The "select" tool's own pointer-down handling: hit-tests token → wall segment → (marker on grid
-	 * "none", else cell) in that priority, skipping a tier whose kind doesn't match an already-locked
-	 * `massSelectionKind`. Doesn't mutate the controller yet — `onPointerUp` decides between a plain
-	 * click (toggle) and a marquee drag once `dragMoved` is known, same pattern as token/marker drags.
+	 * Hit-tests token → wall segment → (marker on grid "none", else cell) in that priority, skipping a
+	 * tier whose kind doesn't match an already-locked `massSelectionKind`. The "wallSegment" tier only
+	 * applies in edit mode — walls aren't a selectable concept in Vue.
 	 */
-	private handleSelectPointerDown(px: number, py: number): void {
-		const world = screenToWorld(px, py, this.transform);
-		this.marqueeWorld = { start: world, current: world };
-		this.selectPointerHit = this.resolveSelectHit(px, py);
-	}
-
 	private resolveSelectHit(px: number, py: number): { kind: MassSelectionKind; id: string } | null {
 		const lockedKind = this.controller.massSelectionKind;
 		if (!lockedKind || lockedKind === "token") {
 			const token = this.hit.findTokenAtScreenPoint(px, py);
 			if (token) return { kind: "token", id: token.id };
 		}
-		if (!lockedKind || lockedKind === "wallSegment") {
+		if (this.controller.mode === "edit" && (!lockedKind || lockedKind === "wallSegment")) {
 			const segment = this.hit.findWallSegmentAtScreenPoint(px, py);
 			if (segment) return { kind: "wallSegment", id: segment.id };
 		}
@@ -437,6 +454,23 @@ export class MapCanvas {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Ctrl+mousedown, either mode: remembers whatever token/wall-segment/tampon (if any) is under the
+	 * pointer, for a later toggle if this turns out to be a plain click (`handleDistributePointerUp`),
+	 * and always starts a distribute-paint stroke too — immediately painting the cell right under the
+	 * pointer, exactly like the brush tool's own `onPointerDown` paints its very first cell rather than
+	 * waiting for the first `onPointerMove`. Harmless when the hit isn't a token or nothing's
+	 * mass-selected yet: `recomputeDistributePreview`/`commitDistribute` only ever move
+	 * `massSelectedTokenIds`, regardless of what tier was actually hit here.
+	 */
+	private handleMassSelectCtrlPointerDown(px: number, py: number): void {
+		this.massSelectCtrlHit = this.resolveSelectHit(px, py);
+		this.distributePaint = { cellKeys: new Set(), points: [], lastCellKey: null };
+		this.paintDistributeCellAt(px, py);
+		this.recomputeDistributePreview();
+		this.render();
 	}
 
 	private onPointerMove = (e: PointerEvent) => {
@@ -499,8 +533,8 @@ export class MapCanvas {
 
 		if (!this.dragMoved) return;
 
-		// Shared by the edit-mode "select" tool's marquee and view mode's Shift-drag marquee — both
-		// just fill in the same `marqueeWorld` at pointer-down (see `onPointerDown`).
+		// The shift-drag marquee, either mode — just fills in `marqueeWorld` at pointer-down (see
+		// `onPointerDown`).
 		if (this.marqueeWorld) {
 			this.marqueeWorld.current = screenToWorld(px, py, this.transform);
 			this.render();
@@ -546,10 +580,9 @@ export class MapCanvas {
 		// A plain left-click on empty space (no edit tool armed, and not landing on a token/marker —
 		// those already have their own selection/info-panel feedback, a ping would be redundant)
 		// pings that spot for players — view mode only, since in edit mode a plain click is just
-		// deselecting/panning. Checked before `toolConsumedClick`/`painting` below, since a
-		// token click in edit mode also flips `toolConsumedClick` (it's not just for brush/fill/wall
-		// placement). Re-does the same hit-tests as `onPointerDown` rather than reading
-		// `draggingToken`/`draggingMarker`, since edit mode never sets those for a token click.
+		// deselecting/panning. Checked before `toolConsumedClick`/`painting` below. Re-does the same
+		// hit-tests as `onPointerDown` rather than reading `draggingToken`/`draggingMarker` directly,
+		// so this stays correct regardless of exactly which of those two ends up set for a given hit.
 		// Right-click is excluded — that's `onContextMenu`'s job (placing a token there), not a ping.
 		if (!this.dragMoved && e.button === 0 && !e.ctrlKey && !e.shiftKey && this.controller.mode === "view" && this.controller.activeTool === "none") {
 			const rect = this.canvas.getBoundingClientRect();
@@ -558,8 +591,9 @@ export class MapCanvas {
 			const hitToken = this.hit.findTokenAtScreenPoint(px, py);
 			const hitMarker = this.controller.getData().gridType === "none" ? this.hit.findMarkerAtScreenPoint(px, py) : null;
 			if (!hitToken && !hitMarker) {
-				// Genuinely empty space, no modifier: same "click clears" convention as the edit-mode
-				// select tool's marquee (see `handleSelectPointerUp`), on top of the existing ping.
+				// Genuinely empty space, no modifier: same "click clears" convention as the mass-select
+				// marquee/toggle gestures (see `handleMarqueePointerUp`/`handleDistributePointerUp`), on
+				// top of the existing ping.
 				if (this.controller.massSelectedTokenIds.size > 0) this.controller.clearMassSelection();
 				const world = screenToWorld(px, py, this.transform);
 				this.triggerPing(world.x, world.y);
@@ -567,8 +601,8 @@ export class MapCanvas {
 			}
 		}
 
-		if (this.controller.mode === "view" && this.marqueeWorld) {
-			this.handleViewMarqueePointerUp();
+		if (this.marqueeWorld) {
+			this.handleMarqueePointerUp();
 			return;
 		}
 		if (this.distributePaint) {
@@ -577,11 +611,6 @@ export class MapCanvas {
 		}
 		if (this.draggingTokenGroup) {
 			this.commitGroupDrag();
-			return;
-		}
-
-		if (this.controller.mode === "edit" && this.controller.activeTool === "select") {
-			this.handleSelectPointerUp();
 			return;
 		}
 
@@ -656,6 +685,11 @@ export class MapCanvas {
 	};
 
 	private onPointerCancel = () => {
+		this.cancelActiveGesture();
+	};
+
+	/** Drops whatever pointer gesture is currently in progress without committing anything — shared by `onPointerCancel` (losing pointer capture mid-gesture) and `handleEscape` (the same thing, keyboard-triggered). */
+	private cancelActiveGesture(): void {
 		this.dragging = false;
 		this.draggingToken = null;
 		this.draggingMarker = null;
@@ -666,73 +700,52 @@ export class MapCanvas {
 		this.lastPaintedKey = null;
 		this.paintedInStroke = new Set();
 		this.toolConsumedClick = false;
-		this.selectPointerHit = null;
+		this.massSelectCtrlHit = null;
 		this.marqueeWorld = null;
 		this.draggingTokenGroup = null;
-		this.viewCtrlTokenHit = null;
 		this.distributePaint = null;
 		this.distributePreview = null;
 		this.drawingPath = null;
-	};
-
-	/**
-	 * A plain click (no drag) toggles whatever `handleSelectPointerDown` resolved under the pointer;
-	 * a marquee drag instead adds every matching-kind object inside the drag rect. If no kind is
-	 * locked yet, a marquee tries tokens → wall segments → stamps, locking on the first tier with any
-	 * hits — see `inferMarqueeKind`.
-	 */
-	private handleSelectPointerUp(): void {
-		const hit = this.selectPointerHit;
-		const marquee = this.marqueeWorld;
-		this.selectPointerHit = null;
-		this.marqueeWorld = null;
-
-		if (!this.dragMoved) {
-			if (hit) {
-				this.controller.toggleMassSelection(hit.kind, hit.id);
-			} else if (this.controller.getData().gridType === "none") {
-				// Genuinely empty background — only possible on grid "none" (a celled grid has no
-				// "empty" click, every point belongs to some cell) — resets the whole selection.
-				this.controller.clearMassSelection();
-			}
-			return;
-		}
-
-		if (!marquee) return;
-		const rect = this.hit.normalizedWorldRect(marquee.start, marquee.current);
-		const kind = this.controller.massSelectionKind ?? this.hit.inferMarqueeKind(rect);
-		if (!kind) return;
-		const ids = this.hit.idsInRect(kind, rect);
-		if (ids.length > 0) this.controller.addMassSelection(kind, ids);
 	}
 
-	/** View mode's Shift-drag marquee release: unlike the edit-mode select tool, this only ever targets tokens — a click with no drag is a no-op (Ctrl+click is the dedicated single-token toggle gesture). */
-	private handleViewMarqueePointerUp(): void {
+	/** Whether some pointer gesture is currently in progress — see `cancelActiveGesture`. Kept in sync with the fields `cancelActiveGesture` resets. */
+	private hasActiveGesture(): boolean {
+		return (
+			this.dragging ||
+			!!this.draggingToken ||
+			!!this.draggingMarker ||
+			!!this.draggingWallPoint ||
+			!!this.pendingWallSegmentId ||
+			this.painting ||
+			!!this.massSelectCtrlHit ||
+			!!this.marqueeWorld ||
+			!!this.draggingTokenGroup ||
+			!!this.distributePaint ||
+			!!this.drawingPath
+		);
+	}
+
+	/**
+	 * Shift-drag marquee release, either mode: adds every matching-kind object inside the drag rect.
+	 * If no kind is locked yet, tries tokens → wall segments (edit mode only), locking on the first
+	 * tier with any hits — see `inferMarqueeKind`. Stamps can never be marquee-selected, even when a
+	 * mass selection is already `"stamp"`-locked from earlier ctrl+clicks (one at a time is the only way
+	 * to add to it — see `resolveSelectHit`/`handleMassSelectCtrlPointerDown`), since a marquee over
+	 * painted zone cells would otherwise scoop up huge swaths of the grid at once. A plain shift-click
+	 * with no drag is a no-op (ctrl+click is the dedicated single-object toggle gesture).
+	 */
+	private handleMarqueePointerUp(): void {
 		const marquee = this.marqueeWorld;
 		this.marqueeWorld = null;
 		if (!marquee || !this.dragMoved) return;
 		const rect = this.hit.normalizedWorldRect(marquee.start, marquee.current);
-		const ids = this.hit.tokensInRect(rect);
-		if (ids.length > 0) this.controller.addMassSelection("token", ids);
+		const kind = this.controller.massSelectionKind ?? this.hit.inferMarqueeKind(rect);
+		if (!kind || kind === "stamp") return;
+		const ids = this.hit.idsInRect(kind, rect);
+		if (ids.length > 0) this.controller.addMassSelection(kind, ids);
 	}
 
-	// ---- View mode: multi-token select / group move / distribute-into-area ----
-
-	/**
-	 * Ctrl+mousedown in view mode: remembers whatever token (if any) is under the pointer, for a
-	 * later toggle if this turns out to be a plain click, and always starts a distribute-paint stroke
-	 * — immediately painting the cell right under the pointer, exactly like the brush tool's own
-	 * `onPointerDown` paints its very first cell rather than waiting for the first `onPointerMove` —
-	 * which gesture this actually is is only known once `onPointerUp` sees whether the pointer moved
-	 * past `DRAG_THRESHOLD` (see `handleDistributePointerUp`).
-	 */
-	private handleViewCtrlPointerDown(px: number, py: number): void {
-		this.viewCtrlTokenHit = this.hit.findTokenAtScreenPoint(px, py)?.id ?? null;
-		this.distributePaint = { cellKeys: new Set(), points: [], lastCellKey: null };
-		this.paintDistributeCellAt(px, py);
-		this.recomputeDistributePreview();
-		this.render();
-	}
+	// ---- Mass-select (ctrl+click/shift-drag) / group move / distribute-into-area, either mode ----
 
 	/** Paints whatever cell (or, on grid type "none", raw point) is at `(px, py)` into the in-progress `distributePaint` stroke — a no-op if it's the same cell already painted last. */
 	private paintDistributeCellAt(px: number, py: number): void {
@@ -749,16 +762,27 @@ export class MapCanvas {
 		paint.cellKeys.add(key);
 	}
 
-	/** Ctrl+mouseup: a plain click toggles whatever token was under the pointer at mousedown; a drag commits (or, if the preview turned red, rejects) the distribute-into-area gesture computed live by `recomputeDistributePreview`. */
+	/**
+	 * Ctrl+mouseup, either mode: a plain click toggles whatever `handleMassSelectCtrlPointerDown`
+	 * resolved under the pointer (any kind — token/wall segment/tampon), or clears the whole selection
+	 * if nothing was hit on grid type "none" (a celled grid has no "empty" click — every point belongs
+	 * to some cell). A drag instead commits (or, if the preview turned red, rejects) the
+	 * distribute-into-area gesture computed live by `recomputeDistributePreview` — always token-only,
+	 * regardless of what tier was hit at mousedown.
+	 */
 	private handleDistributePointerUp(): void {
-		const hitId = this.viewCtrlTokenHit;
+		const hit = this.massSelectCtrlHit;
 		const preview = this.distributePreview;
-		this.viewCtrlTokenHit = null;
+		this.massSelectCtrlHit = null;
 		this.distributePaint = null;
 		this.distributePreview = null;
 
 		if (!this.dragMoved) {
-			if (hitId) this.controller.toggleMassSelection("token", hitId);
+			if (hit) {
+				this.controller.toggleMassSelection(hit.kind, hit.id);
+			} else if (this.controller.getData().gridType === "none") {
+				this.controller.clearMassSelection();
+			}
 			this.render();
 			return;
 		}
@@ -1212,6 +1236,11 @@ export class MapCanvas {
 			this.canvas.addEventListener("dblclick", this.onDoubleClick);
 			this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
 			this.canvas.addEventListener("contextmenu", this.onContextMenu);
+			// Focusable so its own `keydown` (Ctrl+C/Ctrl+V — see `onKeyDown`) fires at all; a plain
+			// `<canvas>` isn't in the tab order by default. Never focused for a mirror canvas — it has
+			// no interaction handlers to begin with (see the branch this sits in).
+			this.canvas.tabIndex = 0;
+			this.canvas.addEventListener("keydown", this.onKeyDown);
 		}
 
 		this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -1382,6 +1411,7 @@ export class MapCanvas {
 			this.canvas.removeEventListener("dblclick", this.onDoubleClick);
 			this.canvas.removeEventListener("wheel", this.onWheel);
 			this.canvas.removeEventListener("contextmenu", this.onContextMenu);
+			this.canvas.removeEventListener("keydown", this.onKeyDown);
 		}
 		this.unsubscribe();
 		this.canvas.remove();
@@ -1546,14 +1576,16 @@ export class MapCanvas {
 			return;
 		}
 
-		if (this.controller.mode === "view") {
-			const data = this.controller.getData();
-			if (data.gridType === "none") return;
-			const cell = this.controller.getActiveLayer().cellsByGridType[data.gridType][key];
-			if (isCellEmpty(cell)) {
-				this.controller.selectCell(null);
-				return;
-			}
+		// A plain left-click only (re)opens the info panel for a cell that already carries something (a
+		// placed tampon/zone/label/link) — the same rule in both modes now (used to be view-mode only).
+		// An empty cell is left untouched by a plain click: paint it with the brush/fill tool first
+		// (edit mode) to make it selectable, then click it to add a tampon/label/links.
+		const data = this.controller.getData();
+		if (data.gridType === "none") return;
+		const cell = this.controller.getActiveLayer().cellsByGridType[data.gridType][key];
+		if (isCellEmpty(cell)) {
+			this.controller.selectCell(null);
+			return;
 		}
 
 		this.controller.selectCell(this.controller.selectedCellKey === key ? null : key);
@@ -1564,6 +1596,30 @@ export class MapCanvas {
 		const world = screenToWorld(px, py, this.transform);
 		const marker = this.controller.addMarker(world.x, world.y);
 		this.controller.selectMarker(marker.id);
+	}
+
+	/**
+	 * Right-click menu's "Placer un tampon ici" (edit mode, any grid type): a freeform `Marker` on grid
+	 * type "none" (`addMarkerAt`), or, on a celled grid, the clicked cell's own `stamp` field — matching
+	 * `InfoPanel`'s "Logo" quick-pick (see `QUICK_STAMPS`). An already-stamped cell is left alone and
+	 * just (re)selected, rather than clobbered with the default, mirroring how right-clicking empty
+	 * space never creates a second marker on top of an existing one on grid type "none" either.
+	 */
+	private addStampAt(px: number, py: number): void {
+		const data = this.controller.getData();
+		if (data.gridType === "none") {
+			this.addMarkerAt(px, py);
+			return;
+		}
+		const world = screenToWorld(px, py, this.transform);
+		const key = this.hit.cellKeyAt(world.x, world.y);
+		const cell = this.controller.getActiveLayer().cellsByGridType[data.gridType][key];
+		if (!cell?.stamp) {
+			// "📍" mirrors the menu item's own "map-pin" icon — just a sensible default, freely
+			// changeable afterward from the info panel's "Logo" row like any other quick-pick.
+			this.controller.updateCell(key, (c) => (c.stamp = "📍"));
+		}
+		this.controller.selectCell(key);
 	}
 
 	/** Places a token at a specific screen point (edit-mode right-click menu) rather than the viewport center. */
@@ -1581,6 +1637,121 @@ export class MapCanvas {
 			return;
 		}
 		this.controller.selectToken(token.id);
+	}
+
+	/** Right-click menu's "Coller ici" — screen-point wrapper around `pasteTokensAtWorldPoint`, mirroring `addTokenAt`. */
+	private pasteTokensAtScreenPoint(px: number, py: number): Promise<void> {
+		const world = screenToWorld(px, py, this.transform);
+		return this.pasteTokensAtWorldPoint(world.x, world.y);
+	}
+
+	/**
+	 * Pastes at a specific world point — shared by the right-click "Coller ici" and the Ctrl+V
+	 * shortcut (see `onKeyDown`). First tries to refresh the in-memory clipboard (see
+	 * `tokenClipboard.ts`) from the real OS clipboard, so a paste picks up tokens copied in a
+	 * *previous* Obsidian session, or copied via Ctrl+C on a *different* open map, not just this same
+	 * session's in-memory copy — falling back to whatever's already in-memory (e.g. copied moments ago
+	 * via the InfoPanel's "Copier" button) if the OS clipboard is empty/unreadable/holds something
+	 * that isn't tokens copied from this plugin (see `parseClipboardTokens`). Surfaces a `Notice` only
+	 * when there was something to paste but it didn't fit (occupied cells) or there was truly nothing
+	 * to paste at all — silent on success, like every other placement gesture here.
+	 */
+	private async pasteTokensAtWorldPoint(worldX: number, worldY: number): Promise<void> {
+		await this.refreshClipboardFromSystem();
+		const hadClipboard = hasTokenClipboard();
+		if (!hadClipboard) {
+			new Notice("Presse-papier vide : copiez d'abord un ou plusieurs pions (Ctrl+C, ou le bouton « Copier »).");
+			return;
+		}
+		const placed = this.controller.pasteTokens(worldX, worldY);
+		if (placed === 0) {
+			new Notice("Impossible de coller ici : la ou les cases visées sont déjà occupées sur ce calque.");
+		}
+	}
+
+	/**
+	 * Whatever's currently selected resolves the Ctrl+V drop point: the selected cell's center on a
+	 * celled grid, the selected marker/token's own free position on grid type "none", falling back to
+	 * the viewport's own center when nothing's selected at all — see `onKeyDown`. A right-click's
+	 * "Coller ici" doesn't need this (the clicked point already *is* the drop point).
+	 */
+	private pasteAnchorWorldPoint(): { x: number; y: number } {
+		const data = this.controller.getData();
+		if (data.gridType !== "none" && this.controller.selectedCellKey) {
+			return this.hit.cellCenter(this.controller.selectedCellKey);
+		}
+		const marker = this.controller.getSelectedMarker();
+		if (marker) return { x: marker.x, y: marker.y };
+		const token = this.controller.getSelectedToken();
+		if (token) return this.hit.footprintCenter(token);
+		return screenToWorld(this.viewportW / 2, this.viewportH / 2, this.transform);
+	}
+
+	/**
+	 * Ctrl+C / Ctrl+V / Échap while the canvas has focus (see the `tabIndex`/`focus()` calls around
+	 * `onPointerDown`) — the canvas is a plain, non-editable `<canvas>`, so there's never a competing
+	 * native text copy/paste (or a text field to blur) to preserve here; the only reason this is
+	 * scoped to the canvas element's own `keydown` (rather than `document`) is to leave every *other*
+	 * keyboard shortcut in Obsidian (including the note editor's own Ctrl+C/V, elsewhere on the page)
+	 * completely alone.
+	 */
+	private onKeyDown = (e: KeyboardEvent) => {
+		if (e.key === "Escape") {
+			this.handleEscape();
+			return;
+		}
+		if (!(e.ctrlKey || e.metaKey)) return;
+		const key = e.key.toLowerCase();
+		if (key === "c") {
+			if (this.controller.getSelectedTokens().length === 0) return;
+			e.preventDefault();
+			void this.copySelectionToSystemClipboard();
+		} else if (key === "v") {
+			e.preventDefault();
+			const anchor = this.pasteAnchorWorldPoint();
+			void this.pasteTokensAtWorldPoint(anchor.x, anchor.y);
+		}
+	};
+
+	/**
+	 * Échap: cancels whatever's in progress first — an armed wall chain/shape/bucket placement (full
+	 * cancel, not `onContextMenu`'s one-step-back undo), or any other in-progress pointer gesture (see
+	 * `cancelActiveGesture`) — without committing anything. Only once nothing is in progress does it
+	 * fall back to clearing every current selection: the mass selection, and whichever single object
+	 * (token/marker/case/wall point/wall segment) is selected.
+	 */
+	private handleEscape(): void {
+		if (this.controller.getWallChainTailId() || this.controller.getWallShapeFirstCorner() || this.controller.pendingWallShape || this.controller.pendingWallBucket) {
+			this.controller.cancelWallShapePlacement();
+			this.controller.cancelWallBucketPlacement();
+			this.controller.resetWallChain();
+			this.render();
+			return;
+		}
+		if (this.hasActiveGesture()) {
+			this.cancelActiveGesture();
+			this.render();
+			return;
+		}
+		this.controller.clearMassSelection();
+		this.controller.selectToken(null);
+		this.controller.selectMarker(null);
+		this.controller.selectCell(null);
+		this.controller.selectWallPoint(null);
+		this.controller.selectWallSegment(null);
+	}
+
+	/** Ctrl+C: copies the current token selection (see `MapController.copySelectedTokens`) into both the in-memory clipboard and the real OS clipboard, as JSON (see `tokenClipboard.ts`) — so it survives closing Obsidian and can be pasted onto a map open in a different window/session, not just this one. */
+	private async copySelectionToSystemClipboard(): Promise<void> {
+		const count = this.controller.copySelectedTokens();
+		if (count === 0) return;
+		try {
+			await navigator.clipboard.writeText(serializeClipboardTokens(getTokenClipboard()));
+		} catch (err) {
+			// Same soft-failure spirit as the paste side: the in-memory clipboard set by
+			// copySelectedTokens() above already covers same-session copy/paste across open maps.
+			console.warn("Map Manager: écriture dans le presse-papier système impossible", err);
+		}
 	}
 
 	// ---- Backgrounds (one image per layer) ----
@@ -1659,7 +1830,6 @@ export class MapCanvas {
 		this.canvas.toggleClass("is-brush-tool", tool === "brush");
 		this.canvas.toggleClass("is-fill-tool", tool === "fill");
 		this.canvas.toggleClass("is-wall-tool", tool === "wall");
-		this.canvas.toggleClass("is-select-tool", tool === "select");
 	}
 
 	render(): void {
@@ -1729,16 +1899,20 @@ export class MapCanvas {
 		this.drawBackgrounds(ctx);
 
 		const cellsVisible = this.cellsCurrentlyVisible();
+		// The "Afficher/masquer les zones" toggle (edit mode's "Zones" toolbar group) only ever hides
+		// the zone-color tint, and only in edit mode — Vue always shows zones (there's no equivalent
+		// button there) — see `MapDrawer.drawGridAndCells`'s own doc comment.
+		const zonesVisible = this.effectiveMode() !== "edit" || this.controller.showZones;
 		if (cellsVisible) {
 			if (imageBounds) {
 				ctx.save();
 				ctx.beginPath();
 				ctx.rect(imageBounds.x, imageBounds.y, imageBounds.w, imageBounds.h);
 				ctx.clip();
-				this.drawer.drawGridAndCells(ctx);
+				this.drawer.drawGridAndCells(ctx, zonesVisible);
 				ctx.restore();
 			} else {
-				this.drawer.drawGridAndCells(ctx);
+				this.drawer.drawGridAndCells(ctx, zonesVisible);
 			}
 		}
 
@@ -1750,7 +1924,7 @@ export class MapCanvas {
 
 		const noGrid = this.controller.getData().gridType === "none";
 		if (noGrid) this.drawer.drawMarkers(ctx, this.draggingMarker);
-		this.drawer.drawWalls(ctx, cellsVisible, this.effectiveMode(), this.draggingWallPoint);
+		this.drawer.drawWalls(ctx, cellsVisible, this.effectiveMode(), this.isMirror, this.draggingWallPoint);
 
 		if (this.fog.isCurrentlyVisible()) this.fog.renderAndComposite(ctx, dpr, imageBounds);
 
@@ -1761,12 +1935,11 @@ export class MapCanvas {
 
 		this.drawTokens(ctx);
 		if (cellsVisible || noGrid || this.controller.selectedWallPointId) this.drawSelection(ctx);
-		// The edit-mode select tool always wants the overlay (marquee mid-drag, or nothing selected
-		// yet); view mode needs it either once there's an actual token mass selection to outline, or
-		// while a fresh Shift-drag marquee is being drawn (that live rectangle must show up even
-		// before anything's been added to the selection — see `drawMassSelectionOverlay`'s own
-		// `marqueeWorld` handling at the bottom).
-		if (this.controller.activeTool === "select" || this.controller.massSelectedTokenIds.size > 0 || this.marqueeWorld) this.drawMassSelectionOverlay(ctx);
+		// Whenever there's an actual mass selection (any kind) to outline, or while a fresh shift-drag
+		// marquee is being drawn — that live rectangle must show up even before anything's been added
+		// to the selection yet (see `drawMassSelectionOverlay`'s own `marqueeWorld` handling at the
+		// bottom).
+		if (this.controller.massSelectionKind || this.marqueeWorld) this.drawMassSelectionOverlay(ctx);
 		this.drawDistributePreview(ctx);
 		this.drawWallPreview(ctx);
 		this.drawPathPreview(ctx);

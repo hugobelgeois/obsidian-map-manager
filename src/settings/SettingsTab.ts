@@ -151,6 +151,22 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName("Taille des images de pion")
+			.setDesc("Côté (en pixels) auquel une image du vault choisie comme logo de pion est redimensionnée/recadrée avant d'être enregistrée.")
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "16";
+				text.setValue(String(settings.tokenImageSize));
+				text.onChange(async (value) => {
+					const n = parseFloat(value);
+					if (!Number.isNaN(n) && n > 0) {
+						settings.tokenImageSize = n;
+						await this.plugin.saveSettings();
+					}
+				});
+			});
+
+		new Setting(containerEl)
 			.setName("Palette de zones (types de terrain)")
 			.setDesc("Partagée par toutes les cartes : toute modification ici (nom, couleur, ajout, suppression) se répercute immédiatement dans leurs menus, y compris sur une carte déjà ouverte.")
 			.setHeading();
@@ -229,13 +245,18 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 					});
 				})
 				.addExtraButton((btn) => {
-					btn.setIcon("trash")
-						.setTooltip("Supprimer")
-						.onClick(async () => {
+					// Every "player" category token is locked to this template (see
+					// `InfoPanel.renderTokenPanel`) — it always needs to resolve to something, so it's
+					// modifiable here like any other template, but never removable — see `TokenTemplate.reserved`.
+					btn.setIcon("trash").setTooltip(template.reserved ? "Modèle réservé aux pions Joueur — non supprimable" : "Supprimer");
+					btn.setDisabled(!!template.reserved);
+					if (!template.reserved) {
+						btn.onClick(async () => {
 							settings.defaultTokenTemplates = settings.defaultTokenTemplates.filter((t) => t.id !== template.id);
 							await this.plugin.saveSettings();
 							this.display();
 						});
+					}
 				});
 		}
 

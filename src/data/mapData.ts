@@ -89,6 +89,8 @@ export interface TokenTemplate {
 	fields: string[];
 	/** Default tab names for a player token using this template (see `getTokenTabs`) — falls back to `DEFAULT_TOKEN_TAB_NAMES` when unset/empty. */
 	defaultTabNames?: string[];
+	/** Locked in place — not user-removable (`SettingsTab`) and not offered as a free choice for an "entity" token (`InfoPanel`). Currently only the built-in "Joueur" template — see `PLAYER_TEMPLATE_ID`. */
+	reserved?: boolean;
 }
 
 /**
@@ -163,26 +165,29 @@ export interface Token {
 	 */
 	category?: TokenCategory;
 	/**
-	 * Player-only vision cone full angle in degrees (see `castVisionRays`) — a player's cone both
-	 * lights up the fog for real and shows the same GM-only tactical preview as an entity's
-	 * (`MapCanvas.drawTokenVisionZones`). An entity token ignores this field entirely; its own vision
-	 * shape instead comes from `sideEyeAngle`/`detectionAngle`/`binocularAngle`/`monocularAngle` (see
-	 * `resolveEyeCones`) — never touching fog either way, purely a GM-only tactical overlay.
+	 * Legacy player-only vision cone full angle in degrees. No longer read by anything — a player's
+	 * fog reveal is now driven entirely by their `lightRadius` (omnidirectional, wall-aware — see
+	 * `castLightRays`), not a directional cone. Left in the type so old map files still parse; a
+	 * player's facing/cone is simply inert data now.
 	 */
 	visionAngle?: number;
-	/** Vision range in cells, shared by both categories' vision shapes — see `visionAngle` (player) and `resolveEyeCones` (entity). */
+	/** Entity-only: reach (in cells) of its directional eye cone(s) — see `resolveEyeCones`/`castEntityConeRays`. Ignored for "player"/"light" categories. */
 	visionRange?: number;
-	/** Omnidirectional "always lit" radius, in cells, regardless of facing — shared by both categories, see `visionAngle` (player) and `resolveEyeCones` (entity). */
+	/**
+	 * Legacy omnidirectional "always lit" radius, in cells. No longer read by anything for either
+	 * category — an entity's `lightRadius` now covers what this used to (see `castEntityConeRays`,
+	 * which pins its own `radius` argument to `0`), and a player never had a use for it beyond the
+	 * cone this replaced. Left in the type so old map files still parse.
+	 */
 	visionRadius?: number;
 	/**
 	 * Radius (in cells), any category, within which this token's own "light" reveals every entity
 	 * token inside it, even when none of them sit inside any player's vision cone — wall-aware
-	 * (opaque or "dim" alike; see `castLightRays` in `fog.ts`), unlike the walls-blind straight-line
-	 * `visionRadius` fallback it otherwise resembles (see `MapCanvas.isEntityRevealedByFog`). Also
-	 * visually hides the fog overlay whether or not a player can actually see that far (`drawFog`'s
-	 * `frameLightCache` punch), but deliberately never feeds `exploredCells`: the area goes dark
-	 * again the moment the light source moves away or is removed, unlike real vision. `0`/unset (the
-	 * default) means the token casts no light.
+	 * (opaque or "dim" alike; see `castLightRays` in `fog.ts`; see `FogRenderer.isEntityRevealed`).
+	 * Also visually hides the fog overlay whether or not a player can actually see that far
+	 * (`drawFog`'s `frameLightCache` punch), but deliberately never feeds `exploredCells`: the area
+	 * goes dark again the moment the light source moves away or is removed, unlike real vision.
+	 * `0`/unset (the default, see `DEFAULT_LIGHT_RADIUS`) means the token casts no light.
 	 */
 	lightRadius?: number;
 	/**
@@ -191,17 +196,14 @@ export interface Token {
 	 * Deliberately separate from `lightRadius` itself so flipping it off/on (e.g. a torch being
 	 * doused/relit mid-session, editable in "Vue" mode too — see `InfoPanel.renderLightRadiusField`)
 	 * never loses the configured radius the way setting `lightRadius` back to `0` would. See
-	 * `resolveLightRadius`, the one place that actually combines this with `lightRadius`/
-	 * `lightRadiusLinkedToVision` into the effective reach everything else reads.
+	 * `resolveLightRadius`, the one place that actually gates `configuredLightRadius` on this flag
+	 * into the effective reach everything else reads.
 	 */
 	lightEnabled?: boolean;
 	/**
-	 * Player-only: when `true`, the *effective* light radius (`resolveLightRadius`) always tracks
-	 * this token's own `visionRadius` ("rayon exploré") instead of its stored `lightRadius` — so a
-	 * player is exactly as visible as far as they can see. Toggled from the "🔗" button next to
-	 * `lightRadius` in `InfoPanel` (player tokens only — an entity/light token has no "rayon exploré"
-	 * concept worth linking to). `lightRadius` itself is left untouched while linked (dormant, not
-	 * overwritten) so unlinking has something sensible to fall back to.
+	 * Legacy: used to link a player token's effective light radius to its own `visionRadius`. No
+	 * longer read anywhere — `lightRadius` is now the single, direct source of a player's light
+	 * (see `configuredLightRadius`). Left in the type so old map files still parse.
 	 */
 	lightRadiusLinkedToVision?: boolean;
 	/**
@@ -222,11 +224,10 @@ export interface Token {
 	image?: string;
 	/**
 	 * Which way the token is drawn facing (a small arrow on its rim — see `drawTokenFacingArrow`),
-	 * in degrees, 0 = east, increasing clockwise. Any category. For player tokens this is also the
-	 * fog vision cone's facing (see `castVisionRays`); for entities it's what `resolveEyeCones`
-	 * points its own cone(s) relative to. There's a single facing per token, not one for the arrow
-	 * and a separate one for vision; pre-v14 files stored that as `visionDirection`, folded into
-	 * this field on load (see `parseToken`).
+	 * in degrees, 0 = east, increasing clockwise. Entity-only in the UI (`InfoPanel`) — an entity's
+	 * `resolveEyeCones` points its own cone(s) relative to this. Player tokens no longer have an
+	 * editable facing (their fog reveal is omnidirectional, via `lightRadius`); pre-v14 files stored
+	 * this as `visionDirection`, folded into this field on load (see `parseToken`).
 	 */
 	rotation?: number;
 }
@@ -240,8 +241,8 @@ export const DEFAULT_VISION_RANGE = 6;
 export const DEFAULT_VISION_RADIUS = 1;
 export const DEFAULT_TOKEN_ROTATION = 0;
 
-/** Default `Token.lightRadius` — `0` means the entity casts no light. */
-export const DEFAULT_LIGHT_RADIUS = 0;
+/** Default `Token.lightRadius`, in cells — light is now the primary omnidirectional reveal for every category (see `resolveLightRadius`/`castLightRays`), so this defaults to a usable radius rather than "no light". */
+export const DEFAULT_LIGHT_RADIUS = 5;
 
 /** Default `Token.sideEyeAngle` — how far each of an entity's two eye cones sits from its facing, in degrees. `0` collapses them onto a single forward direction. See `resolveEyeCones`. */
 export const DEFAULT_SIDE_EYE_ANGLE = 0;
@@ -270,10 +271,10 @@ export interface EntityEyeCone extends EyeTierAngles {
  * Resolves an entity token's eye layout into its two cones, mirrored around its facing (`rotation`)
  * by `token.sideEyeAngle` (defaults to `DEFAULT_SIDE_EYE_ANGLE`, i.e. `0` — both cones pointing the
  * same way, reading as a single forward cone) — one clockwise, one counter-clockwise, both sharing
- * the token's own facing point/`visionRange`/`visionRadius` (see `Token.rotation` and
- * `castVisionRays` callers). Each per-tier angle field on the token overrides
- * `DEFAULT_EYE_TIER_ANGLES` individually, so customizing e.g. just `detectionAngle` leaves the other
- * two at their default. Player tokens never call this — see `Token.visionAngle`.
+ * the token's own facing point/`visionRange` (see `Token.rotation` and `castEntityConeRays`
+ * callers). Each per-tier angle field on the token overrides `DEFAULT_EYE_TIER_ANGLES` individually,
+ * so customizing e.g. just `detectionAngle` leaves the other two at their default. Only the "entity"
+ * category ever calls this — players have no directional cone (their fog reveal is their light).
  */
 export function resolveEyeCones(token: Token): EntityEyeCone[] {
 	const tierAngles: EyeTierAngles = {
@@ -290,18 +291,13 @@ export function resolveEyeCones(token: Token): EntityEyeCone[] {
 }
 
 /**
- * The radius `token`'s light is *configured* to use whenever it's switched on — a linked player
- * token's own `visionRadius` ("rayon exploré", see `lightRadiusLinkedToVision`'s own doc comment)
- * instead of its stored `lightRadius`, or `lightRadius` itself (defaulting to `DEFAULT_LIGHT_RADIUS`)
- * otherwise. Deliberately ignores `lightEnabled` — see `resolveLightRadius`, which layers that gate
- * on top — so a temporarily switched-off light still reports the number it'll come back on at
- * (`InfoPanel.renderLightRadiusField`'s radius input reads this, not `resolveLightRadius`, so
- * toggling the light off never makes that field flash to `0`).
+ * The radius `token`'s light is *configured* to use whenever it's switched on — `lightRadius`
+ * itself, defaulting to `DEFAULT_LIGHT_RADIUS`. Deliberately ignores `lightEnabled` — see
+ * `resolveLightRadius`, which layers that gate on top — so a temporarily switched-off light still
+ * reports the number it'll come back on at (`InfoPanel.renderLightRadiusField`'s radius input reads
+ * this, not `resolveLightRadius`, so toggling the light off never makes that field flash to `0`).
  */
 export function configuredLightRadius(token: Token): number {
-	if ((token.category ?? "entity") === "player" && token.lightRadiusLinkedToVision) {
-		return token.visionRadius ?? DEFAULT_VISION_RADIUS;
-	}
 	return token.lightRadius ?? DEFAULT_LIGHT_RADIUS;
 }
 
@@ -449,7 +445,7 @@ export function getActiveLayer(data: MapFileData): Layer {
 	return data.layers.find((l) => l.id === data.activeLayerId) ?? data.layers[0] ?? createLayer("Calque 1");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
@@ -523,7 +519,8 @@ function parseTokenTabArray(raw: unknown): TokenTab[] | undefined {
 	return raw.map(parseTokenTab).filter((t): t is TokenTab => t !== null);
 }
 
-function parseToken(value: unknown): Token | null {
+/** Exported for `tokenClipboard.ts`'s system-clipboard paste (Ctrl+V): a Ctrl+C payload is a JSON array of tokens shaped exactly like a `.map` file's own `tokens`, so validating a pasted one reuses this rather than a second parallel parser. */
+export function parseToken(value: unknown): Token | null {
 	if (!isRecord(value) || !isString(value.id) || !isString(value.icon)) return null;
 	return {
 		id: value.id,

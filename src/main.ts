@@ -3,7 +3,7 @@ import { createDefaultMapData, MapDefaults, parseMapData, publicSnapshotPath, se
 import { openPlayerWindow } from "./platform/openPlayerWindow";
 import { publishPublicSnapshot } from "./platform/publishPublicSnapshot";
 import { MapManagerSettingsTab } from "./settings/SettingsTab";
-import { DEFAULT_SETTINGS, MapManagerSettings } from "./settings/types";
+import { DEFAULT_SETTINGS, DEFAULT_TOKEN_TEMPLATES, MapManagerSettings, PLAYER_TEMPLATE_ID } from "./settings/types";
 import { FileSuggestModal } from "./ui/FileSuggestModal";
 import { MapView, VIEW_TYPE_MAP } from "./view/MapView";
 import { MapPlayerMirrorView, VIEW_TYPE_MAP_PLAYER_MIRROR } from "./view/MapPlayerMirrorView";
@@ -170,6 +170,20 @@ export default class MapManagerPlugin extends Plugin {
 		if (loaded && loaded.fogAnimationMode === undefined && loaded.fogAnimations !== undefined) {
 			this.settings.fogAnimationMode = loaded.fogAnimations ? "simple" : "none";
 		}
+		// Pre-"Modèle de statistiques verrouillé" installs saved their own `defaultTokenTemplates`
+		// array without the reserved "Joueur" template — `Object.assign` above just keeps that old
+		// array as-is (no per-template merge), so it never gains the new entry on its own. Prepend it
+		// once here instead, same spirit as the fog-animation migration just above.
+		if (!this.settings.defaultTokenTemplates.some((t) => t.id === PLAYER_TEMPLATE_ID)) {
+			const playerTemplate = DEFAULT_TOKEN_TEMPLATES.find((t) => t.id === PLAYER_TEMPLATE_ID);
+			if (playerTemplate) this.settings.defaultTokenTemplates = [{ ...playerTemplate, fields: [...playerTemplate.fields] }, ...this.settings.defaultTokenTemplates];
+		}
+		// Whether just prepended above or an older install's own save predating `TokenTemplate.reserved`,
+		// the "Joueur" entry always ends up flagged reserved here — the one place `SettingsTab`'s delete
+		// guard and `InfoPanel`'s template pickers need to trust instead of re-deriving "is this the
+		// locked template" from the id at each of those call sites.
+		const playerTemplate = this.settings.defaultTokenTemplates.find((t) => t.id === PLAYER_TEMPLATE_ID);
+		if (playerTemplate) playerTemplate.reserved = true;
 	}
 
 	async saveSettings(): Promise<void> {

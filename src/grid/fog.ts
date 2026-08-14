@@ -1,16 +1,14 @@
 import {
-	DEFAULT_TOKEN_ROTATION,
-	DEFAULT_VISION_ANGLE,
-	DEFAULT_VISION_RADIUS,
 	DEFAULT_VISION_RANGE,
 	MapFileData,
 	Token,
 	VisionBlockerType,
+	hexKey,
 	parseCellKey,
 	resolveLightRadius,
 	squareKey,
 } from "../data/mapData";
-import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, pointSegmentDistance, raySegmentDistance } from "./gridMath";
+import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, hexWorldToCell, pointSegmentDistance, raySegmentDistance, squareWorldToCell } from "./gridMath";
 
 /**
  * Rays cast per player token when tracing vision (ray/path tracing, not grid tracing) — fixed
@@ -25,12 +23,11 @@ export const FOG_RAY_COUNT = 180;
  */
 export const FOG_BUCKET_SCALE = 1.25;
 /**
- * How close (in cell-widths) a vision source has to be to a "dim"/partial wall segment for its
- * *directional cone* (`visionRange`/`visionAngle` — "être contre ce mur") to see through it at all.
- * Farther than this, a partial wall blocks the cone exactly like an opaque one instead of letting a
- * dim glimpse through from any distance — see the proximity check in `traceRays`. The omnidirectional
- * `visionRadius` fallback (rays outside the cone) is unaffected by this and keeps stopping at any
- * wall type regardless of distance, same as before this rule existed.
+ * How close (in cell-widths) an entity's eye cone has to be to a "dim"/partial wall segment
+ * (`visionRange` — "être contre ce mur") to see through it at all. Farther than this, a partial wall
+ * blocks the cone exactly like an opaque one instead of letting a dim glimpse through from any
+ * distance — see the proximity check in `traceRays`. Never applies to `castLightRays` (no
+ * directional cone to be "up close and inside" to begin with — see its own doc comment).
  */
 export const WALL_ADJACENCY_CELLS = 1;
 
@@ -82,6 +79,24 @@ export function cellCenter(data: MapFileData, key: string): { x: number; y: numb
 	}
 	const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
 	return hexCellToWorldCenter(a, b, cellSize, orientation);
+}
+
+/**
+ * The inverse of `cellCenter`: which cell key a world point falls in, for any grid type. Grid type
+ * "none" is treated as "square" here — it has no visible cells, but fog still runs on this hidden
+ * square substrate (see `MapController.updateCell`). Used both by `HitTester.cellKeyAt` (click
+ * hit-testing) and `MapController.pasteTokens` (resolving a pasted token's world position onto
+ * whatever grid the target map happens to use).
+ */
+export function worldPointToCellKey(data: MapFileData, x: number, y: number): string {
+	const cellSize = effectiveCellSize(data);
+	if (data.gridType === "square" || data.gridType === "none") {
+		const c = squareWorldToCell(x, y, cellSize);
+		return squareKey(c.a, c.b);
+	}
+	const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
+	const c = hexWorldToCell(x, y, cellSize, orientation);
+	return hexKey(c.a, c.b);
 }
 
 /**
@@ -162,9 +177,10 @@ function angleDiffDeg(a: number, b: number): number {
 /**
  * Traces `FOG_RAY_COUNT` rays outward from `center` (the omnidirectional `radius` plus a
  * directional cone reaching `range` within `halfAngle` of `direction`, whichever reaches further at
- * a given angle) against `wallSegments`. Shared core for `castVisionRays` (a player's own facing
- * cone) and `castEntityConeRays` (one of an entity's `resolveEyeCones` cones) — everything about
- * *whose* angle/direction/reach this is lives in the caller, this function only knows geometry.
+ * a given angle) against `wallSegments`. Shared core for `castLightRays` (a plain omnidirectional
+ * `radius`, `range` pinned to `0`) and `castEntityConeRays` (one of an entity's `resolveEyeCones`
+ * cones, `radius` pinned to `0`) — everything about *whose* angle/direction/reach this is lives in
+ * the caller, this function only knows geometry.
  *
  * A "dim" wall segment blocks a ray completely (both `clearEnd` and `dimEnd` stop there, same as an
  * opaque wall) *unless* that ray is inside the directional cone AND `center` sits within
@@ -228,44 +244,27 @@ function traceRays(
 }
 
 /**
- * A player token's vision: the cone points wherever the token's own facing arrow does
- * (`token.rotation` — see `drawTokenFacingArrow`), full angle `token.visionAngle` — a player's
- * vision is tied to their token's facing, not a separate value, so turning the token turns what it
- * can see. Purely geometric (world units) — no cosmetic tremble, see `VisionRays`.
- *
- * `pose`, when given, overrides where the cone is cast from/toward instead of the token's own
- * committed `cellKey`/`x,y`/`rotation` — used by `MapCanvas` to keep fog reveal following a token's
- * live interpolated position during the "Animation" token-movement tween instead of jumping only
- * once the move commits (see `MapCanvas.currentAnimatedPose`).
- */
-export function castVisionRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
-	const center = pose?.center ?? footprintCenter(data, token);
-	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
-	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
-	const halfAngle = (token.visionAngle ?? DEFAULT_VISION_ANGLE) / 2;
-	const direction = pose?.direction ?? token.rotation ?? DEFAULT_TOKEN_ROTATION;
-	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
-	return { center, rays: traceRays(center, radius, range, halfAngle, direction, wallSegments, wallAdjacency) };
-}
-
-/**
- * One of an entity's eye cones (see `resolveEyeCones` in `mapData.ts`): same geometry as
- * `castVisionRays`, but with an explicit `direction`/`fullAngleDeg` instead of the token's own
- * `rotation`/`visionAngle` — an entity's `visionRange`/`visionRadius` still supply the shared
- * magnitude (see `resolveEyeCones`'s doc comment on why every tier/cone reaches the same distance).
+ * One of an entity's eye cones (see `resolveEyeCones` in `mapData.ts`): a directional cone reaching
+ * `token.visionRange` within `fullAngleDeg` of `direction`, no omnidirectional fallback outside it
+ * (`radius` pinned to `0` — an entity's `lightRadius`/`castLightRays` covers whatever it can see
+ * outside its own eye cones now, same as any other category).
  */
 export function castEntityConeRays(data: MapFileData, token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): VisionRays {
 	const center = footprintCenter(data, token);
-	const radius = (token.visionRadius ?? DEFAULT_VISION_RADIUS) * cellVisualWidth(data);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
 	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
-	return { center, rays: traceRays(center, radius, range, fullAngleDeg / 2, direction, wallSegments, wallAdjacency) };
+	return { center, rays: traceRays(center, 0, range, fullAngleDeg / 2, direction, wallSegments, wallAdjacency) };
 }
 
-/** Every player token's traced vision, for `data` as a whole (all visible layers' walls). */
+/**
+ * Every player token's traced fog-reveal reach, for `data` as a whole (all visible layers' walls) —
+ * a player's fog reveal is their `lightRadius`, omnidirectional and wall-aware (see `castLightRays`),
+ * not a directional cone. Used by `mapRedaction.ts` to redact the public snapshot the same way the
+ * live game determines what's been explored.
+ */
 export function buildVisionCache(data: MapFileData): VisionRays[] {
 	const wallSegments = resolveWallSegments(data);
-	return data.tokens.filter((t) => (t.category ?? "entity") === "player").map((t) => castVisionRays(data, t, wallSegments));
+	return data.tokens.filter((t) => (t.category ?? "entity") === "player").map((t) => castLightRays(data, t, wallSegments));
 }
 
 /**
@@ -278,8 +277,9 @@ export function buildVisionCache(data: MapFileData): VisionRays[] {
  * Light itself has no such exception: there's no cone here to be "up close and inside" to begin
  * with, so it never gets one either.
  *
- * `pose` mirrors `castVisionRays`'s own parameter — lets a light source keep tracking a token's
- * live interpolated position during an in-flight "Animation" move tween.
+ * `pose` mirrors `castEntityConeRays`'s own parameter (indirectly, via the direction it ignores) —
+ * lets a light source keep tracking a token's live interpolated position during an in-flight
+ * "Animation" move tween.
  */
 export function castLightRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
 	const center = pose?.center ?? footprintCenter(data, token);

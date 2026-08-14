@@ -1,17 +1,15 @@
 import { MapController, MapMode } from "../controller/MapController";
 import { FogAnimationMode, MapManagerSettings } from "../settings/types";
-import { DEFAULT_VISION_RADIUS, Token, resolveEyeCones, resolveLightRadius } from "../data/mapData";
+import { Token, resolveEyeCones, resolveLightRadius } from "../data/mapData";
 import { Point, ViewTransform, getVisibleHexCells, getVisibleSquareCells, hexCellToWorldCenter, hexCorners, screenToWorld } from "../grid/gridMath";
 import {
 	ResolvedWallSegment,
 	VisionRays,
 	castEntityConeRays,
 	castLightRays,
-	castVisionRays,
 	cellVisualWidth,
 	effectiveCellSize,
 	fogBucketSize as baseFogBucketSize,
-	footprintCenter,
 	isPointLit,
 	isWorldPointExplored,
 } from "../grid/fog";
@@ -29,7 +27,7 @@ const FOG_OPACITY_EXPLORED = 0.55;
  */
 const FOG_MAX_BUCKETS_PER_AXIS = 160;
 /**
- * Tremble amplitudes in fixed *screen* pixels (divided by zoom at use, see `drawFog`/`castRaysForToken`)
+ * Tremble amplitudes in fixed *screen* pixels (divided by zoom at use, see `drawFog`/`castLightRaysForToken`)
  * rather than a fraction of a world-space length — otherwise the wobble shrinks away right along with
  * everything else when zoomed out, which reads as "the animation stops". The memory (explored/
  * unexplored) frontier's amplitude is deliberately larger than the vision fan's.
@@ -108,30 +106,29 @@ interface PlayerVisionRays extends VisionRays {
  * ask for a fresh frame the same way `MapCanvas.render()` already did before this was split out.
  */
 export class FogRenderer {
-	/** Every player token's traced vision rays, recomputed once per `MapCanvas.render()` and reused by both `drawFog` and `MapCanvas.drawTokens`. */
+	/** Every player token's traced light rays (their fog-reveal source — see `castLightRaysForToken`), recomputed once per `MapCanvas.render()` and reused by both `drawFog` and `MapCanvas.drawTokens`. */
 	private frameVisionCache: PlayerVisionRays[] = [];
 	/**
-	 * Every token's (any category) traced `lightRadius` reach, recomputed once per `MapCanvas.render()` —
-	 * mirrors `frameVisionCache` but for `Token.lightRadius` instead of a player's own vision cone.
+	 * Every non-player token's traced `lightRadius` reach, recomputed once per `MapCanvas.render()`.
 	 * Reused by `drawFog` (to hide fog without writing to `exploredCells` — see `drawFog`'s doc
 	 * comment) and `isEntityRevealed` (so a lit entity is noticed regardless of any player's own
-	 * vision). Wall-aware (`castLightRays`), unlike the plain distance check `visionRadius`'s own
-	 * "rayon exploré" fallback still uses.
+	 * light). Player tokens are deliberately excluded: a player's `lightRadius` *is* its vision reach
+	 * post-refactor, so `frameVisionCache` already traces and fans that exact same shape — including
+	 * them here too would just re-trace/re-fan/re-punch identical geometry for nothing.
 	 */
 	private frameLightCache: PlayerVisionRays[] = [];
 
 	/**
-	 * Memoizes the actual (expensive) ray/wall tracing behind `castRaysForToken`/`castEntityConeVision`,
+	 * Memoizes the actual (expensive) ray/wall tracing behind `castLightRaysForToken`/`castEntityConeVision`,
 	 * keyed against `MapController.dataVersion` — `render()` runs on every pan/zoom/hover/fog-tremble
 	 * animation frame, none of which touch `data`, so re-tracing rays whose token/wall inputs haven't
 	 * changed since the last `render()` was pure waste (the dominant cost of "several tokens with
 	 * vision on" lagging view mode). Only the cheap, per-frame cosmetic tremble in `appendVisionFan`
-	 * still runs unconditionally. Keyed by token id for players (one cone), and `tokenId|direction|
+	 * still runs unconditionally. Keyed by token id for lights, and `tokenId|direction|
 	 * fullAngleDeg` for entities (multiple cones/tiers per token — see `drawEntityEyeCones`).
 	 */
-	private playerVisionRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 	private entityConeRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
-	/** Same memoization as `playerVisionRaysCache`, for `castLightRaysForToken` — keyed by token id, any category. */
+	/** Same memoization as `entityConeRaysCache`, for `castLightRaysForToken` — keyed by token id, any category. */
 	private lightRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 
 	/** Offscreen buffer fog is composited on before being drawn onto the main canvas as one image — see `renderFogLayer`. */
@@ -143,8 +140,7 @@ export class FogRenderer {
 	/** Non-null while the fog-tremble animation loop (settings.fogAnimationMode) is actively re-rendering every frame. */
 	private animationFrameId: number | null = null;
 
-	private static readonly PLAYER_VISION_ZONE_COLOR = "rgba(37, 99, 235, 0.28)";
-	/** Translucent fill color for a token's own `lightRadius` preview — warm/amber, distinct from the vision-cone red/blue so it reads as "light" rather than "sight". */
+	/** Translucent fill color for a token's own `lightRadius` preview — warm/amber, distinct from the entity eye-cone red so it reads as "light" rather than "sight". */
 	private static readonly TOKEN_LIGHT_ZONE_COLOR = "rgba(250, 204, 21, 0.2)";
 	/**
 	 * An entity eye cone's 3 tiers (see `resolveEyeCones`), listed widest-to-narrowest — the order
@@ -249,11 +245,11 @@ export class FogRenderer {
 		this.frameVisionCache = this.controller
 			.getData()
 			.tokens.filter((t) => (t.category ?? "entity") === "player")
-			.map((t) => this.castRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined));
-		// Any token, any category, with an effective light radius > 0 — see `frameLightCache`'s own doc comment.
+			.map((t) => this.castLightRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined));
+		// Any non-player token with an effective light radius > 0 — see `frameLightCache`'s own doc comment.
 		this.frameLightCache = this.controller
 			.getData()
-			.tokens.filter((t) => resolveLightRadius(t) > 0)
+			.tokens.filter((t) => (t.category ?? "entity") !== "player" && resolveLightRadius(t) > 0)
 			.map((t) => this.castLightRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined));
 	}
 
@@ -285,11 +281,14 @@ export class FogRenderer {
 	// ---- Ray casting (path tracing — not tied to the visible grid) ----
 
 	/**
-	 * Traces every ray outward from a player token's center against `wallSegments` — see
-	 * `castVisionRays` in `../grid/fog.ts` for the actual (canvas-agnostic) ray tracing.
+	 * Same idea as `castEntityConeVision`, for a token's `lightRadius` reach (`castLightRays`, any
+	 * category) — see `drawTokenLightZones`/`drawFog`'s `frameLightCache` use. Also what
+	 * `frameVisionCache`/`isEntityRevealed` reads for player tokens now: a player's fog reveal is
+	 * exactly their light, omnidirectional and wall-aware (see `castLightRays` in `../grid/fog.ts`),
+	 * not a directional cone anymore.
 	 *
-	 * These reaches are the *true* vision extent: they gate what counts as lit for gameplay
-	 * (`isLitByCache`) and what gets permanently written to fog memory (`markExplored`). The
+	 * These reaches are the *true* vision extent for players: they gate what counts as lit for
+	 * gameplay (`isLitByCache`) and what gets permanently written to fog memory (`markExplored`). The
 	 * tremble animation must never perturb them — an earlier version wobbled `reach` here, which
 	 * meant every outward wobble peak got permanently baked into explored memory (since a bucket
 	 * once marked explored stays marked), slowly and permanently growing the explored area for as
@@ -299,21 +298,10 @@ export class FogRenderer {
 	 *
 	 * `pose`, when given (see `getAnimatedPose`), casts from that live interpolated
 	 * position/facing instead of the token's own committed data — and always recomputes rather than
-	 * reading/writing `playerVisionRaysCache`, since that cache is keyed on `MapController.dataVersion`
+	 * reading/writing `lightRaysCache`, since that cache is keyed on `MapController.dataVersion`
 	 * alone, which doesn't change while a tween is merely in flight (nothing's committed yet) and so
 	 * would otherwise just keep returning the pre-tween rays for every frame of the animation.
 	 */
-	private castRaysForToken(token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): PlayerVisionRays {
-		if (pose) return { ...castVisionRays(this.controller.getData(), token, wallSegments, pose), phase: tremblePhase(token.id) };
-		const version = this.controller.dataVersion;
-		const cached = this.playerVisionRaysCache.get(token.id);
-		const { center, rays } =
-			cached && cached.version === version ? cached.result : castVisionRays(this.controller.getData(), token, wallSegments);
-		if (!cached || cached.version !== version) this.playerVisionRaysCache.set(token.id, { version, result: { center, rays } });
-		return { center, rays, phase: tremblePhase(token.id) };
-	}
-
-	/** Same idea as `castRaysForToken`, for a token's `lightRadius` reach (`castLightRays`, any category) — see `drawTokenLightZones`/`drawFog`'s `frameLightCache` use. */
 	private castLightRaysForToken(token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): PlayerVisionRays {
 		if (pose) return { ...castLightRays(this.controller.getData(), token, wallSegments, pose), phase: tremblePhase(token.id) };
 		const version = this.controller.dataVersion;
@@ -323,7 +311,7 @@ export class FogRenderer {
 		return { center, rays, phase: tremblePhase(token.id) };
 	}
 
-	/** Same idea as `castRaysForToken`, for one of an entity's `resolveEyeCones` cones — see `drawEntityEyeCones`. */
+	/** Same idea as `castLightRaysForToken`, for one of an entity's `resolveEyeCones` cones — see `drawEntityEyeCones`. */
 	private castEntityConeVision(token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): PlayerVisionRays {
 		const version = this.controller.dataVersion;
 		const key = `${token.id}|${direction}|${fullAngleDeg}`;
@@ -392,25 +380,16 @@ export class FogRenderer {
 	}
 
 	/**
-	 * Whether an entity token at `center` should be shown despite fog: the ordinary raycast reach
-	 * (`isLitByCache` against `frameVisionCache`, walls included), or simply standing within any
-	 * player token's own "rayon exploré" (`visionRadius`) — a straight-line distance check, walls or
-	 * not, so something right next to a player is always noticed even through a partial wall the
-	 * raycast rule itself would otherwise still dim/block at a distance — or standing within any
-	 * token's (any category) traced `lightRadius` reach (`isLitByCache` against `frameLightCache`),
-	 * which unlike the other two *does* stop at a wall (see `castLightRays`). Callers still gate this
-	 * on `fogActive` and `!isPlayer` themselves — see `MapCanvas.drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
+	 * Whether an entity token at `center` should be shown despite fog: standing within any player
+	 * token's own light reach (`isLitByCache` against `frameVisionCache` — a player's fog reveal,
+	 * see `castLightRaysForToken`), or within any non-player token's own traced `lightRadius` reach
+	 * (`isLitByCache` against `frameLightCache`) — both wall-aware (see `castLightRays`). Callers
+	 * still gate this on `fogActive` and `!isPlayer` themselves — see
+	 * `MapCanvas.drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
 	 */
 	isEntityRevealed(center: { x: number; y: number }): boolean {
 		if (this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) return true;
 		if (this.isLitByCache(this.frameLightCache, center.x, center.y, false)) return true;
-		const cellSize = cellVisualWidth(this.controller.getData());
-		for (const player of this.controller.getData().tokens) {
-			if ((player.category ?? "entity") !== "player") continue;
-			const playerCenter = this.getAnimatedPose(player.id)?.center ?? footprintCenter(this.controller.getData(), player);
-			const radius = (player.visionRadius ?? DEFAULT_VISION_RADIUS) * cellSize;
-			if (Math.hypot(center.x - playerCenter.x, center.y - playerCenter.y) <= radius) return true;
-		}
 		return false;
 	}
 
@@ -439,30 +418,22 @@ export class FogRenderer {
 	 * selection concept driving that same clutter there — a player's cone doesn't need the same
 	 * treatment in "view" mode since the real fog overlay already shows it for free there.
 	 *
-	 * The two categories draw entirely differently below: a player token keeps the single blue cone
-	 * this always drew (`castVisionRays`, `dimEnd` — reaches past a "dim"/partial wall, matching what
-	 * its real fog memory would eventually show once explored); an entity token instead draws both of
-	 * `resolveEyeCones`'s cones via `drawEntityEyeCones`, each using `clearEnd` — an entity has no
-	 * fog-memory concept, so a "partial" wall stops its sight exactly like an opaque one. Either
-	 * category also gets `drawTokenLightZones`'s amber wall-aware fan underneath when it has a
-	 * `lightRadius` set — see `Token.lightRadius`/`isEntityRevealed`/`drawFog`'s `frameLightCache`
-	 * use for the actual reveal rule this previews.
+	 * A player token has no directional cone anymore — only `drawTokenLightZones`'s amber wall-aware
+	 * fan (any category, whenever `lightRadius` is set) previews what it reveals, matching the real
+	 * fog reveal rule exactly (see `Token.lightRadius`/`isEntityRevealed`/`drawFog`'s `frameLightCache`
+	 * use). An entity additionally draws both of `resolveEyeCones`'s cones via `drawEntityEyeCones`,
+	 * each using `clearEnd` — an entity has no fog-memory concept, so a "partial" wall stops its sight
+	 * exactly like an opaque one.
 	 */
 	drawVisionZones(ctx: CanvasRenderingContext2D, wallSegments: ResolvedWallSegment[]): void {
 		if (this.effectiveMode() === "edit") {
 			const selected = this.controller.getData().tokens.find((t) => t.id === this.controller.selectedTokenId);
 			if (!selected) return;
 			this.drawTokenLightZones([selected], wallSegments, ctx);
-			const category = selected.category ?? "entity";
-			// "light" tokens have no vision/eye-cone shape of their own — only `drawTokenLightZones`
+			// "light"/"player" tokens have no eye-cone shape of their own — only `drawTokenLightZones`
 			// above applies to them (see `Token.category`'s doc comment).
-			if (category === "entity") {
+			if ((selected.category ?? "entity") === "entity") {
 				this.drawEntityEyeCones([selected], wallSegments, ctx);
-			} else if (category === "player") {
-				const path = new Path2D();
-				this.appendVisionFan(path, this.castRaysForToken(selected, wallSegments), true, "none", 0);
-				ctx.fillStyle = FogRenderer.PLAYER_VISION_ZONE_COLOR;
-				ctx.fill(path);
 			}
 			return;
 		}

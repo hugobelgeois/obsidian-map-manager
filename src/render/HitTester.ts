@@ -6,14 +6,18 @@ import {
 	getVisibleHexCells,
 	getVisibleSquareCells,
 	hexGridSnapCandidates,
-	hexWorldToCell,
 	projectOntoSegment,
 	screenToWorld,
 	squareFootprintAnchor,
 	squareGridSnapCandidates,
-	squareWorldToCell,
 } from "../grid/gridMath";
-import { cellCenter as fogCellCenter, cellVisualWidth as fogCellVisualWidth, effectiveCellSize as fogEffectiveCellSize, footprintCenter as fogFootprintCenter } from "../grid/fog";
+import {
+	cellCenter as fogCellCenter,
+	cellVisualWidth as fogCellVisualWidth,
+	effectiveCellSize as fogEffectiveCellSize,
+	footprintCenter as fogFootprintCenter,
+	worldPointToCellKey as fogWorldPointToCellKey,
+} from "../grid/fog";
 import { FogRenderer } from "./FogRenderer";
 import { WorldRect } from "./canvasTypes";
 
@@ -77,14 +81,7 @@ export class HitTester {
 
 	/** Grid type "none" is treated as "square" here — it has no visible cells, but fog still uses this square substrate. */
 	cellKeyAt(worldX: number, worldY: number): string {
-		const data = this.controller.getData();
-		if (data.gridType === "square" || data.gridType === "none") {
-			const c = squareWorldToCell(worldX, worldY, this.effectiveCellSize());
-			return squareKey(c.a, c.b);
-		}
-		const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
-		const c = hexWorldToCell(worldX, worldY, this.effectiveCellSize(), orientation);
-		return hexKey(c.a, c.b);
+		return fogWorldPointToCellKey(this.controller.getData(), worldX, worldY);
 	}
 
 	/** Anchor cell for a dropped token: accounts for its footprint so its visual center lands under the pointer. */
@@ -278,12 +275,17 @@ export class HitTester {
 		return { minX: Math.min(a.x, b.x), maxX: Math.max(a.x, b.x), minY: Math.min(a.y, b.y), maxY: Math.max(a.y, b.y) };
 	}
 
-	/** Tries each kind in priority order and locks onto the first with any hits inside `rect` — used when a marquee drag starts on an unlocked selection. */
+	/**
+	 * Tries each kind in priority order and locks onto the first with any hits inside `rect` — used when
+	 * a marquee drag starts on an unlocked selection. Stamps are deliberately never inferred here — a
+	 * marquee over painted zone cells would otherwise scoop up huge swaths of the grid at once; see
+	 * `MapCanvas.handleMarqueePointerUp`, which also blocks a marquee from adding to an
+	 * already-`"stamp"`-locked selection.
+	 */
 	inferMarqueeKind(rect: WorldRect): MassSelectionKind | null {
 		if (this.tokensInRect(rect).length > 0) return "token";
 		if (this.wallSegmentsInRect(rect).length > 0) return "wallSegment";
-		const stampIds = this.controller.getData().gridType === "none" ? this.markersInRect(rect) : this.cellsInRect(rect);
-		return stampIds.length > 0 ? "stamp" : null;
+		return null;
 	}
 
 	idsInRect(kind: MassSelectionKind, rect: WorldRect): string[] {

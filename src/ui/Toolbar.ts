@@ -2,11 +2,8 @@ import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
 import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
-import { detectMagicWalls } from "../platform/detectMagicWalls";
 import { MapManagerSettings } from "../settings/types";
-import { ensureFolder, sanitizeFileName } from "../utils";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
-import { MagicWallsModal } from "./MagicWallsModal";
 
 export interface ToolbarActions {
 	recenter: () => void;
@@ -43,7 +40,15 @@ function buildGridIcon(svg: SVGSVGElement, gridType: GridType): void {
 	svg.createSvg("polygon", { attr: { points } });
 }
 
-/** Dropdowns (grid type / layers / image / fog / zoom range) are mutually exclusive and share one outside-click-to-close handler. */
+/**
+ * Boutons communs, dans l'ordre : Annuler/Rétablir (avant tout) ; puis, selon le mode, les groupes
+ * propres à l'Édition (Calques, Image, Grillage, Zones, Murs) ou à la Vue (Calques, grillage,
+ * Brouillard) ; puis, communs à nouveau, Recentrer, Vue Joueur (qui regroupe "Publier la vue" et ses
+ * options une fois lancée), et enfin Info (aide-mémoire des raccourcis), collé tout à droite.
+ *
+ * Dropdowns (grille / calques / image / brouillard / vue joueur / info) sont mutuellement exclusifs et
+ * partagent un seul gestionnaire de fermeture au clic extérieur.
+ */
 export class Toolbar {
 	el: HTMLElement;
 	private unsubscribe: () => void;
@@ -51,13 +56,9 @@ export class Toolbar {
 	private layersMenuOpen = false;
 	private imageMenuOpen = false;
 	private fogMenuOpen = false;
-	private zoomMenuOpen = false;
 	private playerWindowMenuOpen = false;
+	private infoMenuOpen = false;
 	private openDropdownEl: HTMLElement | null = null;
-	/** True while "Murs magiques" is analyzing the active layer's background image (see `runMagicWalls`) — local UI state, not part of `MapController`, so it needs its own re-render. */
-	private magicWallsRunning = false;
-	/** The wall color picked with "Murs magiques"' eyedropper (see `pickMagicWallsColor`), or `null` to fall back to automatic color detection. Local UI state, like `magicWallsRunning` — session-only, resets if the toolbar itself is torn down. */
-	private magicWallsColor: string | null = null;
 
 	constructor(container: HTMLElement, private app: App, private deps: ToolbarDeps, private controller: MapController, private actions: ToolbarActions) {
 		this.el = container.createDiv({ cls: "map-manager-toolbar" });
@@ -76,8 +77,8 @@ export class Toolbar {
 		this.layersMenuOpen = false;
 		this.imageMenuOpen = false;
 		this.fogMenuOpen = false;
-		this.zoomMenuOpen = false;
 		this.playerWindowMenuOpen = false;
+		this.infoMenuOpen = false;
 	}
 
 	private handleDocumentClick = (e: MouseEvent): void => {
@@ -115,10 +116,10 @@ export class Toolbar {
 
 		if (this.controller.mode === "edit") {
 			this.renderLayersDropdown(this.el, data);
+			this.renderImageDropdown(this.el, activeLayer, data);
 			this.renderGridDropdown(this.el, data);
-			this.renderToolControls(this.el, data);
-			this.renderImageDropdown(this.el, activeLayer);
-			this.renderZoomDropdown(this.el, data);
+			this.renderZonesGroup(this.el, data);
+			this.renderMursGroup(this.el);
 		}
 
 		if (this.controller.mode === "view") {
@@ -126,7 +127,7 @@ export class Toolbar {
 
 			if (data.gridType !== "none") {
 				const viewGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
-				const cellsBtn = viewGroup.createEl("button", { text: this.controller.showCells ? "Masquer les cases" : "Afficher les cases", cls: "map-manager-btn" });
+				const cellsBtn = viewGroup.createEl("button", { text: this.controller.showCells ? "Masquer le grillage" : "Afficher le grillage", cls: "map-manager-btn" });
 				cellsBtn.onclick = () => this.controller.toggleShowCells();
 			}
 
@@ -135,19 +136,13 @@ export class Toolbar {
 			this.renderFogDropdown(this.el, data);
 		}
 
-		// Publishing reads whatever fog/exploration state is currently on the map, so it's useful from
-		// either mode — not just "Vue", where a GM runs live sessions.
-		const publishGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
-		const publishBtn = publishGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(publishBtn, "upload");
-		setTooltip(publishBtn, "Publier la vue (met à jour le .json pour le site externe)");
-		publishBtn.onclick = () => this.actions.publish();
-
 		const recenterGroup = this.el.createDiv({ cls: "map-manager-toolbar-group" });
 		const resetBtn = recenterGroup.createEl("button", { text: "Recentrer", cls: "map-manager-btn" });
 		resetBtn.onclick = () => this.actions.recenter();
 
 		this.renderPlayerWindowControl(recenterGroup);
+
+		this.renderInfoDropdown(this.el);
 	}
 
 	/**
@@ -155,7 +150,9 @@ export class Toolbar {
 	 * open (`actions.openPlayerWindow`), same as before. Once one is open, clicking instead opens a
 	 * dropdown of live options for it — opening a second window isn't useful, so the click's meaning
 	 * changes rather than adding a separate menu button. See `MapController.showEntityVisionToPlayers`
-	 * (hidden by default) and `playerMirrorFogEnabled` (enabled by default).
+	 * (hidden by default), `playerMirrorFogEnabled` (enabled by default), and `actions.publish`
+	 * (regrouped here rather than its own standalone toolbar button — a GM publishing a snapshot is
+	 * something done right around launching the player-facing view, not before).
 	 */
 	private renderPlayerWindowControl(container: HTMLElement): void {
 		const isOpen = this.actions.isPlayerWindowOpen();
@@ -188,7 +185,7 @@ export class Toolbar {
 		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Vue joueur" });
 
 		const visionBtn = panel.createEl("button", {
-			text: this.controller.showEntityVisionToPlayers ? "Masquer la vision des entités" : "Afficher la vision des entités",
+			text: this.controller.showEntityVisionToPlayers ? "Masquer la vision des pions entités" : "Afficher la vision des pions entités",
 			cls: "map-manager-btn",
 		});
 		visionBtn.toggleClass("is-active", this.controller.showEntityVisionToPlayers);
@@ -200,6 +197,62 @@ export class Toolbar {
 		});
 		fogBtn.toggleClass("is-active", this.controller.playerMirrorFogEnabled);
 		fogBtn.onclick = () => this.controller.togglePlayerMirrorFog();
+
+		const publishBtn = panel.createEl("button", { text: "Publier la vue", cls: "map-manager-btn" });
+		setTooltip(publishBtn, "Met à jour le .json pour le site externe.");
+		publishBtn.onclick = () => this.actions.publish();
+	}
+
+	/**
+	 * "Info" — aide-mémoire statique des raccourcis clavier/souris, toujours collé tout à droite de la
+	 * barre (voir `styles.css`). Pas de configuration ici — juste une référence consultable, groupée
+	 * par contexte.
+	 */
+	private renderInfoDropdown(container: HTMLElement): void {
+		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-info-dropdown" });
+		wrapper.toggleClass("is-open", this.infoMenuOpen);
+		if (this.infoMenuOpen) this.openDropdownEl = wrapper;
+
+		const trigger = wrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
+		setIcon(trigger, "info");
+		setTooltip(trigger, "Raccourcis");
+		trigger.onclick = () => {
+			const wasOpen = this.infoMenuOpen;
+			this.closeMenus();
+			this.infoMenuOpen = !wasOpen;
+			this.render();
+		};
+
+		const panel = wrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-info-dropdown-panel" });
+		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Raccourcis" });
+
+		const section = (title: string, shortcuts: [string, string][]) => {
+			panel.createDiv({ cls: "map-manager-info-section-title", text: title });
+			const list = panel.createDiv({ cls: "map-manager-info-shortcut-list" });
+			for (const [keys, desc] of shortcuts) {
+				const row = list.createDiv({ cls: "map-manager-info-shortcut-row" });
+				row.createSpan({ cls: "map-manager-info-shortcut-keys", text: keys });
+				row.createSpan({ cls: "map-manager-info-shortcut-desc", text: desc });
+			}
+		};
+
+		section("Général", [
+			["Molette", "Zoom / dézoom"],
+			["Glisser (clic molette ou clic gauche)", "Se déplacer sur la carte"],
+			["Clic droit", "Ajouter un pion/tampon, ou coller"],
+			["Clic gauche", "Afficher les détails d'un pion/tampon existant"],
+			["Ctrl + clic gauche", "Sélectionner plusieurs pions/tampons, un par un"],
+			["Shift + glisser (clic gauche)", "Sélectionner plusieurs pions/tampons par zone"],
+			["Échap", "Désélectionner tout / annuler l'action en cours"],
+		]);
+		section("Édition", [
+			["Clic droit (outil Murs)", "Annuler le dernier point posé"],
+			["Double-clic sur un mur", "Ajouter un point pour le remodeler"],
+		]);
+		section("Vue MJ", [
+			["Ctrl + glisser (clic gauche)", "Déplacer d'un coup les pions sélectionnés"],
+			["Glisser sur la carte", "Tracer un chemin que les pions sélectionnés suivront"],
+		]);
 	}
 
 	/** Clicking the active grid icon opens a dropdown of the other grid types below it; picking one applies and closes it. */
@@ -309,8 +362,8 @@ export class Toolbar {
 		}
 	}
 
-	/** Image settings dropdown: same open/close mechanics as the layers dropdown. */
-	private renderImageDropdown(container: HTMLElement, activeLayer: ReturnType<MapController["getActiveLayer"]>): void {
+	/** Image settings dropdown: same open/close mechanics as the layers dropdown. Also carries "Zoom max" (a map-level, not per-layer, property — see `renderZoomMaxField`) since the résumé groups it under "Image du calque actif". */
+	private renderImageDropdown(container: HTMLElement, activeLayer: ReturnType<MapController["getActiveLayer"]>, data: MapFileData): void {
 		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-image-dropdown" });
 		wrapper.toggleClass("is-open", this.imageMenuOpen);
 		if (this.imageMenuOpen) this.openDropdownEl = wrapper;
@@ -331,14 +384,26 @@ export class Toolbar {
 		panel.createDiv({ cls: "map-manager-dropdown-title", text: `Image (${activeLayer.name})` });
 		const chooseBtn = panel.createEl("button", { text: "Image du vault", cls: "map-manager-btn" });
 		chooseBtn.onclick = () => this.pickVaultImage();
-		const importBtn = panel.createEl("button", { text: "Importer une image", cls: "map-manager-btn" });
-		importBtn.onclick = () => this.importImageFromDisk();
 
 		if (activeLayer.background) {
 			const clearBtn = panel.createEl("button", { text: "Retirer l'image", cls: "map-manager-btn" });
 			clearBtn.onclick = () => this.controller.update((d) => (getActiveLayer(d).background = undefined));
 			this.renderBackgroundControls(panel);
 		}
+
+		this.renderZoomMaxField(panel, data);
+	}
+
+	private renderZoomMaxField(container: HTMLElement, data: MapFileData): void {
+		const wrap = container.createDiv({ cls: "map-manager-field-inline" });
+		wrap.createEl("label", { text: "Zoom max" });
+		const input = wrap.createEl("input", { type: "number" });
+		input.step = "0.01";
+		input.value = String(data.maxZoom);
+		input.onchange = () => {
+			const v = parseFloat(input.value);
+			if (!Number.isNaN(v)) this.controller.update((d) => (d.maxZoom = clamp(v, ABS_MIN_ZOOM, ABS_MAX_ZOOM)));
+		};
 	}
 
 	/**
@@ -379,175 +444,36 @@ export class Toolbar {
 		}
 	}
 
-	/** Zoom range dropdown: same open/close mechanics as the other toolbar dropdowns. */
-	private renderZoomDropdown(container: HTMLElement, data: MapFileData): void {
-		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-zoom-dropdown" });
-		wrapper.toggleClass("is-open", this.zoomMenuOpen);
-		if (this.zoomMenuOpen) this.openDropdownEl = wrapper;
-
-		const trigger = wrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
-		setIcon(trigger, "zoom-in");
-		setTooltip(trigger, "Plage de zoom");
-		setIcon(trigger.createSpan({ cls: "map-manager-dropdown-chevron" }), "chevron-down");
-		trigger.onclick = () => {
-			const wasOpen = this.zoomMenuOpen;
-			this.closeMenus();
-			this.zoomMenuOpen = !wasOpen;
-			this.render();
-		};
-
-		const panel = wrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-zoom-dropdown-panel" });
-		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Plage de zoom" });
-
-		const makeZoomInput = (label: string, value: number, onChange: (v: number) => void) => {
-			const wrap = panel.createDiv({ cls: "map-manager-field-inline" });
-			wrap.createEl("label", { text: label });
-			const input = wrap.createEl("input", { type: "number" });
-			input.step = "0.01";
-			input.value = String(value);
-			input.onchange = () => {
-				const v = parseFloat(input.value);
-				if (!Number.isNaN(v)) onChange(clamp(v, ABS_MIN_ZOOM, ABS_MAX_ZOOM));
-			};
-		};
-
-		makeZoomInput("max", data.maxZoom, (v) => this.controller.update((d) => (d.maxZoom = v)));
-	}
-
 	/**
-	 * Brush (paint while dragging) and fill (flood-fill a closed perimeter) tools, mutually exclusive,
-	 * both painting the same zone type. A third "wall" tool draws freeform vision-blocking lines
-	 * (see MapCanvas) independent of the grid — its own control just picks the default blocker type
-	 * (opaque/dim) for newly-drawn segments.
+	 * "Zones" toolbar group (edit mode): a single "Pinceau" dropdown, mutually exclusive with "Murs"
+	 * below via `activeTool` (open exactly while `activeTool` is "brush" or "fill", same pattern as the
+	 * "Murs" wall-shape dropdown). Panel contents, in order: Remplissage (switches to the click-to-fill
+	 * variant without leaving the dropdown), Rayon du pinceau, Type de zone, Afficher/masquer les zones.
 	 */
-	private renderToolControls(container: HTMLElement, data: MapFileData): void {
-		const toolGroup = container.createDiv({ cls: "map-manager-toolbar-group" });
-		const brushBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+	private renderZonesGroup(container: HTMLElement, data: MapFileData): void {
+		const group = container.createDiv({ cls: "map-manager-toolbar-group" });
+
+		const brushWrapper = group.createDiv({ cls: "map-manager-dropdown map-manager-brush-dropdown" });
+		const brushBtn = brushWrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
 		setIcon(brushBtn, "paintbrush");
 		setTooltip(brushBtn, "Pinceau");
-		brushBtn.toggleClass("is-active", this.controller.activeTool === "brush");
+		const brushOrFillActive = this.controller.activeTool === "brush" || this.controller.activeTool === "fill";
+		brushBtn.toggleClass("is-active", brushOrFillActive);
+		setIcon(brushBtn.createSpan({ cls: "map-manager-dropdown-chevron" }), "chevron-down");
 		brushBtn.onclick = () => this.controller.setActiveTool("brush");
-		const fillBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(fillBtn, "paint-bucket");
-		setTooltip(fillBtn, "Remplissage");
+
+		if (!brushOrFillActive) return;
+
+		brushWrapper.addClass("is-open");
+		const panel = brushWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-brush-dropdown-panel" });
+
+		const fillBtn = panel.createEl("button", { text: "Remplissage", cls: "map-manager-btn" });
 		fillBtn.toggleClass("is-active", this.controller.activeTool === "fill");
 		fillBtn.onclick = () => this.controller.setActiveTool("fill");
-		// Wrapped in its own dropdown so the shape-insert panel (below) opens directly under this
-		// button specifically, not just somewhere in the toolbar row — the button itself keeps its
-		// original meaning (activates manual, point-by-point wall placement); shapes are a separate,
-		// additional way to get a wall, not something this icon represents.
-		const wallWrapper = toolGroup.createDiv({ cls: "map-manager-dropdown map-manager-wall-shape-dropdown" });
-		const wallBtn = wallWrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(wallBtn, "spline");
-		setTooltip(wallBtn, "Murs : placer les points manuellement");
-		wallBtn.toggleClass("is-active", this.controller.activeTool === "wall");
-		wallBtn.onclick = () => this.controller.setActiveTool("wall");
-
-		const selectBtn = toolGroup.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-		setIcon(selectBtn, "mouse-pointer-2");
-		setTooltip(selectBtn, "Sélection (actions groupées)");
-		selectBtn.toggleClass("is-active", this.controller.activeTool === "select");
-		selectBtn.onclick = () => this.controller.setActiveTool("select");
-
-		if (this.controller.activeTool === "wall") {
-			wallWrapper.addClass("is-open");
-			const panel = wallWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-wall-shape-dropdown-panel" });
-			panel.createDiv({ cls: "map-manager-dropdown-title", text: "Insérer une forme" });
-			const shapeRow = panel.createDiv({ cls: "map-manager-wall-shape-row" });
-			const shapeBtn = (shape: "square" | "triangle" | "losange", icon: string, tooltip: string) => {
-				const btn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-				setIcon(btn, icon);
-				setTooltip(btn, tooltip);
-				btn.toggleClass("is-active", this.controller.pendingWallShape === shape);
-				btn.onclick = () => this.controller.startWallShapePlacement(shape);
-			};
-			shapeBtn("square", "square", "Carré / rectangle : cliquez un coin, puis le coin opposé");
-			shapeBtn("triangle", "triangle", "Triangle : cliquez un coin, puis le coin opposé de sa zone");
-			shapeBtn("losange", "diamond", "Losange : cliquez un coin, puis le coin opposé de sa zone");
-			// "Seau à murs" needs no second corner like the shapes above — one click on the map is enough
-			// to flood-fill the color under the cursor and wall off where it stops (see
-			// `MapCanvas.runColorRegionWalls`), so it stays armed after each use instead of needing a
-			// "first corner placed" half-state.
-			const bucketBtn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-			setIcon(bucketBtn, "paint-bucket");
-			setTooltip(bucketBtn, "Seau à murs : cliquez sur une couleur pour murer la zone qui l'entoure");
-			bucketBtn.toggleClass("is-active", this.controller.pendingWallBucket);
-			bucketBtn.onclick = () => this.controller.startWallBucketPlacement();
-			if (this.controller.pendingWallShape) {
-				const hintText = this.controller.getWallShapeFirstCorner()
-					? "Cliquez pour poser le coin opposé (clic droit pour annuler)"
-					: "Cliquez pour poser le premier coin (clic droit pour annuler)";
-				panel.createDiv({ cls: "map-manager-wall-shape-hint", text: hintText });
-			} else if (this.controller.pendingWallBucket) {
-				panel.createDiv({
-					cls: "map-manager-wall-shape-hint",
-					text: "Cliquez sur la carte pour murer la zone de couleur sous le curseur (clic droit pour désactiver)",
-				});
-			}
-
-			// "Optimiser les murs" runs a one-off cleanup pass over the active layer's wall network
-			// (orphan points, overlapping/duplicate segments, redundant straight-line points — see
-			// `MapController.optimizeWalls`). "Murs magiques" auto-detects wall linework from the
-			// layer's background image instead of placing points by hand — see `runMagicWalls`. Its
-			// color row lets the user override automatic color detection with an exact pick instead
-			// (`pickMagicWallsColor`) — handy when the image's wall lines aren't the map's boldest,
-			// highest-contrast stroke (a heavy border/frame, say), which would otherwise win the vote.
-			panel.createDiv({ cls: "map-manager-dropdown-title", text: "Outils" });
-
-			const colorRow = panel.createDiv({ cls: "map-manager-magic-walls-color-row" });
-			colorRow.createSpan({ text: "Couleur des murs :" });
-			const colorSwatch = colorRow.createDiv({ cls: "map-manager-magic-walls-color-swatch" });
-			if (this.magicWallsColor) {
-				colorSwatch.addClass("is-set");
-				colorSwatch.style.setProperty("--map-manager-magic-walls-color", this.magicWallsColor);
-				setTooltip(colorSwatch, this.magicWallsColor);
-			} else {
-				setTooltip(colorSwatch, "Détection automatique");
-			}
-			const pipetteBtn = colorRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-			setIcon(pipetteBtn, "pipette");
-			setTooltip(pipetteBtn, "Choisir la couleur des murs à la pipette");
-			pipetteBtn.onclick = () => void this.pickMagicWallsColor();
-			if (this.magicWallsColor) {
-				const clearColorBtn = colorRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
-				setIcon(clearColorBtn, "x");
-				setTooltip(clearColorBtn, "Revenir à la détection automatique");
-				clearColorBtn.onclick = () => {
-					this.magicWallsColor = null;
-					this.render();
-				};
-			}
-
-			const optimizeWallsBtn = panel.createEl("button", { text: "Optimiser les murs", cls: "map-manager-btn" });
-			optimizeWallsBtn.onclick = () => {
-				this.controller.optimizeWalls();
-				new Notice("Murs optimisés.");
-			};
-			const magicWallsBtn = panel.createEl("button", { text: this.magicWallsRunning ? "Analyse en cours…" : "Murs magiques", cls: "map-manager-btn" });
-			magicWallsBtn.disabled = this.magicWallsRunning;
-			magicWallsBtn.onclick = () => void this.runMagicWalls();
-		}
-
-		if (this.controller.activeTool === "none") return;
-
-		// The "select" tool's own controls live entirely in InfoPanel's mass-edit panel (matching every
-		// other selection type) — nothing further to show in the toolbar row itself.
-		if (this.controller.activeTool === "select") return;
-
-		if (this.controller.activeTool === "wall") {
-			const blockerSelect = toolGroup.createEl("select");
-			const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-			opaqueOpt.value = "opaque";
-			const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-			dimOpt.value = "dim";
-			blockerSelect.value = this.controller.wallDrawBlockerType;
-			blockerSelect.onchange = () => this.controller.setWallDrawBlockerType(blockerSelect.value as VisionBlockerType);
-			return;
-		}
 
 		if (this.controller.activeTool === "brush") {
-			const radiusField = toolGroup.createDiv({ cls: "map-manager-field-inline" });
-			radiusField.createEl("label", { text: "Rayon" });
+			const radiusField = panel.createDiv({ cls: "map-manager-field-inline" });
+			radiusField.createEl("label", { text: "Rayon du pinceau" });
 			const radiusInput = radiusField.createEl("input", { type: "number" });
 			radiusInput.min = "0";
 			radiusInput.value = String(this.controller.brushRadius);
@@ -558,74 +484,98 @@ export class Toolbar {
 		}
 
 		if (data.gridType !== "none") {
-			const zoneSelect = toolGroup.createEl("select");
-			const keepZoneOpt = zoneSelect.createEl("option", { text: "Zone : ne pas changer" });
-			keepZoneOpt.value = "keep";
-			const clearZoneOpt = zoneSelect.createEl("option", { text: "Zone : aucune" });
+			const zoneField = panel.createDiv({ cls: "map-manager-field-inline" });
+			zoneField.createEl("label", { text: "Type de zone" });
+			const zoneSelect = zoneField.createEl("select");
+			const clearZoneOpt = zoneSelect.createEl("option", { text: "Aucune" });
 			clearZoneOpt.value = "clear";
 			for (const z of this.deps.settings.defaultZoneTypes) {
-				const opt = zoneSelect.createEl("option", { text: `Zone : ${z.name}` });
+				const opt = zoneSelect.createEl("option", { text: z.name });
 				opt.value = z.id;
 			}
 			zoneSelect.value = this.controller.brushZoneMode;
 			zoneSelect.onchange = () => this.controller.setBrushZoneMode(zoneSelect.value);
 		}
+
+		const showBtn = panel.createEl("button", { text: this.controller.showZones ? "Masquer les zones" : "Afficher les zones", cls: "map-manager-btn" });
+		showBtn.toggleClass("is-active", this.controller.showZones);
+		showBtn.onclick = () => this.controller.toggleShowZones();
 	}
 
 	/**
-	 * "Murs magiques": runs `detectMagicWalls` against the active layer's background image — using
-	 * `magicWallsColor` (the eyedropper pick) if set, else automatic detection — and, if it found a
-	 * candidate wall network, opens `MagicWallsModal` for the user to confirm before anything is
-	 * actually written to the map (`MapController.applyMagicWalls`). Guard conditions (no background
-	 * image, grid type "none", grid too fine for the image, an invalid picked color) are all just
-	 * thrown `Error`s from `detectMagicWalls` with an already user-facing French message — shown as-is.
+	 * "Murs" toolbar group (edit mode): manual point-by-point placement, a shape-insert dropdown
+	 * (carré/triangle/carré sur coin/remplissage), the default blocker type for newly-drawn segments,
+	 * and "Optimiser les murs". Mutually exclusive with "Zones" above via `activeTool`.
 	 */
-	private async runMagicWalls(): Promise<void> {
-		if (this.magicWallsRunning) return;
-		this.magicWallsRunning = true;
-		this.render();
-		try {
-			const activeLayer = this.controller.getActiveLayer();
-			const result = await detectMagicWalls(this.app, this.controller.getData(), activeLayer, this.controller.wallDrawBlockerType, this.magicWallsColor ?? undefined);
-			if (!result) {
-				new Notice("Aucun mur détecté sur l'image de ce calque.");
-				return;
-			}
-			new MagicWallsModal(this.app, result, () => {
-				this.controller.applyMagicWalls(result.wallPoints, result.wallSegments);
-				const count = result.wallSegments.length;
-				new Notice(`${count} mur${count > 1 ? "s" : ""} magique${count > 1 ? "s" : ""} ajouté${count > 1 ? "s" : ""}.`);
-			}).open();
-		} catch (e) {
-			console.error("Map Manager: échec de la détection des murs magiques", e);
-			new Notice(e instanceof Error ? e.message : "Échec de la détection des murs magiques.");
-		} finally {
-			this.magicWallsRunning = false;
-			this.render();
-		}
-	}
+	private renderMursGroup(container: HTMLElement): void {
+		const group = container.createDiv({ cls: "map-manager-toolbar-group" });
 
-	/**
-	 * Opens the browser's native `EyeDropper` (Chromium/Electron desktop only — not yet part of
-	 * TypeScript's DOM lib, hence the local type cast rather than a global ambient declaration) so
-	 * the user can sample the wall color directly off the map canvas (or anywhere else on screen) for
-	 * "Murs magiques" to target instead of guessing it automatically. Silently does nothing if the
-	 * user presses Escape (`open()` rejects) — that's a cancel, not an error.
-	 */
-	private async pickMagicWallsColor(): Promise<void> {
-		type EyeDropperCtor = new () => { open(): Promise<{ sRGBHex: string }> };
-		const ctor = (window as unknown as { EyeDropper?: EyeDropperCtor }).EyeDropper;
-		if (!ctor) {
-			new Notice("La pipette n'est pas disponible sur cette plateforme.");
-			return;
+		// Wrapped in its own dropdown so the shape-insert panel (below) opens directly under this
+		// button specifically — the button itself keeps its original meaning (activates manual,
+		// point-by-point wall placement); shapes are a separate, additional way to get a wall.
+		const wallWrapper = group.createDiv({ cls: "map-manager-dropdown map-manager-wall-shape-dropdown" });
+		const wallBtn = wallWrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
+		setIcon(wallBtn, "spline");
+		setTooltip(wallBtn, "Murs : placer les points manuellement");
+		wallBtn.toggleClass("is-active", this.controller.activeTool === "wall");
+		setIcon(wallBtn.createSpan({ cls: "map-manager-dropdown-chevron" }), "chevron-down");
+		wallBtn.onclick = () => this.controller.setActiveTool("wall");
+
+		if (this.controller.activeTool !== "wall") return;
+
+		wallWrapper.addClass("is-open");
+		const panel = wallWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-wall-shape-dropdown-panel" });
+		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Insérer une forme" });
+		const shapeRow = panel.createDiv({ cls: "map-manager-wall-shape-row" });
+		const shapeBtn = (shape: "square" | "triangle" | "losange", icon: string, tooltip: string) => {
+			const btn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+			setIcon(btn, icon);
+			setTooltip(btn, tooltip);
+			btn.toggleClass("is-active", this.controller.pendingWallShape === shape);
+			btn.onclick = () => this.controller.startWallShapePlacement(shape);
+		};
+		shapeBtn("square", "square", "Carré / rectangle : cliquez un coin, puis le coin opposé");
+		shapeBtn("triangle", "triangle", "Triangle : cliquez un coin, puis le coin opposé de sa zone");
+		shapeBtn("losange", "diamond", "Carré sur coin (losange) : cliquez un coin, puis le coin opposé de sa zone");
+		// "Seau à murs" needs no second corner like the shapes above — one click on the map is enough
+		// to flood-fill the color under the cursor and wall off where it stops (see
+		// `MapCanvas.runColorRegionWalls`), so it stays armed after each use instead of needing a
+		// "first corner placed" half-state.
+		const bucketBtn = shapeRow.createEl("button", { cls: "map-manager-btn map-manager-btn-icon" });
+		setIcon(bucketBtn, "paint-bucket");
+		setTooltip(bucketBtn, "Remplissage : cliquez sur une couleur pour murer la zone qui l'entoure");
+		bucketBtn.toggleClass("is-active", this.controller.pendingWallBucket);
+		bucketBtn.onclick = () => this.controller.startWallBucketPlacement();
+		if (this.controller.pendingWallShape) {
+			const hintText = this.controller.getWallShapeFirstCorner()
+				? "Cliquez pour poser le coin opposé (clic droit pour annuler)"
+				: "Cliquez pour poser le premier coin (clic droit pour annuler)";
+			panel.createDiv({ cls: "map-manager-wall-shape-hint", text: hintText });
+		} else if (this.controller.pendingWallBucket) {
+			panel.createDiv({
+				cls: "map-manager-wall-shape-hint",
+				text: "Cliquez sur la carte pour murer la zone de couleur sous le curseur (clic droit pour désactiver)",
+			});
 		}
-		try {
-			const result = await new ctor().open();
-			this.magicWallsColor = result.sRGBHex;
-			this.render();
-		} catch {
-			// Cancelled (Escape) — nothing to do.
-		}
+
+		const blockerField = panel.createDiv({ cls: "map-manager-field-inline" });
+		blockerField.createEl("label", { text: "Type de mur" });
+		const blockerSelect = blockerField.createEl("select");
+		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
+		opaqueOpt.value = "opaque";
+		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
+		dimOpt.value = "dim";
+		blockerSelect.value = this.controller.wallDrawBlockerType;
+		blockerSelect.onchange = () => this.controller.setWallDrawBlockerType(blockerSelect.value as VisionBlockerType);
+
+		// "Optimiser les murs" runs a one-off cleanup pass over the active layer's wall network
+		// (orphan points, overlapping/duplicate segments, redundant straight-line points — see
+		// `MapController.optimizeWalls`).
+		const optimizeWallsBtn = panel.createEl("button", { text: "Optimiser les murs", cls: "map-manager-btn" });
+		optimizeWallsBtn.onclick = () => {
+			this.controller.optimizeWalls();
+			new Notice("Murs optimisés.");
+		};
 	}
 
 	private renderBackgroundControls(container: HTMLElement): void {
@@ -671,22 +621,5 @@ export class Toolbar {
 			(file: TFile) => this.setBackgroundCentered(file.path),
 			"Choisir une image du vault..."
 		).open();
-	}
-
-	private importImageFromDisk(): void {
-		const input = document.createElement("input");
-		input.type = "file";
-		input.accept = "image/*";
-		input.onchange = async () => {
-			const file = input.files?.[0];
-			if (!file) return;
-			const buffer = await file.arrayBuffer();
-			const folder = this.deps.assetsFolder || "Map Assets";
-			await ensureFolder(this.app, folder);
-			const path = `${folder}/${Date.now()}-${sanitizeFileName(file.name)}`;
-			const created = await this.app.vault.createBinary(path, buffer);
-			this.setBackgroundCentered(created.path);
-		};
-		input.click();
 	}
 }
