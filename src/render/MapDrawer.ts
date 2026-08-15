@@ -1,5 +1,5 @@
 import { MapController, MapMode } from "../controller/MapController";
-import { WallPoint, hexKey, squareKey } from "../data/mapData";
+import { WallPoint, hexKey, squareKey, wallBlocksVision, wallPassableWithInteract } from "../data/mapData";
 import { ViewTransform, getVisibleHexCells, getVisibleSquareCells, hexCellToWorldCenter, hexCorners } from "../grid/gridMath";
 import { MapManagerSettings } from "../settings/types";
 import { DraggingMarker, DraggingWallPoint } from "./canvasTypes";
@@ -172,14 +172,19 @@ export class MapDrawer {
 	}
 
 	/**
-	 * Committed wall segments (solid red for "opaque", dashed amber for "dim" — same colors the old
-	 * per-cell blocker badges used) plus each point's handle, drawn whenever the grid/cell overlay
-	 * would be (matches the old badges' visibility, hence the `cellsVisible` param — `MapCanvas.render()`
+	 * Committed wall segments plus each point's handle, drawn whenever the grid/cell overlay would be
+	 * (matches the old badges' visibility, hence the `cellsVisible` param — `MapCanvas.render()`
 	 * already computes it once per frame). Point handles only show while actively placing walls or with
 	 * one selected — otherwise just the lines, so authored walls read as map geometry. Never drawn on a
 	 * player-mirror window (`isMirror`) — walls still block vision/line-of-sight there via
 	 * `getWallSegments()` elsewhere, but the authored geometry itself must stay invisible to players.
 	 * The GM's own tabs (edit and View) keep showing it, same as before.
+	 *
+	 * Two independent visual channels, matching `VisionBlockerType`'s own shape: color (`wallBlocksVision`
+	 * — red if it blocks line of sight, teal if it doesn't) and line style (`wallPassableWithInteract` —
+	 * solid if a token can never cross it by any means, dashed if the gamepad's interact-to-pass action
+	 * can force a step through). So `"opaque"` draws solid red, `"see-through"` solid teal,
+	 * `"pass-through"` dashed red, `"pass-see-through"` dashed teal.
 	 */
 	drawWalls(ctx: CanvasRenderingContext2D, cellsVisible: boolean, mode: MapMode, isMirror: boolean, draggingWallPoint: DraggingWallPoint | null): void {
 		if (isMirror) return;
@@ -198,9 +203,11 @@ export class MapDrawer {
 				const aPos = this.wallPointPosition(a, draggingWallPoint);
 				const bPos = this.wallPointPosition(b, draggingWallPoint);
 				ctx.save();
-				ctx.strokeStyle = segment.blockerType === "opaque" ? "#c0392b" : "#d99a2b";
+				ctx.strokeStyle = wallBlocksVision(segment.blockerType) ? "#c0392b" : "#16a085";
 				ctx.lineWidth = Math.max(1.5, 2.5 / this.transform.zoom);
-				if (segment.blockerType === "dim") ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
+				if (wallPassableWithInteract(segment.blockerType)) {
+					ctx.setLineDash([Math.max(3, 6 / this.transform.zoom), Math.max(3, 6 / this.transform.zoom)]);
+				}
 				ctx.beginPath();
 				ctx.moveTo(aPos.x, aPos.y);
 				ctx.lineTo(bPos.x, bPos.y);

@@ -38,6 +38,8 @@ export class MapPlayerMirrorView extends ItemView {
 	private unsubscribeScroll: (() => void) | null = null;
 	private unsubscribePing: (() => void) | null = null;
 	private unsubscribePathAnimation: (() => void) | null = null;
+	private unsubscribeCellHop: (() => void) | null = null;
+	private unsubscribeAim: (() => void) | null = null;
 	private rootEl: HTMLElement;
 	private bodyEl: HTMLElement | null = null;
 
@@ -102,6 +104,8 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribeViewport = source.onViewportChange(() => this.canvasComp?.setMirrorCamera(source.getView()));
 		this.unsubscribePing = source.onPing((x, y) => this.canvasComp?.triggerPing(x, y));
 		this.unsubscribePathAnimation = source.onPathAnimationStart((routes, speedWorldPerMs) => this.canvasComp?.playPathAnimationEcho(routes, speedWorldPerMs));
+		this.unsubscribeCellHop = source.onCellHop((tokenId, from, to) => this.canvasComp?.playCellHopEcho(tokenId, from, to));
+		this.unsubscribeAim = source.onAim((tokenId, angleDeg) => this.canvasComp?.playAimEcho(tokenId, angleDeg));
 		this.unsubscribeController = source.controller.onChange(() => this.syncInfoPanel());
 		this.syncInfoPanel();
 	}
@@ -134,6 +138,8 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribeScroll?.();
 		this.unsubscribePing?.();
 		this.unsubscribePathAnimation?.();
+		this.unsubscribeCellHop?.();
+		this.unsubscribeAim?.();
 		this.canvasComp = null;
 		this.infoPanelComp = null;
 		this.unsubscribeViewport = null;
@@ -141,6 +147,8 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribeScroll = null;
 		this.unsubscribePing = null;
 		this.unsubscribePathAnimation = null;
+		this.unsubscribeCellHop = null;
+		this.unsubscribeAim = null;
 	}
 
 	async onClose(): Promise<void> {

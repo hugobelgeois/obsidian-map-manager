@@ -2,7 +2,7 @@ import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Token, hexKey, isCellEmpty, parseCellKey, squareKey } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, Token, configuredLightRadius, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
@@ -26,7 +26,8 @@ import {
 	wallShapeCorners,
 	worldToScreen,
 } from "../grid/gridMath";
-import { ResolvedWallSegment, footprintCellKeys, occupiedFootprintCells, resolveWallSegments as fogResolveWallSegments } from "../grid/fog";
+import { ResolvedWallSegment, cellVisualWidth, footprintCellKeys, occupiedFootprintCells, resolveWallSegments as fogResolveWallSegments } from "../grid/fog";
+import { GamepadInputPoller } from "../controller/gamepadInput";
 
 const DRAG_THRESHOLD = 4;
 /** How long a "ping" ring (see `triggerPing`) expands and fades before disappearing, in ms. */
@@ -41,6 +42,10 @@ const PATH_FOLLOW_GAP_CELLS = 1;
 const COLLISION_SEARCH_LIMIT = 400;
 /** Below this on-screen cell size (in px), the grid/cell overlay auto-hides until zoomed back in. */
 const MIN_CELL_PIXELS = 12;
+/** Gamepad-driven token movement (see `GamepadInputPoller`/`handleGamepadMove`): how long a single-cell "jump" hop (`cellHops`) takes, ms — quick enough to keep up with a direction held down and auto-repeating. */
+const CELL_HOP_DURATION_MS = 180;
+/** How high (as a fraction of a cell's width) a "jump" hop arcs upward at its midpoint — see `currentHopPose`. */
+const CELL_HOP_HEIGHT_RATIO = 0.35;
 
 /** Axial neighbor offsets (orientation-agnostic — pointy vs. flat only changes pixel<->hex conversion, not adjacency). */
 const HEX_NEIGHBOR_OFFSETS: Array<{ dq: number; dr: number }> = [
@@ -112,6 +117,18 @@ interface PathAnimationState {
 	commitOnFinish: boolean;
 }
 
+/**
+ * One token's in-flight gamepad-driven "jump" hop, purely cosmetic — by the time this starts,
+ * `MapController.moveToken` has already committed the token's new `cellKey` (see `handleGamepadMove`),
+ * same "draw the tween, not yet the commit" idea as `pathAnimation`/`draggingToken`, just for a single
+ * step instead of a whole gesture. `from`/`to` are the two cells' centers in world space.
+ */
+interface CellHopState {
+	from: Point;
+	to: Point;
+	startedAt: number;
+}
+
 /** Live preview for the Ctrl-drag "distribute the selection into this area" gesture — see `MapCanvas.recomputeDistributePreview`. */
 interface DistributePreview {
 	valid: boolean;
@@ -149,6 +166,10 @@ export interface MapCanvasOptions {
 	onPing?: (x: number, y: number) => void;
 	/** Called whenever an "Animation" token-movement tween starts (see `startPathAnimation`) so a mirror can replay the same tween visually via `playPathAnimationEcho` — panning/dragging the tween itself never touches `MapController` until it finishes, so a mirror wouldn't otherwise see it move until the drop. */
 	onPathAnimation?: (routes: PathAnimationRoute[], speedWorldPerMs: number) => void;
+	/** Called whenever a gamepad-driven "jump" hop starts (`startCellHop`, from `handleGamepadMove`) so a mirror can replay it visually via `playCellHopEcho` — the hop is purely cosmetic (the actual move already committed to `MapController` by the time this fires), so a mirror wouldn't otherwise see anything but the token instantly snapping to its new cell. */
+	onCellHop?: (tokenId: string, from: Point, to: Point) => void;
+	/** Called on every poll tick the gamepad's right stick reports a "look" angle (or `null` once it returns to center — see `GamepadCallbacks.onAim`) so a mirror can replay the same live facing override via `playAimEcho` — `aimOverrides` is purely local render state, never itself a `MapController` mutation, so a mirror wouldn't otherwise see it at all until the eventual commit-on-release. */
+	onAim?: (tokenId: string, angleDeg: number | null) => void;
 }
 
 export class MapCanvas {
@@ -231,6 +252,21 @@ export class MapCanvas {
 	private pathAnimation: PathAnimationState | null = null;
 	/** Non-null while `pathAnimation`'s own render loop is actively re-rendering every frame — same pattern as `pingAnimationFrameId`. */
 	private pathAnimationFrameId: number | null = null;
+
+	/** Continuously polls connected gamepads and turns a held direction into "move one step" calls (`handleGamepadMove`) — view mode only in effect (see the check inside), but always running so a direction held while switching into view mode doesn't fire immediately. `null` for a mirror canvas (see the constructor) — a mirror never drives token movement, only reflects it. */
+	private gamepadPoller: GamepadInputPoller | null = null;
+	/** In-flight gamepad-triggered "jump" hops, keyed by token id — see `CellHopState`/`startCellHop`/`drawTokens`. */
+	private cellHops: Map<string, CellHopState> = new Map();
+	/** Non-null while any `cellHops` entry is actively re-rendering every frame — same pattern as `pingAnimationFrameId`. */
+	private cellHopFrameId: number | null = null;
+	/**
+	 * Live right-stick "look" override, keyed by token id — see `handleGamepadAim`/`drawTokens`. Purely
+	 * local render state, never touching `MapController` while the stick is actively held (unlike
+	 * `cellHops`, this isn't a tween with a natural end — committing it to real data on every poll tick
+	 * would flood the undo stack and rebuild the InfoPanel's DOM up to 60×/s); only committed via a
+	 * single ordinary `MapController.updateToken` call once the stick returns to center.
+	 */
+	private aimOverrides: Map<string, number> = new Map();
 
 	private unsubscribe: () => void;
 
@@ -1241,6 +1277,14 @@ export class MapCanvas {
 			// no interaction handlers to begin with (see the branch this sits in).
 			this.canvas.tabIndex = 0;
 			this.canvas.addEventListener("keydown", this.onKeyDown);
+
+			this.gamepadPoller = new GamepadInputPoller({
+				onMove: (gamepadIndex, angleDeg, interactHeld) => this.handleGamepadMove(gamepadIndex, angleDeg, interactHeld),
+				onInteract: (gamepadIndex) => this.handleGamepadInteract(gamepadIndex),
+				onLightStep: (gamepadIndex, delta) => this.handleGamepadLightStep(gamepadIndex, delta),
+				onAim: (gamepadIndex, angleDeg) => this.handleGamepadAim(gamepadIndex, angleDeg),
+			});
+			this.gamepadPoller.start();
 		}
 
 		this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -1402,6 +1446,8 @@ export class MapCanvas {
 		this.fog.destroy();
 		if (this.pingAnimationFrameId !== null) cancelAnimationFrame(this.pingAnimationFrameId);
 		if (this.pathAnimationFrameId !== null) cancelAnimationFrame(this.pathAnimationFrameId);
+		if (this.cellHopFrameId !== null) cancelAnimationFrame(this.cellHopFrameId);
+		this.gamepadPoller?.stop();
 		this.resizeObserver.disconnect();
 		if (!this.isMirror) {
 			this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -1464,7 +1510,7 @@ export class MapCanvas {
 		}
 	}
 
-	/** Adjacent cell keys (4-connected for square, 6-connected for hex), used by the fill tool's flood fill. */
+	/** Adjacent cell keys (4-connected for square, 6-connected for hex) — used by the fill tool's flood fill and by gamepad-driven token movement (`nearestNeighborKey`). Falls back to square adjacency for grid type "none" (same convention as `zoneAt`), though in practice `handleGamepadMove` never calls this for a "none"-grid token, which has no `cellKey` to begin with. */
 	private neighborKeys(key: string): string[] {
 		const data = this.controller.getData();
 		const { a, b } = parseCellKey(key);
@@ -1481,11 +1527,222 @@ export class MapCanvas {
 		return this.controller.getActiveLayer().cellsByGridType[gridType][cellKey]?.zoneTypeId;
 	}
 
-	/** Whether a wall segment crosses the straight line between two adjacent cells' centers — used by `fillFrom` to stop the flood at a wall, like a blocker cell used to. */
-	private edgeBlocked(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): boolean {
+	/**
+	 * Classifies whether/how a step from `fromKey` to `toKey` is stopped by a wall crossing the
+	 * straight line between the two cells' centers — every wall type blocks a plain step (see
+	 * `VisionBlockerType`'s own doc comment), so any crossing at all rules out `"clear"`:
+	 *  - `"clear"` — no wall crosses this line at all.
+	 *  - `"interact"` — blocked for a plain step, but every wall crossing this line is
+	 *    interact-crossable (`wallPassableWithInteract` — `"pass-through"`/`"pass-see-through"`),
+	 *    forcible via the gamepad's interact-to-pass action — see `handleGamepadMove`.
+	 *  - `"blocked"` — at least one crossing wall has no override at all (`"opaque"`/`"see-through"`),
+	 *    so even holding interact can't get a token through.
+	 * Used by the fill tool's flood fill (`edgeBlocked`, which treats anything but `"clear"` as
+	 * blocked — it has no interact concept) and by gamepad movement (`handleGamepadMove`, the only
+	 * caller that cares about the `"interact"` distinction).
+	 */
+	private wallCrossing(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): "clear" | "interact" | "blocked" {
 		const a = this.hit.cellCenter(fromKey);
 		const b = this.hit.cellCenter(toKey);
-		return wallSegments.some((seg) => segmentIntersection(a, b, seg.a, seg.b) !== null);
+		let interactOnly = true;
+		let sawAny = false;
+		for (const seg of wallSegments) {
+			if (segmentIntersection(a, b, seg.a, seg.b) === null) continue;
+			sawAny = true;
+			if (!wallPassableWithInteract(seg.type)) interactOnly = false;
+		}
+		if (!sawAny) return "clear";
+		return interactOnly ? "interact" : "blocked";
+	}
+
+	/** Boolean flattening of `wallCrossing` for `fillFrom`, which has no interact concept of its own — anything but `"clear"` stops the flood. */
+	private edgeBlocked(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): boolean {
+		return this.wallCrossing(fromKey, toKey, wallSegments) !== "clear";
+	}
+
+	/** Smallest angular distance between two degree angles (0..180), direction-agnostic — used by `nearestNeighborKey` to find whichever grid direction a gamepad's held angle points closest to. */
+	private static angularDistanceDeg(a: number, b: number): number {
+		const diff = Math.abs(a - b) % 360;
+		return diff > 180 ? 360 - diff : diff;
+	}
+
+	/**
+	 * Whichever of `key`'s grid neighbors (`neighborKeys`) best matches `inputAngleDeg` (same atan2/
+	 * y-down world-space convention as `GamepadInputPoller`'s own angle), plus that neighbor's own
+	 * exact direction — turns a stick/d-pad direction into one concrete cell to step onto (and the
+	 * facing to rotate the token to, see `handleGamepadMove`), on both the square grid's 4 neighbors and
+	 * either hex grid's 6 alike. `null` if `key` has no neighbors (shouldn't happen for a celled grid,
+	 * but `neighborKeys` is total).
+	 */
+	private nearestNeighborKey(key: string, inputAngleDeg: number): { key: string; angleDeg: number } | null {
+		const origin = this.hit.cellCenter(key);
+		let best: { key: string; angleDeg: number } | null = null;
+		let bestDiff = Infinity;
+		for (const candidate of this.neighborKeys(key)) {
+			const center = this.hit.cellCenter(candidate);
+			const rawAngle = (Math.atan2(center.y - origin.y, center.x - origin.x) * 180) / Math.PI;
+			const angleDeg = rawAngle < 0 ? rawAngle + 360 : rawAngle;
+			const diff = MapCanvas.angularDistanceDeg(inputAngleDeg, angleDeg);
+			if (diff < bestDiff) {
+				bestDiff = diff;
+				best = { key: candidate, angleDeg };
+			}
+		}
+		return best;
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onMove` callback (see the constructor): one gamepad just reported a held
+	 * direction (edge-triggered, possibly auto-repeating — see the poller itself) — if `gamepadIndex` is
+	 * assigned to a player token (`MapController.gamepadAssignments`), steps that token one cell in
+	 * whichever of its grid neighbors is closest to `inputAngleDeg`, rotating it to face that direction
+	 * (`token.rotation`, same commit as the move — see `MapController.moveToken`'s `rotation` param),
+	 * unless that neighbor is already occupied by something other than a "light" token (`moveToken`'s own
+	 * check) or a wall stands between the two (`wallCrossing`) — `"blocked"` always stops it, `"interact"`
+	 * only stops it while `interactHeld` is false, letting the gamepad's interact button force a step
+	 * through a `"pass-through"` wall. On success, plays the "jump" hop animation (`startCellHop`,
+	 * echoed to any player-mirror window via `MapCanvasOptions.onCellHop`) — started *before*
+	 * `MapController.moveToken` itself, see the comment at that call below for why the order matters.
+	 *
+	 * A no-op outside view mode, on a mirror canvas (`gamepadPoller` is never even created for one — see
+	 * the constructor), for an unassigned gamepad, for a token with no `cellKey` (grid type "none" —
+	 * there's no notion of "cell to cell" movement to step through there), or while that same token is
+	 * still mid an earlier hop (`cellHops`) — a new step only starts once the last one's animation has
+	 * actually finished, so held-direction auto-repeat can't outrun what's on screen.
+	 */
+	private handleGamepadMove(gamepadIndex: number, inputAngleDeg: number, interactHeld: boolean): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		if (this.cellHops.has(tokenId)) return;
+		const token = this.controller.findToken(tokenId);
+		if (!token?.cellKey) return;
+		const target = this.nearestNeighborKey(token.cellKey, inputAngleDeg);
+		if (!target) return;
+		const crossing = this.wallCrossing(token.cellKey, target.key, this.resolveWallSegments());
+		if (crossing === "blocked") return;
+		if (crossing === "interact" && !interactHeld) return;
+		const from = this.hit.cellCenter(token.cellKey);
+		const to = this.hit.cellCenter(target.key);
+		// Start the hop's render override on this canvas *and* broadcast it to any player-mirror window
+		// *before* `moveToken` — `MapController.update` calls its listeners synchronously, and that
+		// includes both this canvas's own `render()` *and* the mirror's (they share one `MapController`).
+		// If `moveToken` ran first, either canvas's next render would draw the token already at its
+		// newly-committed cell (nothing in `cellHops` yet on that canvas), then visibly snap back to
+		// `from` once its hop actually starts — a teleport-then-rewind flash. Starting (and echoing) the
+		// hop first means both canvases' `cellHops` are already populated by the time that synchronous
+		// render runs, so it draws the hop's very first frame (t≈0, i.e. still at `from`) instead.
+		this.startCellHop(tokenId, from, to);
+		this.options.onCellHop?.(tokenId, from, to);
+		if (!this.controller.moveToken(tokenId, target.key, target.angleDeg)) {
+			this.cellHops.delete(tokenId);
+			return;
+		}
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onInteract` callback (see the constructor): one gamepad's interact button
+	 * was just pressed (edge-triggered) — if `gamepadIndex` is assigned to a player token, toggles a
+	 * light: whichever "light" category token shares the player's own cell, if any (a co-located light —
+	 * see `MapController.moveToken`'s light-passthrough exception), else the player token's own light.
+	 * The "!" indicator itself isn't triggered from here at all — see `tokenCanInteract`/`drawTokens`,
+	 * which show it live off the token's actual position, independent of whether this button has ever
+	 * been pressed. A no-op outside view mode, on a mirror canvas, or for an unassigned gamepad — same
+	 * gating as `handleGamepadMove`.
+	 */
+	private handleGamepadInteract(gamepadIndex: number): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const data = this.controller.getData();
+		const lightHere = token.cellKey ? data.tokens.find((t) => t.id !== token.id && t.cellKey === token.cellKey && (t.category ?? "entity") === "light") : undefined;
+		const targetId = lightHere?.id ?? token.id;
+		this.controller.updateToken(targetId, (t) => (t.lightEnabled = !(t.lightEnabled ?? true)));
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onLightStep` callback (see the constructor): L1/R1 was just pressed
+	 * (edge-triggered) — if `gamepadIndex` is assigned to a player token, steps `token.lightRadiusReduction`
+	 * by `-delta` (L1's `delta` of `-1` *increases* the reduction, i.e. dims; R1's `1` decreases it, i.e.
+	 * brightens), clamped so the effective radius (`resolveLightRadius`) stays within
+	 * `[0, configuredLightRadius(token)]` — the InfoPanel menu's own authored value is the ceiling this
+	 * can brighten back up to, never exceeded, and never itself touched by the gamepad. A no-op outside
+	 * view mode, on a mirror canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
+	 */
+	private handleGamepadLightStep(gamepadIndex: number, delta: -1 | 1): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const max = configuredLightRadius(token);
+		const currentReduction = Math.max(0, token.lightRadiusReduction ?? 0);
+		const nextReduction = clamp(currentReduction - delta, 0, max);
+		this.controller.updateToken(tokenId, (t) => (t.lightRadiusReduction = nextReduction));
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onAim` callback (see the constructor): the right stick's current "look"
+	 * angle for `gamepadIndex`, reported every poll tick (continuous, not edge-triggered — see
+	 * `GamepadCallbacks.onAim`'s own doc comment) — if assigned to a player token, either updates that
+	 * token's live `aimOverrides` entry and re-renders (`angleDeg` non-`null`, the stick is actively
+	 * held somewhere), or — the tick it first reports `null` (the stick just returned to center) — drops
+	 * the override and commits its last angle to the real `token.rotation` via one ordinary
+	 * `MapController.updateToken` call, the same one-undo-step/one-save write any other facing change
+	 * gets. Broadcasts every tick to `MapCanvasOptions.onAim` so a player-mirror window's own
+	 * `aimOverrides` stays in lockstep — see `playAimEcho`. A no-op outside view mode, on a mirror
+	 * canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
+	 */
+	private handleGamepadAim(gamepadIndex: number, angleDeg: number | null): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		if (angleDeg === null) {
+			const committed = this.aimOverrides.get(tokenId);
+			if (committed === undefined) return;
+			this.aimOverrides.delete(tokenId);
+			this.options.onAim?.(tokenId, null);
+			this.controller.updateToken(tokenId, (t) => (t.rotation = committed));
+			return;
+		}
+		this.aimOverrides.set(tokenId, angleDeg);
+		this.options.onAim?.(tokenId, angleDeg);
+		this.render();
+	}
+
+	/**
+	 * Replays a live right-stick "look" tick on a player-mirror window — see `MapCanvasOptions.onAim`/
+	 * `handleGamepadAim`. `angleDeg` of `null` drops the mirror's own override (the stick returned to
+	 * center on the source canvas — the eventual `rotation` commit itself reaches the mirror normally,
+	 * through the shared `MapController`, no echo needed for that part).
+	 */
+	playAimEcho(tokenId: string, angleDeg: number | null): void {
+		if (angleDeg === null) {
+			this.aimOverrides.delete(tokenId);
+		} else {
+			this.aimOverrides.set(tokenId, angleDeg);
+		}
+		this.render();
+	}
+
+	/**
+	 * Whether `token` currently has something to interact with via the gamepad's interact button — a
+	 * "light" category token sharing its cell, or a `"pass-through"` wall standing between it and one of
+	 * its grid neighbors (`wallCrossing` returning `"interact"` — see `handleGamepadMove`). Drives the
+	 * live "!" indicator (`drawTokens`/`drawInteractIndicator`): recomputed fresh from the token's actual
+	 * current position on every render rather than triggered for a fixed duration by the button itself,
+	 * so it appears/disappears immediately as the token moves, in perfect sync on a player-mirror window
+	 * too (no separate echo needed — both canvases already share the same `MapController` data this
+	 * reads). `false` for a token with no `cellKey` (grid type "none").
+	 */
+	private tokenCanInteract(token: Token, wallSegments: ResolvedWallSegment[]): boolean {
+		const cellKey = token.cellKey;
+		if (!cellKey) return false;
+		const data = this.controller.getData();
+		if (data.tokens.some((t) => t.id !== token.id && t.cellKey === cellKey && (t.category ?? "entity") === "light")) return true;
+		return this.neighborKeys(cellKey).some((neighborKey) => this.wallCrossing(cellKey, neighborKey, wallSegments) === "interact");
 	}
 
 	/**
@@ -1959,11 +2216,16 @@ export class MapCanvas {
 			if (this.draggingToken?.token.id === token.id) continue;
 			if (groupIds?.has(token.id)) continue;
 			if (animatingIds?.has(token.id)) continue;
+			if (this.cellHops.has(token.id)) continue;
 			if (this.fog.isLightTokenHidden(token)) continue;
 			const isPlayer = (token.category ?? "entity") === "player";
 			const center = this.hit.footprintCenter(token);
 			if (fogActive && !isPlayer && !this.fog.isEntityRevealed(center)) continue;
-			this.drawToken(ctx, center.x, center.y, token, token.id === this.controller.selectedTokenId);
+			// Live right-stick "look" override (`handleGamepadAim`) — a token being actively aimed with
+			// the gamepad draws facing that live angle instead of its own still-uncommitted `rotation`.
+			const aimAngle = this.aimOverrides.get(token.id);
+			const drawnToken = aimAngle !== undefined ? { ...token, rotation: aimAngle } : token;
+			this.drawToken(ctx, center.x, center.y, drawnToken, token.id === this.controller.selectedTokenId);
 		}
 		if (this.draggingToken) {
 			const { token, currentWorld } = this.draggingToken;
@@ -1989,6 +2251,30 @@ export class MapCanvas {
 				this.drawToken(ctx, pose.center.x, pose.center.y, { ...token, rotation: pose.direction }, true);
 			}
 		}
+		// Gamepad-driven "jump" hop: same "override the render, data's already committed" precedent as
+		// `pathAnimation` above, including ignoring fog — see its own comment.
+		if (this.cellHops.size > 0) {
+			for (const tokenId of this.cellHops.keys()) {
+				const token = data.tokens.find((t) => t.id === tokenId);
+				const pose = this.currentHopPose(tokenId);
+				if (!token || !pose) continue;
+				this.drawToken(ctx, pose.x, pose.y, token, token.id === this.controller.selectedTokenId);
+			}
+		}
+		// Gamepad interact button's "!" indicator — live (`tokenCanInteract`), not tied to the button
+		// ever having been pressed: shown above any gamepad-assigned token for as long as it actually
+		// has something to interact with right now, view mode only (the only mode the button does
+		// anything in — see `handleGamepadMove`/`handleGamepadInteract`), drawn above whatever position
+		// the token is actually at (mid-hop or not, see `currentHopPose`'s footprint-center fallback).
+		if (this.effectiveMode() === "view" && this.controller.gamepadAssignments.size > 0) {
+			const wallSegments = this.resolveWallSegments();
+			for (const tokenId of this.controller.gamepadAssignments.values()) {
+				const token = data.tokens.find((t) => t.id === tokenId);
+				if (!token || !this.tokenCanInteract(token, wallSegments)) continue;
+				const pose = this.currentHopPose(tokenId) ?? this.hit.footprintCenter(token);
+				this.drawInteractIndicator(ctx, pose.x, pose.y, token);
+			}
+		}
 	}
 
 	/**
@@ -2008,6 +2294,80 @@ export class MapCanvas {
 		const token = this.controller.findToken(tokenId);
 		const direction = directionAtArcLength(route.points, route.cumulative, arc) ?? token?.rotation ?? 0;
 		return { center, direction };
+	}
+
+	/** Starts (or restarts, if a fast gamepad repeat lands mid-hop) `tokenId`'s "jump" bounce from `from` to `to` (both world points, its old and new cell centers) — see `CellHopState`/`drawTokens`/`currentHopPose`. Called by `handleGamepadMove` right before `MapController.moveToken` commits the actual cell change. */
+	private startCellHop(tokenId: string, from: Point, to: Point): void {
+		this.cellHops.set(tokenId, { from, to, startedAt: performance.now() });
+		this.runCellHopLoop();
+	}
+
+	/** Same self-contained start/stop `requestAnimationFrame` pattern as `triggerPing`/`runPathAnimationLoop`: re-renders every frame while any hop is in flight, dropping each one once its own `CELL_HOP_DURATION_MS` has elapsed. */
+	private runCellHopLoop(): void {
+		if (this.cellHopFrameId !== null) return;
+		const tick = () => {
+			const now = performance.now();
+			for (const [id, hop] of this.cellHops) {
+				if (now - hop.startedAt >= CELL_HOP_DURATION_MS) this.cellHops.delete(id);
+			}
+			this.render();
+			if (this.cellHops.size === 0) {
+				this.cellHopFrameId = null;
+				return;
+			}
+			this.cellHopFrameId = requestAnimationFrame(tick);
+		};
+		this.cellHopFrameId = requestAnimationFrame(tick);
+	}
+
+	/**
+	 * `tokenId`'s current interpolated position if it's mid a gamepad-triggered "jump" hop (`cellHops`),
+	 * else `null` — a straight lerp from `from` to `to` with a sine-eased upward arc
+	 * (`CELL_HOP_HEIGHT_RATIO` of a cell's width at the midpoint) so it reads as a little hop rather
+	 * than a slide.
+	 */
+	private currentHopPose(tokenId: string): Point | null {
+		const hop = this.cellHops.get(tokenId);
+		if (!hop) return null;
+		const t = clamp((performance.now() - hop.startedAt) / CELL_HOP_DURATION_MS, 0, 1);
+		const height = cellVisualWidth(this.controller.getData()) * CELL_HOP_HEIGHT_RATIO;
+		return {
+			x: hop.from.x + (hop.to.x - hop.from.x) * t,
+			y: hop.from.y + (hop.to.y - hop.from.y) * t - Math.sin(t * Math.PI) * height,
+		};
+	}
+
+	/**
+	 * Replays a gamepad-driven "jump" hop on a player-mirror window — see `MapCanvasOptions.onCellHop`/
+	 * `handleGamepadMove`. No owner-vs-mirror distinction to make here (unlike `playPathAnimationEcho`):
+	 * a hop never itself commits anything to `MapController` (that already happened, before this even
+	 * fires — see `handleGamepadMove`), it's purely a visual tween, so both the owner canvas and any
+	 * mirror just run the exact same `startCellHop`.
+	 */
+	playCellHopEcho(tokenId: string, from: Point, to: Point): void {
+		this.startCellHop(tokenId, from, to);
+	}
+
+	/**
+	 * The "!" indicator drawn above a gamepad-assigned token for as long as `tokenCanInteract` says it
+	 * has something to interact with right now — always drawn regardless of fog, same "a GM/player sees
+	 * their own token's status" reasoning as `draggingToken`/`pathAnimation`. Needs no player-mirror echo
+	 * of its own (unlike `playCellHopEcho`): it's derived live from the same `MapController` data both
+	 * canvases already share, so a mirror's own `drawTokens` call just recomputes the same answer.
+	 */
+	private drawInteractIndicator(ctx: CanvasRenderingContext2D, cx: number, cy: number, token: Token): void {
+		const r = this.hit.tokenRadius(token);
+		ctx.save();
+		ctx.textAlign = "center";
+		ctx.textBaseline = "bottom";
+		ctx.font = `bold ${Math.max(14, r * 1.1)}px sans-serif`;
+		ctx.lineWidth = Math.max(1.5, 3 / this.transform.zoom);
+		ctx.strokeStyle = "#000000";
+		ctx.fillStyle = "#f1c40f";
+		const y = cy - r * 1.3;
+		ctx.strokeText("!", cx, y);
+		ctx.fillText("!", cx, y);
+		ctx.restore();
 	}
 
 	/** Fixed glyph/color for every "light" category token's own marker — see `drawLightToken`. */

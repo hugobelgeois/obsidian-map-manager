@@ -2,6 +2,7 @@ import { Notice, TextFileView, WorkspaceLeaf } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapData, serializeMapData } from "../data/mapData";
+import { Point } from "../grid/gridMath";
 import { extractLayerToNewMap } from "../platform/extractLayerToNewMap";
 import { registerMirrorSource } from "../platform/mirrorRegistry";
 import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
@@ -29,6 +30,10 @@ export class MapView extends TextFileView {
 	private pingListeners: Set<(x: number, y: number) => void> = new Set();
 	/** Player mirror windows subscribed to this view's "Animation" token-movement tweens via `registerMirrorSource`'s `onPathAnimationStart`. */
 	private pathAnimationListeners: Set<(routes: PathAnimationRoute[], speedWorldPerMs: number) => void> = new Set();
+	/** Player mirror windows subscribed to this view's gamepad-driven "jump" hops via `registerMirrorSource`'s `onCellHop`. */
+	private cellHopListeners: Set<(tokenId: string, from: Point, to: Point) => void> = new Set();
+	/** Player mirror windows subscribed to this view's live gamepad right-stick "look" ticks via `registerMirrorSource`'s `onAim`. */
+	private aimListeners: Set<(tokenId: string, angleDeg: number | null) => void> = new Set();
 	private rootEl: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
@@ -115,6 +120,12 @@ export class MapView extends TextFileView {
 			onPathAnimation: (routes, speedWorldPerMs) => {
 				for (const cb of this.pathAnimationListeners) cb(routes, speedWorldPerMs);
 			},
+			onCellHop: (tokenId, from, to) => {
+				for (const cb of this.cellHopListeners) cb(tokenId, from, to);
+			},
+			onAim: (tokenId, angleDeg) => {
+				for (const cb of this.aimListeners) cb(tokenId, angleDeg);
+			},
 		});
 		if (this.file) {
 			this.unregisterMirror = registerMirrorSource(this.file.path, {
@@ -135,6 +146,14 @@ export class MapView extends TextFileView {
 				onPathAnimationStart: (cb) => {
 					this.pathAnimationListeners.add(cb);
 					return () => this.pathAnimationListeners.delete(cb);
+				},
+				onCellHop: (cb) => {
+					this.cellHopListeners.add(cb);
+					return () => this.cellHopListeners.delete(cb);
+				},
+				onAim: (cb) => {
+					this.aimListeners.add(cb);
+					return () => this.aimListeners.delete(cb);
 				},
 			});
 		}

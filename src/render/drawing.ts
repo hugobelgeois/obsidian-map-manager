@@ -5,7 +5,7 @@ export const MIN_LABEL_PIXELS = 9;
 
 /** Fog opacity for ground that has never been in a player's vision. */
 export const FOG_OPACITY_UNEXPLORED = 1;
-/** Fog opacity for ground that has been seen before, isn't currently lit, or sits beyond a "dim" blocker. */
+/** Fog opacity for ground that has been seen before but isn't currently lit. */
 export const FOG_OPACITY_EXPLORED = 0.55;
 
 /** Mixes a #rrggbb color toward white by `ratio` (0 = unchanged, 1 = white). Used for the selected-token border. */

@@ -1,4 +1,5 @@
 import { MapController } from "../controller/MapController";
+import { Point } from "../grid/gridMath";
 import { PathAnimationRoute } from "../render/MapCanvas";
 
 /**
@@ -20,6 +21,10 @@ export interface MirrorSource {
 	onPing: (cb: (x: number, y: number) => void) => () => void;
 	/** Subscribes to the source canvas's "Animation" token-movement tweens (see `MapCanvasOptions.onPathAnimation`) so a mirror can replay them visually via its own `MapCanvas.playPathAnimationEcho`; returns an unsubscribe function. */
 	onPathAnimationStart: (cb: (routes: PathAnimationRoute[], speedWorldPerMs: number) => void) => () => void;
+	/** Subscribes to the source canvas's gamepad-driven "jump" hops (see `MapCanvasOptions.onCellHop`) so a mirror can replay them visually via its own `MapCanvas.playCellHopEcho`; returns an unsubscribe function. */
+	onCellHop: (cb: (tokenId: string, from: Point, to: Point) => void) => () => void;
+	/** Subscribes to the source canvas's live gamepad right-stick "look" ticks (see `MapCanvasOptions.onAim`) so a mirror can replay the same live facing override via its own `MapCanvas.playAimEcho`; returns an unsubscribe function. */
+	onAim: (cb: (tokenId: string, angleDeg: number | null) => void) => () => void;
 }
 
 const sources = new Map<string, MirrorSource>();

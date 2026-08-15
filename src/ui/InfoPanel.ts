@@ -1,4 +1,5 @@
 import { App, Component, MarkdownRenderer, Notice, TFile, resolveSubpath, setIcon, setTooltip } from "obsidian";
+import { GamepadInfo, listConnectedGamepads } from "../controller/gamepadInput";
 import { MapController } from "../controller/MapController";
 import {
 	CellData,
@@ -14,7 +15,6 @@ import {
 	TokenCategory,
 	TokenTab,
 	TokenTemplate,
-	VisionBlockerType,
 	findStatsTab,
 	generateLocalId,
 	getTokenTabs,
@@ -29,6 +29,7 @@ import { resizeImageToSquare } from "../platform/resizeImage";
 import { MapManagerSettings, PLAYER_TEMPLATE_ID } from "../settings/types";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
 import { HeadingSuggestModal } from "./HeadingSuggestModal";
+import { WALL_BLOCKER_TYPE_OPTIONS, isWallBlockerTypeValue } from "./wallBlockerTypeOptions";
 
 export interface InfoPanelDeps {
 	assetsFolder: string;
@@ -103,15 +104,29 @@ export class InfoPanel {
 			if (this.suppressRerender) return;
 			this.render();
 		});
+		// The list of connected gamepads (`renderGamepadField`) isn't `MapController` state — a browser/
+		// OS-level connection event, not a map mutation — so it needs its own listener to refresh the
+		// dropdown the moment a controller is plugged in/unplugged rather than waiting for some unrelated
+		// map change to trigger the next `render()`. Not attached for a player-mirror panel (`forPlayers`),
+		// which never shows this field to begin with (GM-only tooling, see `InfoPanelDeps.forPlayers`).
+		if (!this.deps.forPlayers) window.addEventListener("gamepadconnected", this.onGamepadChange);
+		if (!this.deps.forPlayers) window.addEventListener("gamepaddisconnected", this.onGamepadChange);
 	}
 
 	destroy(): void {
 		this.unsubscribe();
 		this.el.removeEventListener("scroll", this.onScroll);
+		window.removeEventListener("gamepadconnected", this.onGamepadChange);
+		window.removeEventListener("gamepaddisconnected", this.onGamepadChange);
 		this.clearRenderComponents();
 		this.resizeHandleEl.remove();
 		this.el.remove();
 	}
+
+	private onGamepadChange = (): void => {
+		if (this.suppressRerender) return;
+		this.render();
+	};
 
 	private onScroll = (): void => {
 		this.deps.onScroll?.(this.el.scrollTop);
@@ -533,18 +548,17 @@ export class InfoPanel {
 	/** Bulk blocker-type editor for mass-selected wall *segments* — unlike the single-point editor, this never touches a whole connected shape, only exactly the segments in the selection. */
 	private renderMassWallSegmentPanel(): void {
 		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
-		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		blockerField.createEl("label", { text: "Type de mur" });
 		const blockerSelect = blockerField.createEl("select");
 		const keepOpt = blockerSelect.createEl("option", { text: "— ne pas changer —" });
 		keepOpt.value = "";
-		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-		opaqueOpt.value = "opaque";
-		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-		dimOpt.value = "dim";
+		for (const opt of WALL_BLOCKER_TYPE_OPTIONS) {
+			const optEl = blockerSelect.createEl("option", { text: opt.label });
+			optEl.value = opt.value;
+		}
 		blockerSelect.value = "";
 		blockerSelect.onchange = () => {
-			const value = blockerSelect.value;
-			if (value === "opaque" || value === "dim") this.controller.massSetWallSegmentsBlockerType(value);
+			if (isWallBlockerTypeValue(blockerSelect.value)) this.controller.massSetWallSegmentsBlockerType(blockerSelect.value);
 		};
 
 		const count = this.controller.massSelectedWallSegmentIds.size;
@@ -740,18 +754,20 @@ export class InfoPanel {
 		const segments = this.controller.getSegmentsForPoint(pointId);
 
 		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
-		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		blockerField.createEl("label", { text: "Type de mur" });
 		const blockerSelect = blockerField.createEl("select");
-		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-		opaqueOpt.value = "opaque";
-		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-		dimOpt.value = "dim";
+		for (const opt of WALL_BLOCKER_TYPE_OPTIONS) {
+			const optEl = blockerSelect.createEl("option", { text: opt.label });
+			optEl.value = opt.value;
+		}
 		// Segments connected to this point may not all share the same type; leave the control on its
 		// first option in that case rather than misrepresenting a single value.
 		const firstType = segments[0]?.blockerType;
 		const allSame = segments.every((s) => s.blockerType === firstType);
 		if (allSame && firstType) blockerSelect.value = firstType;
-		blockerSelect.onchange = () => this.controller.setWallPointBlockerType(pointId, blockerSelect.value as VisionBlockerType);
+		blockerSelect.onchange = () => {
+			if (isWallBlockerTypeValue(blockerSelect.value)) this.controller.setWallPointBlockerType(pointId, blockerSelect.value);
+		};
 		if (segments.length === 0) {
 			blockerField.createDiv({ cls: "map-manager-infopanel-empty", text: "Ce point n'est relié à aucune ligne." });
 		}
@@ -764,14 +780,16 @@ export class InfoPanel {
 	/** Unlike `renderWallPointPanel` (whole connected shape), edits exactly one segment — e.g. a single door-sized gap in an otherwise opaque wall. Reached by clicking directly on a wall's line rather than one of its endpoint handles. */
 	private renderWallSegmentPanel(segment: WallSegment): void {
 		const blockerField = this.el.createDiv({ cls: "map-manager-field" });
-		blockerField.createEl("label", { text: "Bloc visuel (brouillard de guerre)" });
+		blockerField.createEl("label", { text: "Type de mur" });
 		const blockerSelect = blockerField.createEl("select");
-		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-		opaqueOpt.value = "opaque";
-		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-		dimOpt.value = "dim";
+		for (const opt of WALL_BLOCKER_TYPE_OPTIONS) {
+			const optEl = blockerSelect.createEl("option", { text: opt.label });
+			optEl.value = opt.value;
+		}
 		blockerSelect.value = segment.blockerType;
-		blockerSelect.onchange = () => this.controller.setWallSegmentBlockerType(segment.id, blockerSelect.value as VisionBlockerType);
+		blockerSelect.onchange = () => {
+			if (isWallBlockerTypeValue(blockerSelect.value)) this.controller.setWallSegmentBlockerType(segment.id, blockerSelect.value);
+		};
 
 		const hint = this.el.createDiv({ cls: "map-manager-infopanel-empty" });
 		hint.setText("Double-cliquez sur ce segment pour y ajouter un point et modifier sa forme.");
@@ -904,13 +922,14 @@ export class InfoPanel {
 	 * View mode ("Vue", still GM-facing) only shows what's needed mid-session: a static logo+name
 	 * header (`renderTokenLogoAndName`), rotation (entity-only — its own GM-only vision zone points
 	 * wherever this faces, drawn continuously here instead of only-while-selected like edit mode; a
-	 * player's fog reveal is their light, omnidirectional, with no facing to show), light
-	 * (`renderLightRadiusField`, any category — a torch is exactly the kind of thing a GM plausibly
-	 * wants to flip mid-session, unlike the rest of a token's setup), and tabs' read-only content
-	 * (stats/inventory/story/... — see `renderTokenTabsReadOnly`, which applies to both categories).
-	 * Everything else (icon/image/category/size/color/template picker/vision shape/delete) is
-	 * edit-only. A "light" token has neither a facing nor tabs to begin with (see `TokenCategory`'s
-	 * own doc comment), so it gets neither — just its light field and a short note.
+	 * player's fog reveal is their light, omnidirectional, with no facing to show), a gamepad picker
+	 * (player-only — `renderGamepadField`, see its own doc comment), light (`renderLightRadiusField`,
+	 * any category — a torch is exactly the kind of thing a GM plausibly wants to flip mid-session,
+	 * unlike the rest of a token's setup), and tabs' read-only content (stats/inventory/story/... — see
+	 * `renderTokenTabsReadOnly`, which applies to both categories). Everything else (icon/image/
+	 * category/size/color/template picker/vision shape/delete) is edit-only. A "light" token has
+	 * neither a facing, a gamepad, nor tabs to begin with (see `TokenCategory`'s own doc comment), so
+	 * it gets none of those — just its light field and a short note.
 	 */
 	private renderTokenViewPanel(token: Token): void {
 		const category = token.category ?? "entity";
@@ -921,8 +940,52 @@ export class InfoPanel {
 		}
 		this.renderTokenLogoAndName(token);
 		if (category === "entity") this.renderRotationField(token);
+		if (category === "player") this.renderGamepadField(token);
 		this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 		this.renderTokenTabsReadOnly(token);
+	}
+
+	/**
+	 * Assigns/unassigns a connected gamepad to drive `token` (a player token, cell-by-cell, blocked by
+	 * walls — see `MapCanvas`'s `GamepadInputPoller`/`handleGamepadMove`). Vue mode only (see
+	 * `renderTokenViewPanel`): gamepad-driven movement itself only runs in view mode, so offering the
+	 * picker in edit mode would just be confusing (assign, then nothing happens until switching to
+	 * "Vue"). `listConnectedGamepads` is re-read on every render — kept fresh live by the constructor's
+	 * `gamepadconnected`/`gamepaddisconnected` listeners on top of the usual `MapController` change
+	 * feed. `MapController.assignGamepad` itself enforces one gamepad per token (and vice versa), so
+	 * picking a gamepad already assigned elsewhere here silently steals it from whichever token had it.
+	 */
+	private renderGamepadField(token: Token): void {
+		const wrap = this.el.createDiv({ cls: "map-manager-field" });
+		wrap.createEl("label", { text: "Manette" });
+		const select = wrap.createEl("select");
+		const noneOpt = select.createEl("option", { text: "— aucune —" });
+		noneOpt.value = "";
+
+		const pads: GamepadInfo[] = listConnectedGamepads();
+		const assignedIndex = this.controller.gamepadForToken(token.id);
+		// A gamepad the browser hasn't reported input from yet this page load simply isn't in
+		// `listConnectedGamepads` (see its own doc comment) — keep an already-assigned one in the list
+		// regardless, so the assignment doesn't visually vanish just because nobody's touched it since.
+		if (assignedIndex !== null && !pads.some((p) => p.index === assignedIndex)) {
+			pads.push({ index: assignedIndex, id: `Manette ${assignedIndex + 1}` });
+		}
+		for (const pad of pads) {
+			const opt = select.createEl("option", { text: pad.id });
+			opt.value = String(pad.index);
+		}
+		select.value = assignedIndex !== null ? String(assignedIndex) : "";
+		select.onchange = () => {
+			if (select.value === "") {
+				if (assignedIndex !== null) this.controller.unassignGamepad(assignedIndex);
+			} else {
+				this.controller.assignGamepad(Number(select.value), token.id);
+			}
+		};
+
+		if (pads.length === 0) {
+			wrap.createDiv({ cls: "map-manager-view-empty", text: "Aucune manette détectée — appuyez sur un bouton de la manette pour la connecter." });
+		}
 	}
 
 	/** Static (non-editable) logo + name header for a token, Vue MJ only — the editable equivalent lives in `renderTokenPanel`'s own "Logo"/"Nom" fields. */

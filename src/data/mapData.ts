@@ -16,11 +16,66 @@ export interface ZoneType {
 }
 
 /**
- * Blocks line of sight for fog-of-war vision cones/radii (a wall, a door, ...), on a `WallSegment`.
- * "opaque" hides everything beyond it entirely; "dim" still stops direct/clear vision but lets
- * cells beyond be marked "explored" (dimly visible), like a window or a searched-but-unlit room.
+ * A `WallSegment`'s behavior along two independent axes — whether it blocks line of sight
+ * (fog-of-war vision cones/radii, `wallBlocksVision`) and whether a token can ever force its way
+ * through it at all via the gamepad's interact-to-pass action (`wallPassableWithInteract` — gamepad-
+ * driven movement only, see `MapCanvas`'s `wallCrossing`/`handleGamepadMove`; mouse-dragged moves are
+ * never gated by walls at all). Every wall type blocks a token's *plain* directional step outright —
+ * there's no "freely walkable" wall type; a wall is drawn precisely because something should stop a
+ * token there by default, interact button or not.
+ *
+ * - `"opaque"`: blocks vision, and can never be crossed by any means — a normal solid wall.
+ * - `"see-through"`: doesn't block vision, but can never be crossed either — glass, a window, a low
+ *   fence you can see over but not climb.
+ * - `"pass-through"`: blocks vision, but interact-crossable — a curtain, a secret door.
+ * - `"pass-see-through"`: doesn't block vision, and is also interact-crossable — an open threshold you
+ *   can already see through, but still have to deliberately step through rather than wander across.
+ *
+ * Renamed/expanded from the pre-v15 `"opaque" | "dim"` pair — see `normalizeMapData`'s migration
+ * (old `"dim"` walls, which only ever affected vision, become `"see-through"`).
  */
-export type VisionBlockerType = "opaque" | "dim";
+export type VisionBlockerType = "opaque" | "see-through" | "pass-through" | "pass-see-through";
+
+/** Whether a `type` wall blocks line of sight — `"opaque"`/`"pass-through"` (see `VisionBlockerType`). */
+export function wallBlocksVision(type: VisionBlockerType): boolean {
+	return type === "opaque" || type === "pass-through";
+}
+
+/**
+ * Whether a `type` wall is crossable at all via the gamepad's interact-to-pass action —
+ * `"pass-through"`/`"pass-see-through"`. Every wall type blocks a token's plain directional step (see
+ * `VisionBlockerType`'s own doc comment); this is the *only* override that exists, and even then only
+ * while the interact button is held alongside the direction — see `MapCanvas.wallCrossing`/
+ * `handleGamepadMove`. `"opaque"`/`"see-through"` have no override at all, ever.
+ */
+export function wallPassableWithInteract(type: VisionBlockerType): boolean {
+	return type === "pass-through" || type === "pass-see-through";
+}
+
+/**
+ * Total order over `VisionBlockerType`, most-blocking first — used to resolve two overlapping
+ * collinear wall segments of different types onto a single winning type for their shared stretch (see
+ * `wallOptimize.ts`'s `addWallSegment`/`optimizeWallNetwork`, and `moreRestrictiveWallType` below).
+ * Every type already blocks a plain step outright (see `VisionBlockerType`'s own doc comment), so
+ * what actually varies — in order of how much it matters here — is whether *anything* can ever get a
+ * token through at all (`wallPassableWithInteract`, weighted heaviest: never-crossable trumps
+ * everything else) and, only as a tiebreak within that, whether it blocks vision
+ * (`wallBlocksVision`). `"opaque"` (never crossable, blocks vision) is thus the most restrictive,
+ * `"pass-see-through"` (interact-crossable, doesn't block vision) the least, with `"see-through"`
+ * (never crossable, open vision) still ranking above `"pass-through"` (interact-crossable, blocks
+ * vision) — getting past a wall at all matters more here than merely seeing past it.
+ */
+const WALL_BLOCKER_RESTRICTIVENESS: Record<VisionBlockerType, number> = {
+	opaque: 3,
+	"see-through": 2,
+	"pass-through": 1,
+	"pass-see-through": 0,
+};
+
+/** Whichever of `a`/`b` is more restrictive per `WALL_BLOCKER_RESTRICTIVENESS` — ties (there are none among the 4 values) would keep `a`. */
+export function moreRestrictiveWallType(a: VisionBlockerType, b: VisionBlockerType): VisionBlockerType {
+	return WALL_BLOCKER_RESTRICTIVENESS[a] >= WALL_BLOCKER_RESTRICTIVENESS[b] ? a : b;
+}
 
 export interface CellData {
 	zoneTypeId?: string;
@@ -182,8 +237,9 @@ export interface Token {
 	visionRadius?: number;
 	/**
 	 * Radius (in cells), any category, within which this token's own "light" reveals every entity
-	 * token inside it, even when none of them sit inside any player's vision cone — wall-aware
-	 * (opaque or "dim" alike; see `castLightRays` in `fog.ts`; see `FogRenderer.isEntityRevealed`).
+	 * token inside it, even when none of them sit inside any player's vision cone — wall-aware, blocked
+	 * by any vision-blocking wall (`wallBlocksVision`; see `castLightRays` in `fog.ts`; see
+	 * `FogRenderer.isEntityRevealed`).
 	 * Also visually hides the fog overlay whether or not a player can actually see that far
 	 * (`drawFog`'s `frameLightCache` punch), but deliberately never feeds `exploredCells`: the area
 	 * goes dark again the moment the light source moves away or is removed, unlike real vision.
@@ -200,6 +256,16 @@ export interface Token {
 	 * into the effective reach everything else reads.
 	 */
 	lightEnabled?: boolean;
+	/**
+	 * How many cells the gamepad's L1/R1 buttons ("dim"/"brighten" — see `MapCanvas.handleGamepadLightStep`)
+	 * have currently reduced this token's light below its own `lightRadius` (the InfoPanel menu's
+	 * authored *maximum*, never itself touched by the gamepad). L1 increments this, R1 decrements it,
+	 * both clamped so the effective radius (`resolveLightRadius`) never goes below `0` or back above
+	 * that configured maximum. `0`/unset (the default) means at full configured brightness. Deliberately
+	 * separate from `lightRadius` itself for the same reason `lightEnabled` is: a live, in-session
+	 * adjustment shouldn't overwrite what the GM actually authored for this token.
+	 */
+	lightRadiusReduction?: number;
 	/**
 	 * Legacy: used to link a player token's effective light radius to its own `visionRadius`. No
 	 * longer read anywhere — `lightRadius` is now the single, direct source of a player's light
@@ -303,12 +369,15 @@ export function configuredLightRadius(token: Token): number {
 
 /**
  * The light radius actually in effect for `token` right now (cells) — `configuredLightRadius`,
- * gated by `lightEnabled`. Every reader of a token's *actual* light (`castLightRays`, `MapCanvas`'s
- * `frameLightCache`/`drawTokenLightZones`) calls this instead of reading `lightRadius` directly.
+ * gated by `lightEnabled` and reduced by `lightRadiusReduction` (the gamepad's L1/R1 live dim/
+ * brighten — see its own doc comment), clamped to never go negative. Every reader of a token's
+ * *actual* light (`castLightRays`, `MapCanvas`'s `frameLightCache`/`drawTokenLightZones`) calls this
+ * instead of reading `lightRadius` directly.
  */
 export function resolveLightRadius(token: Token): number {
 	if (token.lightEnabled === false) return 0;
-	return configuredLightRadius(token);
+	const reduction = Math.max(0, token.lightRadiusReduction ?? 0);
+	return Math.max(0, configuredLightRadius(token) - reduction);
 }
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
@@ -352,7 +421,7 @@ export interface Layer {
 }
 
 export interface MapFileData {
-	version: 14;
+	version: 15;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -427,7 +496,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 14,
+		version: 15,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
@@ -477,7 +546,7 @@ function parseCellsByGridType(raw: unknown): CellsByGridType {
 }
 
 function isVisionBlockerType(value: unknown): value is VisionBlockerType {
-	return value === "opaque" || value === "dim";
+	return value === "opaque" || value === "see-through" || value === "pass-through" || value === "pass-see-through";
 }
 
 function parseWallPoint(value: unknown): WallPoint | null {
@@ -490,9 +559,25 @@ function parseWallPointArray(raw: unknown): WallPoint[] {
 	return raw.map(parseWallPoint).filter((p): p is WallPoint => p !== null);
 }
 
+/**
+ * Resolves a raw `blockerType` value to today's 4-value `VisionBlockerType`, or `null` if it's neither
+ * that nor a recognized legacy value (a genuinely corrupted segment — `parseWallSegment` drops it, same
+ * as before this existed). Pre-v15 files stored `"dim"` instead — a "dim" wall only ever affected
+ * vision (movement-blocking is new in v15, every pre-v15 wall implicitly blocked it), so it folds onto
+ * `"see-through"` (blocks movement, not vision) as the closest of the new types to "less blocking than
+ * opaque".
+ */
+function parseBlockerType(value: unknown): VisionBlockerType | null {
+	if (isVisionBlockerType(value)) return value;
+	if (value === "dim") return "see-through";
+	return null;
+}
+
 function parseWallSegment(value: unknown): WallSegment | null {
-	if (!isRecord(value) || !isString(value.id) || !isString(value.aId) || !isString(value.bId) || !isVisionBlockerType(value.blockerType)) return null;
-	return { id: value.id, aId: value.aId, bId: value.bId, blockerType: value.blockerType };
+	if (!isRecord(value) || !isString(value.id) || !isString(value.aId) || !isString(value.bId)) return null;
+	const blockerType = parseBlockerType(value.blockerType);
+	if (blockerType === null) return null;
+	return { id: value.id, aId: value.aId, bId: value.bId, blockerType };
 }
 
 /** Drops segments referencing a point that doesn't exist among `points` (e.g. hand-edited/corrupted files). */
@@ -540,6 +625,7 @@ export function parseToken(value: unknown): Token | null {
 		visionRadius: typeof value.visionRadius === "number" && value.visionRadius >= 0 ? value.visionRadius : undefined,
 		lightRadius: typeof value.lightRadius === "number" && value.lightRadius >= 0 ? value.lightRadius : undefined,
 		lightEnabled: typeof value.lightEnabled === "boolean" ? value.lightEnabled : undefined,
+		lightRadiusReduction: typeof value.lightRadiusReduction === "number" && value.lightRadiusReduction >= 0 ? value.lightRadiusReduction : undefined,
 		lightRadiusLinkedToVision: typeof value.lightRadiusLinkedToVision === "boolean" ? value.lightRadiusLinkedToVision : undefined,
 		sideEyeAngle: typeof value.sideEyeAngle === "number" ? value.sideEyeAngle : undefined,
 		detectionAngle: typeof value.detectionAngle === "number" ? value.detectionAngle : undefined,
@@ -691,7 +777,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 14, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
+	return { version: 15, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

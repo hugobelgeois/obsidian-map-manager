@@ -2,6 +2,7 @@ import { MarkdownPostProcessorContext, MarkdownRenderChild, Notice, TFile, debou
 import type MapManagerPlugin from "../main";
 import { MapController } from "../controller/MapController";
 import { parseMapBlockSource, parseMapData, serializeMapData } from "../data/mapData";
+import { Point } from "../grid/gridMath";
 import { extractLayerToNewMap } from "../platform/extractLayerToNewMap";
 import { registerMirrorSource } from "../platform/mirrorRegistry";
 import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWindow";
@@ -111,6 +112,8 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const viewportListeners = new Set<() => void>();
 	const pingListeners = new Set<(x: number, y: number) => void>();
 	const pathAnimationListeners = new Set<(routes: PathAnimationRoute[], speedWorldPerMs: number) => void>();
+	const cellHopListeners = new Set<(tokenId: string, from: Point, to: Point) => void>();
+	const aimListeners = new Set<(tokenId: string, angleDeg: number | null) => void>();
 	const canvas = new MapCanvas(canvasHost, controller, app, plugin.settings, {
 		onViewportChange: () => {
 			for (const cb of viewportListeners) cb();
@@ -120,6 +123,12 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		},
 		onPathAnimation: (routes, speedWorldPerMs) => {
 			for (const cb of pathAnimationListeners) cb(routes, speedWorldPerMs);
+		},
+		onCellHop: (tokenId, from, to) => {
+			for (const cb of cellHopListeners) cb(tokenId, from, to);
+		},
+		onAim: (tokenId, angleDeg) => {
+			for (const cb of aimListeners) cb(tokenId, angleDeg);
 		},
 	});
 	canvasRef = canvas;
@@ -142,6 +151,14 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		onPathAnimationStart: (cb) => {
 			pathAnimationListeners.add(cb);
 			return () => pathAnimationListeners.delete(cb);
+		},
+		onCellHop: (cb) => {
+			cellHopListeners.add(cb);
+			return () => cellHopListeners.delete(cb);
+		},
+		onAim: (cb) => {
+			aimListeners.add(cb);
+			return () => aimListeners.delete(cb);
 		},
 	});
 	const infoPanel = new InfoPanel(

@@ -1,9 +1,10 @@
 import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController } from "../controller/MapController";
-import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, VisionBlockerType, getActiveLayer } from "../data/mapData";
+import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
 import { MapManagerSettings } from "../settings/types";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
+import { WALL_BLOCKER_TYPE_OPTIONS, isWallBlockerTypeValue } from "./wallBlockerTypeOptions";
 
 export interface ToolbarActions {
 	recenter: () => void;
@@ -561,12 +562,14 @@ export class Toolbar {
 		const blockerField = panel.createDiv({ cls: "map-manager-field-inline" });
 		blockerField.createEl("label", { text: "Type de mur" });
 		const blockerSelect = blockerField.createEl("select");
-		const opaqueOpt = blockerSelect.createEl("option", { text: "Opaque (cache tout au-delà)" });
-		opaqueOpt.value = "opaque";
-		const dimOpt = blockerSelect.createEl("option", { text: "Partiel (visible en mode exploré)" });
-		dimOpt.value = "dim";
+		for (const opt of WALL_BLOCKER_TYPE_OPTIONS) {
+			const optEl = blockerSelect.createEl("option", { text: opt.label });
+			optEl.value = opt.value;
+		}
 		blockerSelect.value = this.controller.wallDrawBlockerType;
-		blockerSelect.onchange = () => this.controller.setWallDrawBlockerType(blockerSelect.value as VisionBlockerType);
+		blockerSelect.onchange = () => {
+			if (isWallBlockerTypeValue(blockerSelect.value)) this.controller.setWallDrawBlockerType(blockerSelect.value);
+		};
 
 		// "Optimiser les murs" runs a one-off cleanup pass over the active layer's wall network
 		// (orphan points, overlapping/duplicate segments, redundant straight-line points — see

@@ -1,4 +1,4 @@
-import { VisionBlockerType, WallPoint, WallSegment, generateLocalId } from "../data/mapData";
+import { VisionBlockerType, WallPoint, WallSegment, generateLocalId, moreRestrictiveWallType } from "../data/mapData";
 import { clamp, collinearOverlap, isStraightThrough, projectParam, segmentIntersection } from "./gridMath";
 
 /**
@@ -27,7 +27,7 @@ export interface WallNetwork {
  *    sub-segment always sits between two real points.
  *  - A run that's collinear with (and overlaps) an existing segment doesn't get a second, stacked
  *    segment for the shared stretch — that stretch keeps a single segment, using whichever of the
- *    two blocker types is more restrictive ("opaque" over "dim").
+ *    two blocker types is more restrictive (see `moreRestrictiveWallType`).
  * Mutates `network` in place. Must run inside `MapController.update`'s mutator when `network` is a
  * live layer (one history entry per commit, however many points/segments it ends up touching — see
  * `MapController.commitWallPoint`).
@@ -93,8 +93,8 @@ export function addWallSegment(network: WallNetwork, aId: string, bId: string, b
 
 			// Rebuild `existing` around the overlap: whatever of its own extent sits outside
 			// [t0, t1] keeps its original type as its own segment(s); the shared middle becomes
-			// one merged segment, opaque winning over dim.
-			const winningType: VisionBlockerType = existing.blockerType === "opaque" || blockerType === "opaque" ? "opaque" : "dim";
+			// one merged segment, the more restrictive of the two types winning.
+			const winningType: VisionBlockerType = moreRestrictiveWallType(existing.blockerType, blockerType);
 			const teA = projectParam(ea, a, b);
 			const teB = projectParam(eb, a, b);
 			const [loT, loId, hiT, hiId] = teA <= teB ? [teA, existing.aId, teB, existing.bId] : [teB, existing.bId, teA, existing.aId];
@@ -209,9 +209,9 @@ export function mergeStraightWallPoints(network: WallNetwork): void {
  * `MapController.optimizeWalls` ("Optimiser les murs", run on a hand-edited layer in place) and
  * `detectMagicWalls` (run on a freshly-built candidate network before it's ever shown to the user):
  *  1. Points no segment touches — dropped outright.
- *  2. Overlapping/duplicate segments — collapsed via `addWallSegment`'s own reconciliation (opaque
- *     winning over dim for the shared stretch), by re-inserting every existing segment through it,
- *     one at a time, into a network rebuilt from scratch.
+ *  2. Overlapping/duplicate segments — collapsed via `addWallSegment`'s own reconciliation (the more
+ *     restrictive type winning for the shared stretch, see `moreRestrictiveWallType`), by re-inserting
+ *     every existing segment through it, one at a time, into a network rebuilt from scratch.
  *  3. Redundant straight-line middle points — collapsed via `mergeStraightWallPoints`.
  * Mutates `network` in place.
  */

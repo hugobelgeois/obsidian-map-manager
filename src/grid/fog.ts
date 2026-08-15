@@ -7,8 +7,9 @@ import {
 	parseCellKey,
 	resolveLightRadius,
 	squareKey,
+	wallBlocksVision,
 } from "../data/mapData";
-import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, hexWorldToCell, pointSegmentDistance, raySegmentDistance, squareWorldToCell } from "./gridMath";
+import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, hexWorldToCell, raySegmentDistance, squareWorldToCell } from "./gridMath";
 
 /**
  * Rays cast per player token when tracing vision (ray/path tracing, not grid tracing) — fixed
@@ -22,15 +23,6 @@ export const FOG_RAY_COUNT = 180;
  * doesn't need cell-level precision — but small enough to hug walls/blockers reasonably closely.
  */
 export const FOG_BUCKET_SCALE = 1.25;
-/**
- * How close (in cell-widths) an entity's eye cone has to be to a "dim"/partial wall segment
- * (`visionRange` — "être contre ce mur") to see through it at all. Farther than this, a partial wall
- * blocks the cone exactly like an opaque one instead of letting a dim glimpse through from any
- * distance — see the proximity check in `traceRays`. Never applies to `castLightRays` (no
- * directional cone to be "up close and inside" to begin with — see its own doc comment).
- */
-export const WALL_ADJACENCY_CELLS = 1;
-
 /** A `WallSegment` with its two endpoints resolved to world coordinates, for ray casting/flood-fill. */
 export interface ResolvedWallSegment {
 	a: Point;
@@ -38,11 +30,16 @@ export interface ResolvedWallSegment {
 	type: VisionBlockerType;
 }
 
-/** One ray's traced reach, in world units from the token center, at a fixed angle (see `FOG_RAY_COUNT`). */
+/**
+ * One ray's traced reach, in world units from the token center, at a fixed angle (see `FOG_RAY_COUNT`).
+ * `clearEnd` and `dimEnd` are always equal now — every `VisionBlockerType` either blocks a ray outright
+ * (`wallBlocksVision`) or doesn't affect it at all, no in-between "hazy, slightly further" reach the
+ * way the old (pre-v15) `"dim"` wall type produced. Kept as two fields anyway, rather than collapsing
+ * to one, since `FogRenderer`'s fog-memory rendering (`appendVisionFan`'s paired dim/clear fan draw)
+ * still reads them as two separate values — touching that is out of scope here.
+ */
 export interface RaySample {
-	/** Distance to the first blocker of any kind (or the vision's natural edge if none). */
 	clearEnd: number;
-	/** Distance to the first *opaque* blocker (or the natural edge) — reaches past a "dim" blocker. */
 	dimEnd: number;
 }
 
@@ -139,12 +136,14 @@ export function footprintCellKeys(data: MapFileData, cellKey: string, size: numb
  * via `footprintCellKeys`) — a batch-move collision check, used both by
  * `MapController.moveTokensToCells` and `MapCanvas`'s group-move/distribute-into-area preview so
  * the footprint math isn't duplicated between them. Tokens with no `cellKey` (grid type "none") are
- * skipped, same as any single-token collision check on this map.
+ * skipped, same as any single-token collision check on this map — as are "light" category tokens
+ * (see `Token.category`'s doc comment): a pure light fixture, non-physical, never blocks another
+ * token from moving onto its cell (see `MapController.moveToken`'s own matching exception).
  */
 export function occupiedFootprintCells(data: MapFileData, excludeIds: ReadonlySet<string>): Set<string> {
 	const occupied = new Set<string>();
 	for (const token of data.tokens) {
-		if (excludeIds.has(token.id) || !token.cellKey) continue;
+		if (excludeIds.has(token.id) || !token.cellKey || (token.category ?? "entity") === "light") continue;
 		for (const key of footprintCellKeys(data, token.cellKey, token.size ?? 1)) occupied.add(key);
 	}
 	return occupied;
@@ -182,22 +181,14 @@ function angleDiffDeg(a: number, b: number): number {
  * cones, `radius` pinned to `0`) — everything about *whose* angle/direction/reach this is lives in
  * the caller, this function only knows geometry.
  *
- * A "dim" wall segment blocks a ray completely (both `clearEnd` and `dimEnd` stop there, same as an
- * opaque wall) *unless* that ray is inside the directional cone AND `center` sits within
- * `wallAdjacency` (world units, see `WALL_ADJACENCY_CELLS`) of the segment itself — only then does it
- * not block the ray at all (skipped entirely, as if it weren't there). The plain omnidirectional
- * `radius` fallback (rays outside the cone) never gets that exception, regardless of distance to the
- * wall — only the directional cone is ever meant to "peer through" a partial wall up close.
+ * Only wall segments with `wallBlocksVision(seg.type)` ever stop a ray at all — anything else
+ * (`"see-through"`/`"pass-see-through"`) is skipped entirely, as if it weren't there. Unlike the
+ * pre-v15 `"dim"` wall type this replaced, there's no partial/proximity-dependent peek-through left:
+ * a vision-blocking wall always fully blocks, a non-blocking one never blocks at all (see
+ * `RaySample`'s own doc comment on why `clearEnd`/`dimEnd` end up equal here).
  */
-function traceRays(
-	center: Point,
-	radius: number,
-	range: number,
-	halfAngle: number,
-	direction: number,
-	wallSegments: ResolvedWallSegment[],
-	wallAdjacency: number
-): RaySample[] {
+function traceRays(center: Point, radius: number, range: number, halfAngle: number, direction: number, wallSegments: ResolvedWallSegment[]): RaySample[] {
+	const blockers = wallSegments.filter((seg) => wallBlocksVision(seg.type));
 	const rays: RaySample[] = [];
 	for (let i = 0; i < FOG_RAY_COUNT; i++) {
 		const angle = (360 / FOG_RAY_COUNT) * i;
@@ -211,34 +202,12 @@ function traceRays(
 		const dx = Math.cos(rad);
 		const dy = Math.sin(rad);
 
-		const hits: { dist: number; type: VisionBlockerType }[] = [];
-		for (const seg of wallSegments) {
-			const dist = raySegmentDistance(center, dx, dy, reach, seg.a, seg.b);
-			if (dist === null) continue;
-			if (seg.type === "dim") {
-				if (inCone && pointSegmentDistance(center, seg.a, seg.b) <= wallAdjacency) continue; // against it, cone only: fully passable
-				hits.push({ dist, type: "opaque" }); // radius fallback, or cone but too far: blocks fully, like an opaque wall
-				continue;
-			}
-			hits.push({ dist, type: seg.type });
+		let end = reach;
+		for (const seg of blockers) {
+			const dist = raySegmentDistance(center, dx, dy, end, seg.a, seg.b);
+			if (dist !== null && dist < end) end = dist;
 		}
-		hits.sort((h1, h2) => h1.dist - h2.dist);
-
-		let clearEnd = reach;
-		let dimEnd = reach;
-		let dimHit = false;
-		for (const hit of hits) {
-			if (hit.type === "opaque") {
-				dimEnd = hit.dist;
-				if (!dimHit) clearEnd = hit.dist;
-				break;
-			}
-			if (!dimHit) {
-				dimHit = true;
-				clearEnd = hit.dist;
-			}
-		}
-		rays.push({ clearEnd, dimEnd });
+		rays.push({ clearEnd: end, dimEnd: end });
 	}
 	return rays;
 }
@@ -252,8 +221,7 @@ function traceRays(
 export function castEntityConeRays(data: MapFileData, token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): VisionRays {
 	const center = footprintCenter(data, token);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
-	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
-	return { center, rays: traceRays(center, 0, range, fullAngleDeg / 2, direction, wallSegments, wallAdjacency) };
+	return { center, rays: traceRays(center, 0, range, fullAngleDeg / 2, direction, wallSegments) };
 }
 
 /**
@@ -269,13 +237,9 @@ export function buildVisionCache(data: MapFileData): VisionRays[] {
 
 /**
  * A token's "light" reach (`resolveLightRadius`, any category — see the field's doc comment in
- * `mapData.ts`): a plain omnidirectional radius, fully blocked by any wall it meets, opaque or
- * "dim" alike. Reuses `traceRays` with `range` pinned at 0, so every angle falls outside its
- * (otherwise inactive) directional cone and gets the plain `radius` reach — the same path a "dim"
- * wall takes outside a vision cone's own proximity exception, i.e. it blocks fully, unlike a vision
- * cone's own reach which can peer through a "dim" wall up close (see `traceRays`'s doc comment).
- * Light itself has no such exception: there's no cone here to be "up close and inside" to begin
- * with, so it never gets one either.
+ * `mapData.ts`): a plain omnidirectional radius, fully blocked by any vision-blocking wall it meets
+ * (`wallBlocksVision`). Reuses `traceRays` with `range` pinned at 0, so every angle falls outside its
+ * (otherwise inactive) directional cone and gets the plain `radius` reach.
  *
  * `pose` mirrors `castEntityConeRays`'s own parameter (indirectly, via the direction it ignores) —
  * lets a light source keep tracking a token's live interpolated position during an in-flight
@@ -284,8 +248,7 @@ export function buildVisionCache(data: MapFileData): VisionRays[] {
 export function castLightRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
 	const center = pose?.center ?? footprintCenter(data, token);
 	const radius = resolveLightRadius(token) * cellVisualWidth(data);
-	const wallAdjacency = WALL_ADJACENCY_CELLS * cellVisualWidth(data);
-	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments, wallAdjacency) };
+	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments) };
 }
 
 /** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */

@@ -17,7 +17,7 @@ import { ImageBounds, WorldRect } from "./canvasTypes";
 
 /** Fog opacity for ground that has never been in a player's vision. */
 const FOG_OPACITY_UNEXPLORED = 1;
-/** Fog opacity for ground that has been seen before, isn't currently lit, or sits beyond a "dim" blocker. */
+/** Fog opacity for ground that has been seen before but isn't currently lit. */
 const FOG_OPACITY_EXPLORED = 0.55;
 
 /**
@@ -448,8 +448,8 @@ export class FogRenderer {
 	}
 
 	/**
-	 * Wall-aware (`castLightRaysForToken`/`castLightRays`, blocked by opaque and "dim" walls alike)
-	 * fan preview of every `tokens` token's `lightRadius`, any category — batched into a single
+	 * Wall-aware (`castLightRaysForToken`/`castLightRays`, blocked by any vision-blocking wall —
+	 * `wallBlocksVision`) fan preview of every `tokens` token's `lightRadius`, any category — batched into a single
 	 * `Path2D`/fill regardless of how many tokens are on screen, same as `drawEntityEyeCones`. Tokens
 	 * with no light radius set contribute nothing. This is the exact shape `drawFog` also punches
 	 * through the real fog overlay for (see `frameLightCache`), just drawn as a GM preview instead —

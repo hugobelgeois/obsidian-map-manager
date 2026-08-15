@@ -57,6 +57,17 @@ export class MapController {
 	activeInfoLinkIndex = 0;
 
 	/**
+	 * Which player token (by id) each connected gamepad currently drives — see `GamepadInputPoller`
+	 * (`MapCanvas`) and `InfoPanel`'s "Manette" field on a player token's Vue-mode panel. Keyed by the
+	 * gamepad's own `Gamepad.index`, not persisted: that index is just an OS/browser connection-order
+	 * slot, meaningless across sessions or devices, so this is session-only the same as `showCells`
+	 * etc. `assignGamepad` enforces one gamepad per token (see its own doc comment); nothing enforces
+	 * the reverse here, but nothing offers assigning a second gamepad to an already-assigned token
+	 * either (`InfoPanel`'s dropdown is the only writer).
+	 */
+	gamepadAssignments: Map<number, string> = new Map();
+
+	/**
 	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
 	 * (brush) or flood-filled from a click (fill). Session-only, not persisted. `brushZoneMode` is
 	 * "clear" (remove the zone) or a zoneTypeId to apply — no "leave untouched" option, so the toolbar
@@ -909,6 +920,7 @@ export class MapController {
 			data.tokens = data.tokens.filter((t) => !ids.has(t.id));
 		});
 		this.clearMassSelection();
+		this.unassignGamepadsForTokens(ids);
 	}
 
 	/** Bulk-sets the blocker type of every mass-selected wall segment (each segment individually, unlike `setWallPointBlockerType`'s whole-connected-shape behavior), as one undo step. */
@@ -1017,14 +1029,25 @@ export class MapController {
 		return token;
 	}
 
-	moveToken(tokenId: string, newCellKey: string): boolean {
+	/**
+	 * Moves `tokenId` onto `newCellKey`, optionally also setting `rotation` in the same commit (one
+	 * undo step for both — see `MapCanvas.handleGamepadMove`, which rotates a gamepad-driven token to
+	 * face the direction it just stepped). Fails (returns `false`, no-op) if the target cell already
+	 * holds another token — except a "light" category token (see `Token.category`'s doc comment): a
+	 * pure light fixture, non-physical, so any token can share its cell (same exception
+	 * `occupiedFootprintCells` applies for drag/mass-move collision).
+	 */
+	moveToken(tokenId: string, newCellKey: string, rotation?: number): boolean {
 		const found = this.findToken(tokenId);
 		if (!found) return false;
-		if (found.cellKey === newCellKey) return true;
-		if (this.getTokenAt(newCellKey)) return false;
+		if (found.cellKey === newCellKey && rotation === undefined) return true;
+		const occupant = this.getTokenAt(newCellKey);
+		if (occupant && occupant.id !== tokenId && (occupant.category ?? "entity") !== "light") return false;
 		this.update((data) => {
 			const token = data.tokens.find((t) => t.id === tokenId);
-			if (token) token.cellKey = newCellKey;
+			if (!token) return;
+			token.cellKey = newCellKey;
+			if (rotation !== undefined) token.rotation = rotation;
 		});
 		return true;
 	}
@@ -1129,6 +1152,48 @@ export class MapController {
 			data.tokens = data.tokens.filter((t) => t.id !== tokenId);
 		});
 		if (this.selectedTokenId === tokenId) this.selectToken(null);
+		this.unassignGamepadsForTokens(new Set([tokenId]));
+	}
+
+	// ---- Gamepad assignment (session-only — see `gamepadAssignments`) ----
+
+	/** Which gamepad (if any) currently drives `tokenId` — the inverse lookup of `gamepadAssignments`, for `InfoPanel`'s "Manette" dropdown to show the current selection. */
+	gamepadForToken(tokenId: string): number | null {
+		for (const [index, id] of this.gamepadAssignments) {
+			if (id === tokenId) return index;
+		}
+		return null;
+	}
+
+	/**
+	 * Assigns gamepad `gamepadIndex` to drive token `tokenId`, first dropping that same gamepad's
+	 * previous assignment (if any) and this token's previous gamepad (if any) — enforced here so a
+	 * gamepad only ever drives one token and a token is only ever driven by one gamepad, without
+	 * `InfoPanel`'s dropdown needing to duplicate the bookkeeping.
+	 */
+	assignGamepad(gamepadIndex: number, tokenId: string): void {
+		for (const [index, id] of [...this.gamepadAssignments]) {
+			if (index === gamepadIndex || id === tokenId) this.gamepadAssignments.delete(index);
+		}
+		this.gamepadAssignments.set(gamepadIndex, tokenId);
+		this.notify();
+	}
+
+	unassignGamepad(gamepadIndex: number): void {
+		if (!this.gamepadAssignments.delete(gamepadIndex)) return;
+		this.notify();
+	}
+
+	/** Drops any gamepad assignment pointing at one of `tokenIds` — called whenever token(s) are deleted, see `removeToken`/`massRemoveTokens`. */
+	private unassignGamepadsForTokens(tokenIds: ReadonlySet<string>): void {
+		let changed = false;
+		for (const [index, id] of [...this.gamepadAssignments]) {
+			if (tokenIds.has(id)) {
+				this.gamepadAssignments.delete(index);
+				changed = true;
+			}
+		}
+		if (changed) this.notify();
 	}
 
 	// ---- Clipboard (tokens only — see tokenClipboard.ts) ----
