@@ -1,6 +1,6 @@
 import { CellData, Marker, VisionBlockerType, WallPoint, WallSegment, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
 import { footprintCellKeys, footprintCenter, occupiedFootprintCells, worldPointToCellKey } from "../grid/fog";
-import { WallShapeKind, wallShapeCorners } from "../grid/gridMath";
+import { WallShapeKind, clamp, wallShapeCorners } from "../grid/gridMath";
 import { addWallSegment, optimizeWallNetwork } from "../grid/wallOptimize";
 import { ClipboardToken, getTokenClipboard, setTokenClipboard, stripPlacementFields } from "./tokenClipboard";
 
@@ -139,6 +139,19 @@ export class MapController {
 	 * of the wall tool's placement modes.
 	 */
 	pendingWallBucket = false;
+
+	/**
+	 * "Seau à murs" tolerances (see `detectColorRegionWalls`), editable via the fields under the
+	 * bucket button in the "Murs" dropdown rather than baked-in constants — session-only, not
+	 * persisted (a per-session tuning knob for this one flood fill, not a property of the map itself).
+	 * `wallBucketColorTolerancePercent`/`wallBucketWallFailFraction` are both 0-1 fractions (shown to
+	 * the user as 0-100%); `wallBucketPixelReach` is a whole number of image pixels.
+	 */
+	wallBucketColorTolerancePercent = 0.1;
+	/** See `wallBucketColorTolerancePercent` above. */
+	wallBucketWallFailFraction = 0.95;
+	/** See `wallBucketColorTolerancePercent` above. */
+	wallBucketPixelReach = 5;
 
 	private data: MapFileData;
 	private listeners: Set<MapControllerListener> = new Set();
@@ -508,6 +521,24 @@ export class MapController {
 
 	setWallDrawBlockerType(type: VisionBlockerType): void {
 		this.wallDrawBlockerType = type;
+		this.notify();
+	}
+
+	/** See `wallBucketColorTolerancePercent`. Clamped to 0-1 since it's shown/edited as a 0-100% field. */
+	setWallBucketColorTolerancePercent(percent: number): void {
+		this.wallBucketColorTolerancePercent = clamp(percent, 0, 1);
+		this.notify();
+	}
+
+	/** See `wallBucketWallFailFraction`. Clamped to 0-1 since it's shown/edited as a 0-100% field. */
+	setWallBucketWallFailFraction(fraction: number): void {
+		this.wallBucketWallFailFraction = clamp(fraction, 0, 1);
+		this.notify();
+	}
+
+	/** See `wallBucketPixelReach`. Floored at 0 (no negative pixel reach) and rounded to a whole pixel. */
+	setWallBucketPixelReach(reach: number): void {
+		this.wallBucketPixelReach = Math.max(0, Math.round(reach));
 		this.notify();
 	}
 

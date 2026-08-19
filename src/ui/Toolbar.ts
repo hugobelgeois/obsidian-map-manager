@@ -23,6 +23,9 @@ export interface ToolbarDeps {
 	settings: MapManagerSettings;
 }
 
+/** How far (in CSS px) the cursor can wander from the "Zones"/"Murs" tool panel before it auto-collapses — see `Toolbar.handleToolPanelMouseMove`. */
+const TOOL_PANEL_HOVER_DISTANCE = 40;
+
 function buildGridIcon(svg: SVGSVGElement, gridType: GridType): void {
 	svg.setAttribute("viewBox", "0 0 20 20");
 	svg.addClass("map-manager-grid-icon");
@@ -60,17 +63,40 @@ export class Toolbar {
 	private playerWindowMenuOpen = false;
 	private infoMenuOpen = false;
 	private openDropdownEl: HTMLElement | null = null;
+	/**
+	 * Unlike the click-toggled dropdowns above, the "Zones"/"Murs" tool panel (brush/fill/wall options)
+	 * stays tied to `activeTool` itself — selecting the tool doesn't just open a menu, it also arms the
+	 * canvas tool, so there's no click-outside-to-close without also deactivating the tool. Instead it
+	 * auto-collapses once the cursor wanders too far (`handleToolPanelMouseMove`), purely a rendering
+	 * concern: the tool stays active and every setting in the panel (brush radius, bucket tolerances,
+	 * blocker type, ...) lives on the controller, so hiding the panel never touches any of it. `false`
+	 * initially: nothing to hide before a tool is picked, and picking one re-opens it (see `render`).
+	 */
+	private toolPanelOpen = false;
+	private toolPanelWasActive = false;
+	/**
+	 * The trigger button is tracked separately from the panel because the panel is `position: absolute`
+	 * (see `.map-manager-dropdown-panel`) — it sits outside its wrapper's own layout box, so the wrapper's
+	 * `getBoundingClientRect()` alone only covers the button, never the panel below it. Both are measured
+	 * in `handleToolPanelMouseMove` so hovering anywhere over the actual panel content never counts as
+	 * "too far", however far that puts the cursor from the button itself. `toolPanelPanelEl` is null
+	 * whenever the panel isn't currently rendered (closed, or no such tool active).
+	 */
+	private toolPanelTriggerEl: HTMLElement | null = null;
+	private toolPanelPanelEl: HTMLElement | null = null;
 
 	constructor(container: HTMLElement, private app: App, private deps: ToolbarDeps, private controller: MapController, private actions: ToolbarActions) {
 		this.el = container.createDiv({ cls: "map-manager-toolbar" });
 		this.render();
 		this.unsubscribe = this.controller.onChange(() => this.render());
 		document.addEventListener("mousedown", this.handleDocumentClick, true);
+		document.addEventListener("mousemove", this.handleToolPanelMouseMove);
 	}
 
 	destroy(): void {
 		this.unsubscribe();
 		document.removeEventListener("mousedown", this.handleDocumentClick, true);
+		document.removeEventListener("mousemove", this.handleToolPanelMouseMove);
 	}
 
 	private closeMenus(): void {
@@ -89,9 +115,54 @@ export class Toolbar {
 		this.render();
 	};
 
+	/**
+	 * Closing and re-opening the "Zones"/"Murs" tool panel are deliberately asymmetric:
+	 * - Open → close: forgiving. It only collapses once the cursor strays more than
+	 *   `TOOL_PANEL_HOVER_DISTANCE` from *both* the trigger button and the panel itself, so it never
+	 *   closes while the cursor is actually over the panel's contents, however far that puts it from the
+	 *   button that opened it.
+	 * - Closed → open: deliberate. It only comes back by hovering directly over the trigger button
+	 *   (an exact hit test, no halo) — otherwise it would keep popping open just from the cursor passing
+	 *   near the toolbar on its way to/from the canvas.
+	 * `toolPanelTriggerEl` is null whenever no brush/fill/wall tool is active, so this is a no-op the
+	 * rest of the time. Re-renders only on an actual open/closed transition, not on every mouse move.
+	 */
+	private handleToolPanelMouseMove = (e: MouseEvent): void => {
+		if (!this.toolPanelTriggerEl) return;
+		if (this.toolPanelOpen) {
+			const distanceTo = (el: HTMLElement): number => {
+				const rect = el.getBoundingClientRect();
+				const dx = Math.max(rect.left - e.clientX, e.clientX - rect.right, 0);
+				const dy = Math.max(rect.top - e.clientY, e.clientY - rect.bottom, 0);
+				return Math.hypot(dx, dy);
+			};
+			const distance = this.toolPanelPanelEl
+				? Math.min(distanceTo(this.toolPanelTriggerEl), distanceTo(this.toolPanelPanelEl))
+				: distanceTo(this.toolPanelTriggerEl);
+			if (distance > TOOL_PANEL_HOVER_DISTANCE) {
+				this.toolPanelOpen = false;
+				this.render();
+			}
+		} else {
+			const rect = this.toolPanelTriggerEl.getBoundingClientRect();
+			const hoveringTrigger = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+			if (hoveringTrigger) {
+				this.toolPanelOpen = true;
+				this.render();
+			}
+		}
+	};
+
 	private render(): void {
 		this.el.empty();
 		this.openDropdownEl = null;
+		this.toolPanelTriggerEl = null;
+		this.toolPanelPanelEl = null;
+		// Freshly picking a brush/fill/wall tool always (re-)opens its panel, regardless of how it was
+		// last left — only a live tool's panel can auto-collapse by distance (`handleToolPanelMouseMove`).
+		const toolHasPanel = this.controller.activeTool === "brush" || this.controller.activeTool === "fill" || this.controller.activeTool === "wall";
+		if (toolHasPanel && !this.toolPanelWasActive) this.toolPanelOpen = true;
+		this.toolPanelWasActive = toolHasPanel;
 		const data = this.controller.getData();
 		const activeLayer = this.controller.getActiveLayer();
 
@@ -483,9 +554,12 @@ export class Toolbar {
 		brushBtn.onclick = () => this.controller.setActiveTool("brush");
 
 		if (!brushOrFillActive) return;
+		this.toolPanelTriggerEl = brushWrapper;
+		if (!this.toolPanelOpen) return;
 
 		brushWrapper.addClass("is-open");
 		const panel = brushWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-brush-dropdown-panel" });
+		this.toolPanelPanelEl = panel;
 
 		const fillBtn = panel.createEl("button", { text: "Remplissage", cls: "map-manager-btn" });
 		fillBtn.toggleClass("is-active", this.controller.activeTool === "fill");
@@ -542,9 +616,12 @@ export class Toolbar {
 		wallBtn.onclick = () => this.controller.setActiveTool("wall");
 
 		if (this.controller.activeTool !== "wall") return;
+		this.toolPanelTriggerEl = wallWrapper;
+		if (!this.toolPanelOpen) return;
 
 		wallWrapper.addClass("is-open");
 		const panel = wallWrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-wall-shape-dropdown-panel" });
+		this.toolPanelPanelEl = panel;
 		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Insérer une forme" });
 		const shapeRow = panel.createDiv({ cls: "map-manager-wall-shape-row" });
 		const shapeBtn = (shape: "square" | "triangle" | "losange", icon: string, tooltip: string) => {
@@ -578,6 +655,8 @@ export class Toolbar {
 			});
 		}
 
+		if (this.controller.pendingWallBucket) this.renderWallBucketTolerances(panel);
+
 		const blockerField = panel.createDiv({ cls: "map-manager-field-inline" });
 		blockerField.createEl("label", { text: "Type de mur" });
 		const blockerSelect = blockerField.createEl("select");
@@ -597,6 +676,51 @@ export class Toolbar {
 		optimizeWallsBtn.onclick = () => {
 			this.controller.optimizeWalls();
 			new Notice("Murs optimisés.");
+		};
+	}
+
+	/**
+	 * The three "Seau à murs" tolerances (see `detectColorRegionWalls`), shown right under the bucket
+	 * button whenever it's armed so they're tuned before the next click rather than after: percentages
+	 * are edited as whole 0-100 numbers and converted to/from the controller's 0-1 fractions here, so
+	 * the field itself never shows an odd value like "0.1".
+	 */
+	private renderWallBucketTolerances(panel: HTMLElement): void {
+		const percentField = (label: string, tooltip: string, value: number, onChange: (fraction: number) => void) => {
+			const field = panel.createDiv({ cls: "map-manager-field-inline" });
+			const labelEl = field.createEl("label", { text: label });
+			setTooltip(labelEl, tooltip);
+			const input = field.createEl("input", { type: "number" });
+			input.min = "0";
+			input.max = "100";
+			input.value = String(Math.round(value * 100));
+			input.onchange = () => {
+				const v = parseFloat(input.value);
+				if (!Number.isNaN(v)) onChange(v / 100);
+			};
+		};
+		percentField(
+			"Tolérance de couleur (%)",
+			"À quel point un pixel peut différer de la couleur cliquée tout en comptant comme la même couleur.",
+			this.controller.wallBucketColorTolerancePercent,
+			(v) => this.controller.setWallBucketColorTolerancePercent(v)
+		);
+		percentField(
+			"Tolérance de mur (%)",
+			"Part des pixels d'un bord qui doivent échouer au test de couleur pour qu'un mur y soit posé.",
+			this.controller.wallBucketWallFailFraction,
+			(v) => this.controller.setWallBucketWallFailFraction(v)
+		);
+
+		const reachField = panel.createDiv({ cls: "map-manager-field-inline" });
+		const reachLabel = reachField.createEl("label", { text: "Tolérance d'éloignement de mur" });
+		setTooltip(reachLabel, "Distance (en pixels) de part et d'autre du bord d'une case encore prise en compte — 1 par défaut, 10 vérifie jusqu'à 10 pixels de chaque côté du bord.");
+		const reachInput = reachField.createEl("input", { type: "number" });
+		reachInput.min = "0";
+		reachInput.value = String(this.controller.wallBucketPixelReach);
+		reachInput.onchange = () => {
+			const v = parseInt(reachInput.value, 10);
+			if (!Number.isNaN(v)) this.controller.setWallBucketPixelReach(v);
 		};
 	}
 

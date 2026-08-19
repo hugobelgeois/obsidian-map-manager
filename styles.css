@@ -318,6 +318,49 @@
 	cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26"><text x="0" y="20" font-size="20">🪣</text></svg>') 2 22, crosshair;
 }
 
+/* "Seau à murs" color magnifier (see MapCanvas.updateColorMagnifier) — floats over the map canvas,
+   tracking the cursor, while the bucket tool is armed. Never intercepts pointer events itself: it's
+   purely a readout, positioned/hidden entirely from TypeScript. */
+.map-manager-magnifier {
+	position: absolute;
+	z-index: 5;
+	pointer-events: none;
+	display: none;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	box-shadow: var(--shadow-s, 0 2px 8px rgba(0, 0, 0, 0.3));
+	padding: 4px;
+}
+
+.map-manager-magnifier.is-visible {
+	display: block;
+}
+
+.map-manager-magnifier-canvas {
+	display: block;
+	border-radius: 2px;
+	image-rendering: pixelated;
+}
+
+.map-manager-magnifier-label {
+	display: flex;
+	align-items: center;
+	gap: 0.4em;
+	margin-top: 4px;
+	font-size: 0.8em;
+	font-family: var(--font-monospace, monospace);
+	color: var(--text-normal);
+}
+
+.map-manager-magnifier-swatch {
+	width: 1em;
+	height: 1em;
+	border-radius: 2px;
+	border: 1px solid var(--background-modifier-border);
+	flex: 0 0 auto;
+}
+
 
 .map-manager-infopanel {
 	flex: 0 0 0;

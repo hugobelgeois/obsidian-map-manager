@@ -39,9 +39,12 @@ const DPAD_BUTTONS: { index: number; angleDeg: number }[] = [
 /**
  * "Triangle"/"Y" — the standard Gamepad API mapping's button index 3 (top face button, whichever
  * label the physical pad uses for it) — the interact button (see `MapCanvas.handleGamepadInteract`):
- * toggles a light, or forces a step through a `"pass-through"` wall when held alongside a direction.
+ * toggles a light on a long press (`INTERACT_HOLD_MS`), or forces a step through a `"pass-through"`
+ * wall when held (any duration) alongside a direction.
  */
 const INTERACT_BUTTON_INDEX = 3;
+/** How long the interact button must be held before `onInteract` fires (toggling a light), ms — long enough that a quick tap (e.g. one that only meant to force a step through a `"pass-through"` wall) doesn't also toggle a light. */
+const INTERACT_HOLD_MS = 1500;
 /** L1/LB — standard mapping index 4 — dims a player token's light by one cell (see `MapCanvas.handleGamepadLightStep`). */
 const L1_BUTTON_INDEX = 4;
 /** R1/RB — standard mapping index 5 — brightens a player token's light by one cell (see `MapCanvas.handleGamepadLightStep`). */
@@ -92,8 +95,12 @@ interface GamepadPollState {
 	/** Whether the last poll saw the left stick/d-pad pushed past the deadzone — a direction only ever fires on the poll it first becomes true (then again per the repeat timer), never continuously, so tapping the stick yields exactly one step. */
 	moveActive: boolean;
 	moveNextFireAt: number;
-	/** Last-seen pressed state of each edge-triggered button, for edge-detecting `onInteract`/`onLightStep`. */
+	/** Last-seen pressed state of each edge-triggered button, for edge-detecting `onLightStep`. */
 	interactPressed: boolean;
+	/** When the interact button most recently went from released to held (`performance.now()`), or `null` while it's up — the basis for `onInteract`'s `INTERACT_HOLD_MS` long-press gate. */
+	interactPressedAt: number | null;
+	/** Whether `onInteract` has already fired for the interact button's current hold, so it fires exactly once per press-and-hold rather than on every poll past `INTERACT_HOLD_MS`. */
+	interactFired: boolean;
 	l1Pressed: boolean;
 	r1Pressed: boolean;
 }
@@ -108,7 +115,11 @@ export interface GamepadCallbacks {
 	 * direction rather than tracked separately, so this always sees the two in sync.
 	 */
 	onMove: (gamepadIndex: number, inputAngleDeg: number, interactHeld: boolean) => void;
-	/** The interact button's own press, edge-triggered, independent of whatever direction (if any) is also held. */
+	/**
+	 * The interact button held continuously for `INTERACT_HOLD_MS`, firing once per press-and-hold (not
+	 * on release, and not again while still held past the threshold) — independent of whatever direction
+	 * (if any) is also held. A quick tap (below the threshold) never fires this at all.
+	 */
 	onInteract: (gamepadIndex: number) => void;
 	/** L1/R1's own press, edge-triggered — `delta` is `-1` for L1 ("dim"), `1` for R1 ("brighten"). */
 	onLightStep: (gamepadIndex: number, delta: -1 | 1) => void;
@@ -158,12 +169,22 @@ export class GamepadInputPoller {
 			seen.add(pad.index);
 			let entry = this.state.get(pad.index);
 			if (!entry) {
-				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, l1Pressed: false, r1Pressed: false };
+				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, interactPressedAt: null, interactFired: false, l1Pressed: false, r1Pressed: false };
 				this.state.set(pad.index, entry);
 			}
 
 			const interactHeld = pad.buttons[INTERACT_BUTTON_INDEX]?.pressed ?? false;
-			if (interactHeld && !entry.interactPressed) this.callbacks.onInteract(pad.index);
+			if (interactHeld && !entry.interactPressed) {
+				entry.interactPressedAt = now;
+				entry.interactFired = false;
+			}
+			if (!interactHeld) {
+				entry.interactPressedAt = null;
+				entry.interactFired = false;
+			} else if (!entry.interactFired && entry.interactPressedAt !== null && now - entry.interactPressedAt >= INTERACT_HOLD_MS) {
+				this.callbacks.onInteract(pad.index);
+				entry.interactFired = true;
+			}
 			entry.interactPressed = interactHeld;
 
 			const l1Held = pad.buttons[L1_BUTTON_INDEX]?.pressed ?? false;

@@ -2,9 +2,10 @@ import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Token, configuredLightRadius, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, Layer, Token, configuredLightRadius, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
+import { rgbToHex } from "../platform/detectMagicWalls";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
 import { FogRenderer } from "./FogRenderer";
 import { HitTester } from "./HitTester";
@@ -62,6 +63,13 @@ const HEX_NEIGHBOR_OFFSETS: Array<{ dq: number; dr: number }> = [
 ];
 /** Safety cap on the fill tool's flood fill, so an unenclosed area (no closed perimeter) can't hang the browser. */
 const FILL_LIMIT = 4000;
+
+/** "Seau à murs" color magnifier (see `MapCanvas.updateColorMagnifier`): the loupe's own on-screen size, in CSS px. */
+const MAGNIFIER_SIZE_PX = 128;
+/** How many source-image pixels — a square, always odd so there's a single unambiguous center one — the loupe zooms into. The center pixel is the one under the cursor, i.e. what `detectColorRegionWalls` would actually sample as the flood fill's seed color at that spot. */
+const MAGNIFIER_SOURCE_PIXELS = 11;
+/** Loupe offset from the cursor, in CSS px, along whichever axis it isn't flipped to the opposite side on (see `updateColorMagnifier`) — keeps it clear of the pointer it's tracking. */
+const MAGNIFIER_OFFSET_PX = 24;
 
 /** Mixes a #rrggbb color toward white by `ratio` (0 = unchanged, 1 = white). Used for the selected-token border. */
 function lightenColor(hex: string, ratio: number): string {
@@ -191,6 +199,21 @@ export class MapCanvas {
 	private tokenImages: Map<string, BackgroundEntry> = new Map();
 	/** True once the initial "center on the image, zoomed out to fit it" framing has run. */
 	private hasAutoFramed = false;
+
+	/**
+	 * Per-layer offscreen copy of `bgImages`' `<img>`, redrawn onto a same-size `<canvas>` so its pixels
+	 * are readable via `getImageData` — `<img>` itself has no pixel-read API. Built lazily and only for
+	 * the "Seau à murs" magnifier (see `getBackgroundPixelSource`/`updateColorMagnifier`); nothing else
+	 * needs raw pixel access since `drawBackgrounds` draws straight from the `<img>`.
+	 */
+	private bgPixelSources: Map<string, { path: string; canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D }> = new Map();
+	/** "Seau à murs" color magnifier DOM, created lazily on first use — see `ensureMagnifierEls`/`updateColorMagnifier`/`hideColorMagnifier`. `null` until then, and for the lifetime of a mirror canvas (which never runs pointer input, so never arms the bucket tool). */
+	private magnifierEl: HTMLDivElement | null = null;
+	private magnifierCanvas: HTMLCanvasElement | null = null;
+	private magnifierSwatchEl: HTMLSpanElement | null = null;
+	private magnifierHexEl: HTMLSpanElement | null = null;
+	/** Scratch canvas the magnifier repaints every pointer move (see `updateColorMagnifier`) instead of allocating a new one each time. */
+	private magnifierScratch: HTMLCanvasElement | null = null;
 
 	/** Ray casting, fog compositing, and the GM-only vision/light zone preview — see `FogRenderer`. */
 	private fog: FogRenderer;
@@ -521,6 +544,14 @@ export class MapCanvas {
 			const rect = this.canvas.getBoundingClientRect();
 			this.wallPreview = this.hit.resolveWallPlacement(e.clientX - rect.left, e.clientY - rect.top);
 			this.render();
+		}
+
+		// "Seau à murs" color magnifier: tracks the pointer the same unconditional way `wallPreview`
+		// above does (not gated on `dragging` — the bucket tool acts on a plain click, not a drag), so
+		// the user can see exactly what color they're about to flood-fill from before committing to it.
+		if (this.controller.activeTool === "wall" && this.controller.pendingWallBucket) {
+			const rect = this.canvas.getBoundingClientRect();
+			this.updateColorMagnifier(e.clientX - rect.left, e.clientY - rect.top);
 		}
 
 		if (!this.dragging) return;
@@ -1493,6 +1524,7 @@ export class MapCanvas {
 		}
 		this.unsubscribe();
 		this.canvas.remove();
+		this.magnifierEl?.remove();
 	}
 
 	private resize(): void {
@@ -1674,7 +1706,8 @@ export class MapCanvas {
 
 	/**
 	 * `GamepadInputPoller`'s `onInteract` callback (see the constructor): one gamepad's interact button
-	 * was just pressed (edge-triggered) — if `gamepadIndex` is assigned to a player token, toggles a
+	 * was just held for `INTERACT_HOLD_MS` (1.5s long-press, fires once per press-and-hold — see the
+	 * poller) — if `gamepadIndex` is assigned to a player token, toggles a
 	 * light: whichever "light" category token shares the player's own cell, if any (a co-located light —
 	 * see `MapController.moveToken`'s light-passthrough exception), else the player token's own light.
 	 * The "!" indicator itself isn't triggered from here at all — see `tokenCanInteract`/`drawTokens`,
@@ -1829,7 +1862,11 @@ export class MapCanvas {
 		this.colorRegionWallsRunning = true;
 		try {
 			const activeLayer = this.controller.getActiveLayer();
-			const result = await detectColorRegionWalls(this.app, this.controller.getData(), activeLayer, this.controller.wallDrawBlockerType, world);
+			const result = await detectColorRegionWalls(this.app, this.controller.getData(), activeLayer, this.controller.wallDrawBlockerType, world, {
+				colorTolerancePercent: this.controller.wallBucketColorTolerancePercent,
+				wallFailFraction: this.controller.wallBucketWallFailFraction,
+				pixelReach: this.controller.wallBucketPixelReach,
+			});
 			if (!result) {
 				new Notice("Impossible de délimiter une zone à cet endroit (couleur hors image, ou zone transparente).");
 				return;
@@ -2051,6 +2088,9 @@ export class MapCanvas {
 		for (const id of Array.from(this.bgImages.keys())) {
 			if (!layerIds.has(id)) this.bgImages.delete(id);
 		}
+		for (const id of Array.from(this.bgPixelSources.keys())) {
+			if (!layerIds.has(id)) this.bgPixelSources.delete(id);
+		}
 		for (const layer of data.layers) {
 			if (!layer.background) {
 				this.bgImages.delete(layer.id);
@@ -2067,6 +2107,129 @@ export class MapCanvas {
 			};
 			img.src = this.app.vault.adapter.getResourcePath(layer.background.path);
 		}
+	}
+
+	// ---- "Seau à murs" color magnifier ----
+
+	/**
+	 * Lazily redraws `bgImages`' loaded `<img>` for `layer` onto an offscreen `<canvas>` so its pixels
+	 * become readable via `getImageData` (an `<img>` element itself has no pixel-read API), and caches
+	 * that canvas per layer — same "reload only when the path actually changes" convention as
+	 * `ensureBackgroundsLoaded` uses for `bgImages` itself. `null` while the layer has no background or
+	 * its image hasn't finished loading yet.
+	 */
+	private getBackgroundPixelSource(layer: Layer): { ctx: CanvasRenderingContext2D; width: number; height: number } | null {
+		const entry = this.bgImages.get(layer.id);
+		if (!entry?.img) return null;
+		const cached = this.bgPixelSources.get(layer.id);
+		if (cached && cached.path === entry.path) return { ctx: cached.ctx, width: cached.canvas.width, height: cached.canvas.height };
+		const canvas = document.createElement("canvas");
+		canvas.width = entry.img.naturalWidth;
+		canvas.height = entry.img.naturalHeight;
+		// Pixels are read back on (almost) every pointer move while the bucket tool is armed —
+		// `willReadFrequently` asks the browser to keep this context on a CPU-backed buffer instead of
+		// re-downloading from the GPU on every `getImageData` call.
+		const ctx = canvas.getContext("2d", { willReadFrequently: true });
+		if (!ctx) return null;
+		ctx.drawImage(entry.img, 0, 0);
+		this.bgPixelSources.set(layer.id, { path: entry.path, canvas, ctx });
+		return { ctx, width: canvas.width, height: canvas.height };
+	}
+
+	/** Creates (once) and returns the magnifier's DOM: a small `position: absolute` panel — a pixel-zoom `<canvas>` over a swatch+hex label — living directly in `container` alongside the map `<canvas>` itself, so it can float over it untouched by the map's own pan/zoom transform. */
+	private ensureMagnifierEls(): { wrapperEl: HTMLDivElement; canvasEl: HTMLCanvasElement; swatchEl: HTMLSpanElement; hexEl: HTMLSpanElement } {
+		if (!this.magnifierEl) {
+			this.magnifierEl = this.container.createDiv({ cls: "map-manager-magnifier" });
+			const canvasEl = this.magnifierEl.createEl("canvas", { cls: "map-manager-magnifier-canvas" });
+			canvasEl.width = MAGNIFIER_SIZE_PX;
+			canvasEl.height = MAGNIFIER_SIZE_PX;
+			this.magnifierCanvas = canvasEl;
+			const label = this.magnifierEl.createDiv({ cls: "map-manager-magnifier-label" });
+			this.magnifierSwatchEl = label.createSpan({ cls: "map-manager-magnifier-swatch" });
+			this.magnifierHexEl = label.createSpan({ cls: "map-manager-magnifier-hex" });
+		}
+		// Non-null by construction right above — `!`-asserted rather than re-checked since all four
+		// fields are always set together.
+		return { wrapperEl: this.magnifierEl, canvasEl: this.magnifierCanvas!, swatchEl: this.magnifierSwatchEl!, hexEl: this.magnifierHexEl! };
+	}
+
+	private hideColorMagnifier(): void {
+		this.magnifierEl?.toggleClass("is-visible", false);
+	}
+
+	/**
+	 * "Seau à murs": repaints and repositions the magnifier loupe next to the cursor at canvas point
+	 * `(px, py)`, zoomed into the active layer's background image around the pixel under it — the exact
+	 * pixel `detectColorRegionWalls` would sample as the flood fill's seed color if clicked right now
+	 * (see its own `worldToImage`, mirrored here). Hides the loupe instead whenever there's nothing
+	 * sensible to show: no background on the active layer, its image not loaded yet, or the cursor
+	 * currently over empty space outside the image bounds.
+	 */
+	private updateColorMagnifier(px: number, py: number): void {
+		const layer = this.controller.getActiveLayer();
+		const bg = layer.background;
+		const source = bg ? this.getBackgroundPixelSource(layer) : null;
+		if (!bg || !source) {
+			this.hideColorMagnifier();
+			return;
+		}
+
+		const cellSize = this.hit.effectiveCellSize();
+		const w = source.width * bg.scale;
+		const h = source.height * bg.scale;
+		// Same world-space origin convention as `detectColorRegionWalls`/`drawBackgrounds`.
+		const originX = bg.offsetX * cellSize - w / 2;
+		const originY = bg.offsetY * cellSize - h / 2;
+		const world = screenToWorld(px, py, this.transform);
+		const imgX = Math.floor((world.x - originX) / bg.scale);
+		const imgY = Math.floor((world.y - originY) / bg.scale);
+		if (imgX < 0 || imgY < 0 || imgX >= source.width || imgY >= source.height) {
+			this.hideColorMagnifier();
+			return;
+		}
+
+		const half = (MAGNIFIER_SOURCE_PIXELS - 1) / 2;
+		const patch = source.ctx.getImageData(imgX - half, imgY - half, MAGNIFIER_SOURCE_PIXELS, MAGNIFIER_SOURCE_PIXELS);
+		const scratch = this.magnifierScratch ?? (this.magnifierScratch = document.createElement("canvas"));
+		scratch.width = MAGNIFIER_SOURCE_PIXELS;
+		scratch.height = MAGNIFIER_SOURCE_PIXELS;
+		const scratchCtx = scratch.getContext("2d");
+		if (!scratchCtx) return;
+		scratchCtx.putImageData(patch, 0, 0);
+
+		const { wrapperEl, canvasEl, swatchEl, hexEl } = this.ensureMagnifierEls();
+		const mctx = canvasEl.getContext("2d");
+		if (mctx) {
+			mctx.imageSmoothingEnabled = false;
+			mctx.clearRect(0, 0, MAGNIFIER_SIZE_PX, MAGNIFIER_SIZE_PX);
+			mctx.drawImage(scratch, 0, 0, MAGNIFIER_SOURCE_PIXELS, MAGNIFIER_SOURCE_PIXELS, 0, 0, MAGNIFIER_SIZE_PX, MAGNIFIER_SIZE_PX);
+			// Outlines the exact center pixel — a light-over-dark double stroke so it stays visible
+			// against any underlying color, same trick as the selected-token border elsewhere.
+			const cellPx = MAGNIFIER_SIZE_PX / MAGNIFIER_SOURCE_PIXELS;
+			mctx.strokeStyle = "#000000";
+			mctx.lineWidth = 3;
+			mctx.strokeRect(half * cellPx + 0.5, half * cellPx + 0.5, cellPx - 1, cellPx - 1);
+			mctx.strokeStyle = "#ffffff";
+			mctx.lineWidth = 1;
+			mctx.strokeRect(half * cellPx + 0.5, half * cellPx + 0.5, cellPx - 1, cellPx - 1);
+		}
+
+		const d = patch.data;
+		const ci = (half * MAGNIFIER_SOURCE_PIXELS + half) * 4;
+		const hex = rgbToHex([d[ci] ?? 0, d[ci + 1] ?? 0, d[ci + 2] ?? 0]);
+		swatchEl.style.backgroundColor = hex;
+		hexEl.setText(hex);
+
+		const containerW = this.container.clientWidth;
+		const containerH = this.container.clientHeight;
+		const labelH = 28; // approx. label row height, kept out of the layout-measuring hot path below
+		let left = px + MAGNIFIER_OFFSET_PX;
+		let top = py + MAGNIFIER_OFFSET_PX;
+		if (left + MAGNIFIER_SIZE_PX > containerW) left = px - MAGNIFIER_OFFSET_PX - MAGNIFIER_SIZE_PX;
+		if (top + MAGNIFIER_SIZE_PX + labelH > containerH) top = py - MAGNIFIER_OFFSET_PX - MAGNIFIER_SIZE_PX - labelH;
+		wrapperEl.style.left = `${Math.max(0, left)}px`;
+		wrapperEl.style.top = `${Math.max(0, top)}px`;
+		wrapperEl.toggleClass("is-visible", true);
 	}
 
 	// ---- Token images (custom image per token, overrides the icon once loaded) ----
@@ -2119,6 +2282,12 @@ export class MapCanvas {
 		this.canvas.toggleClass("is-brush-tool", tool === "brush");
 		this.canvas.toggleClass("is-fill-tool", tool === "fill");
 		this.canvas.toggleClass("is-wall-tool", tool === "wall");
+
+		// Covers every way the bucket tool can turn off without a pointer move to catch it (toolbar
+		// button, right-click cancel, switching tools/mode) — `onPointerMove` is what keeps it positioned
+		// and up to date while it stays armed, but everything that disarms it goes through `notify()` →
+		// `render()`, not a pointer event.
+		if (!(tool === "wall" && this.controller.pendingWallBucket)) this.hideColorMagnifier();
 	}
 
 	render(): void {
