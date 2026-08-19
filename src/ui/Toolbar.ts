@@ -1,5 +1,5 @@
 import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
-import { MapController } from "../controller/MapController";
+import { MapController, PLAYER_MIRROR_CAMERA_MODES, PLAYER_MIRROR_CAMERA_MODE_LABELS, PlayerMirrorCameraMode } from "../controller/MapController";
 import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
 import { MapManagerSettings } from "../settings/types";
@@ -151,9 +151,10 @@ export class Toolbar {
 	 * open (`actions.openPlayerWindow`), same as before. Once one is open, clicking instead opens a
 	 * dropdown of live options for it — opening a second window isn't useful, so the click's meaning
 	 * changes rather than adding a separate menu button. See `MapController.showEntityVisionToPlayers`
-	 * (hidden by default), `playerMirrorFogEnabled` (enabled by default), and `actions.publish`
-	 * (regrouped here rather than its own standalone toolbar button — a GM publishing a snapshot is
-	 * something done right around launching the player-facing view, not before).
+	 * (hidden by default), `playerMirrorFogEnabled` (enabled by default), `playerMirrorCameraMode`
+	 * (segmented control at the top — `renderCameraModeRow`, defaults to "mirror"), and
+	 * `actions.publish` (regrouped here rather than its own standalone toolbar button — a GM publishing
+	 * a snapshot is something done right around launching the player-facing view, not before).
 	 */
 	private renderPlayerWindowControl(container: HTMLElement): void {
 		const isOpen = this.actions.isPlayerWindowOpen();
@@ -185,6 +186,8 @@ export class Toolbar {
 		const panel = wrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-player-window-dropdown-panel" });
 		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Vue joueur" });
 
+		this.renderCameraModeRow(panel);
+
 		const visionBtn = panel.createEl("button", {
 			text: this.controller.showEntityVisionToPlayers ? "Masquer la vision des pions entités" : "Afficher la vision des pions entités",
 			cls: "map-manager-btn",
@@ -202,6 +205,22 @@ export class Toolbar {
 		const publishBtn = panel.createEl("button", { text: "Publier la vue", cls: "map-manager-btn" });
 		setTooltip(publishBtn, "Met à jour le .json pour le site externe.");
 		publishBtn.onclick = () => this.actions.publish();
+	}
+
+	/** Segmented control picking `MapController.playerMirrorCameraMode` — see `PlayerMirrorCameraMode`. */
+	private renderCameraModeRow(panel: HTMLElement): void {
+		const row = panel.createDiv({ cls: "map-manager-camera-mode-row" });
+		const tooltips: Record<PlayerMirrorCameraMode, string> = {
+			mirror: "La caméra de la vue joueur suit celle de cette fenêtre.",
+			freeze: "La caméra de la vue joueur ne bouge plus ; cette fenêtre peut bouger librement sans l'influencer.",
+			center: "La caméra de la vue joueur est indépendante et cadre automatiquement les pions joueurs, en zoomant selon leurs déplacements.",
+		};
+		for (const mode of PLAYER_MIRROR_CAMERA_MODES) {
+			const btn = row.createEl("button", { text: PLAYER_MIRROR_CAMERA_MODE_LABELS[mode], cls: "map-manager-btn" });
+			btn.toggleClass("is-active", this.controller.playerMirrorCameraMode === mode);
+			setTooltip(btn, tooltips[mode]);
+			btn.onclick = () => this.controller.setPlayerMirrorCameraMode(mode);
+		}
 	}
 
 	/**

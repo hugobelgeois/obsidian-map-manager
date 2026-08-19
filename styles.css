@@ -555,6 +555,19 @@
 	width: 220px;
 }
 
+.map-manager-camera-mode-row {
+	display: flex;
+	flex-direction: row;
+	gap: 0.3em;
+}
+
+.map-manager-camera-mode-row .map-manager-btn {
+	flex: 1;
+	padding: 0.3em 0.2em;
+	font-size: 0.78em;
+	white-space: nowrap;
+}
+
 .map-manager-layers-list {
 	display: flex;
 	flex-direction: column;

@@ -21,6 +21,25 @@ export type EditTool = "none" | "brush" | "fill" | "wall";
  */
 export type MassSelectionKind = "token" | "wallSegment" | "stamp";
 
+/**
+ * How a player-mirror window's camera behaves relative to the GM's own source window — see the
+ * player-window dropdown in `Toolbar` and `MapPlayerMirrorView.applyCameraForMode`. "mirror" (the
+ * long-standing default) keeps following the source's own pan/zoom live. "freeze" stops touching the
+ * camera at all once selected, so the GM's own window can keep panning/zooming around without
+ * dragging the player-facing one along with it. "center" ignores the source's camera entirely and
+ * instead keeps every player token framed, zooming/panning to fit them as they move — see
+ * `MapCanvas.computeFitCamera`.
+ */
+export type PlayerMirrorCameraMode = "mirror" | "freeze" | "center";
+
+export const PLAYER_MIRROR_CAMERA_MODES: PlayerMirrorCameraMode[] = ["mirror", "freeze", "center"];
+
+export const PLAYER_MIRROR_CAMERA_MODE_LABELS: Record<PlayerMirrorCameraMode, string> = {
+	mirror: "Miroir MJ",
+	freeze: "Figer",
+	center: "Centrer",
+};
+
 const MAX_HISTORY = 100;
 
 /**
@@ -45,6 +64,8 @@ export class MapController {
 	showEntityVisionToPlayers = false;
 	/** Whether fog renders on a player mirror window — independent of `data.fogEnabled` (which only governs the GM's own window/tab); a mirror otherwise always shows fog (see `MapCanvasOptions.forceFog`). Defaults on. Session-only, not persisted. See the player-window dropdown in `Toolbar`. */
 	playerMirrorFogEnabled = true;
+	/** Which camera behavior a player mirror window uses — see `PlayerMirrorCameraMode`. Defaults to "mirror" (the long-standing behavior). Session-only, not persisted. See the player-window dropdown in `Toolbar`. */
+	playerMirrorCameraMode: PlayerMirrorCameraMode = "mirror";
 	/**
 	 * Which InfoPanel tab is currently previewed for the selected token (by tab id) — shared on the
 	 * controller (rather than kept private to one InfoPanel instance) so a player mirror's InfoPanel
@@ -173,6 +194,12 @@ export class MapController {
 
 	togglePlayerMirrorFog(): void {
 		this.playerMirrorFogEnabled = !this.playerMirrorFogEnabled;
+		this.notify();
+	}
+
+	setPlayerMirrorCameraMode(mode: PlayerMirrorCameraMode): void {
+		if (this.playerMirrorCameraMode === mode) return;
+		this.playerMirrorCameraMode = mode;
 		this.notify();
 	}
 

@@ -46,6 +46,10 @@ const MIN_CELL_PIXELS = 12;
 const CELL_HOP_DURATION_MS = 180;
 /** How high (as a fraction of a cell's width) a "jump" hop arcs upward at its midpoint — see `currentHopPose`. */
 const CELL_HOP_HEIGHT_RATIO = 0.35;
+/** "Centrer" player-mirror camera mode (see `computeFitCamera`/`MapPlayerMirrorView`): the tightest player-token bounding box is padded by this factor so tokens don't sit flush against the viewport edges. */
+const CENTER_CAMERA_PADDING_RATIO = 1.4;
+/** "Centrer" player-mirror camera mode: minimum framed extent, in cells, so a single token (or a tight cluster) doesn't zoom in absurdly close. */
+const CENTER_CAMERA_MIN_CELLS = 6;
 
 /** Axial neighbor offsets (orientation-agnostic — pointy vs. flat only changes pixel<->hex conversion, not adjacency). */
 const HEX_NEIGHBOR_OFFSETS: Array<{ dq: number; dr: number }> = [
@@ -1348,6 +1352,34 @@ export class MapCanvas {
 	setMirrorCamera(view: { zoom: number; x: number; y: number }): void {
 		this.mirrorCamera = view;
 		this.render();
+	}
+
+	/**
+	 * "Centrer" player-mirror camera mode: a camera (world-space center + zoom, same shape as
+	 * `setMirrorCamera` expects) that fits every point in `points` inside this canvas's own current
+	 * viewport, padded by `CENTER_CAMERA_PADDING_RATIO` and never framing tighter than
+	 * `CENTER_CAMERA_MIN_CELLS`. Returns `null` if this canvas hasn't measured a real viewport size yet
+	 * (see `resize`) or `points` is empty (no player tokens on the map) — the caller should just leave
+	 * the camera as it was in either case. See `MapPlayerMirrorView.applyCameraForMode`.
+	 */
+	computeFitCamera(points: Point[]): { zoom: number; x: number; y: number } | null {
+		if (this.viewportW === 0 || this.viewportH === 0 || points.length === 0) return null;
+		let minX = Infinity;
+		let maxX = -Infinity;
+		let minY = Infinity;
+		let maxY = -Infinity;
+		for (const p of points) {
+			minX = Math.min(minX, p.x);
+			maxX = Math.max(maxX, p.x);
+			minY = Math.min(minY, p.y);
+			maxY = Math.max(maxY, p.y);
+		}
+		const data = this.controller.getData();
+		const minExtent = data.cellSize * CENTER_CAMERA_MIN_CELLS;
+		const w = Math.max(maxX - minX, minExtent) * CENTER_CAMERA_PADDING_RATIO;
+		const h = Math.max(maxY - minY, minExtent) * CENTER_CAMERA_PADDING_RATIO;
+		const zoom = clamp(Math.min(this.viewportW / w, this.viewportH / h), data.minZoom, data.maxZoom);
+		return { zoom, x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 	}
 
 	/**
