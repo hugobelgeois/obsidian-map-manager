@@ -399,12 +399,38 @@ export interface WallPoint {
 	y: number;
 }
 
+/**
+ * One wall's link to a clock, wired through `WallSegment.clockTrigger` — see `WallClockTrigger`.
+ * `delta` is signed: positive fills this many currently-empty wedges (in index order), negative
+ * unfills this many currently-filled wedges (from the end) — see `applyClockDelta`.
+ */
+export interface WallClockLink {
+	clockId: string;
+	delta: number;
+}
+
+/**
+ * Configures a `WallSegment` to roll a d20 and, on success, advance/reverse one or more `Clock`s —
+ * set via `MapController.updateWallSegmentClockTrigger`/`triggerWallClock`. Only ever actually rolled
+ * when a player forces a crossing of this segment via the gamepad's interact-to-pass action (see
+ * `wallPassableWithInteract` and `MapCanvas.handleGamepadMove`) — there's no other "interact with a
+ * wall" concept in this codebase, so a trigger on an `"opaque"`/`"see-through"` segment (never
+ * interact-crossable) is simply inert.
+ */
+export interface WallClockTrigger {
+	links: WallClockLink[];
+	/** 1-20. A roll >= this value does nothing; a roll below it applies every link. */
+	chance: number;
+}
+
 /** A vision-blocking line between two `WallPoint`s (by id, both on the same layer). */
 export interface WallSegment {
 	id: string;
 	aId: string;
 	bId: string;
 	blockerType: VisionBlockerType;
+	/** See `WallClockTrigger`'s own doc comment. Unset means this wall triggers nothing. */
+	clockTrigger?: WallClockTrigger;
 }
 
 export interface Layer {
@@ -420,8 +446,60 @@ export interface Layer {
 	wallSegments: WallSegment[];
 }
 
+/**
+ * One wedge of a `Clock` — see `Clock.segments`. No `filled` flag of its own any more: like a real
+ * clock face, wedges fill in a fixed order, so "how many are filled" is a single counter
+ * (`Clock.currentSegments`) rather than N independent booleans — a wedge's filled state is simply
+ * `index < clock.currentSegments`. Only its optional note link is per-wedge data.
+ */
+export interface ClockSegment {
+	/** Same "path" or "path#Heading" convention as `CellData.links` etc. */
+	link?: string;
+}
+
+/**
+ * A Blades-in-the-Dark-style progress tracker: a circle divided into `segments.length` wedges
+ * ("morceaux totaux"), of which the first `currentSegments` ("morceaux actuels") are filled — wedges
+ * can only ever be checked/unchecked in order, like a clock hand, never individually out of sequence
+ * (see `MapController.clickClockSegment`/`setClockProgress`). Each wedge can independently link to a
+ * note, shown in `InfoPanel`'s "Horloge" panel in chronological (index) order. `name` may be empty —
+ * `ClockBar` simply omits the name label for such a clock, rather than showing an empty box.
+ * `visibleToPlayers` (default `true` when unset) gates whether `ClockBar` shows it at all on the
+ * read-only "Vue joueur" mirror; the GM's own edit/embed windows always show every clock regardless,
+ * so it can still be managed. Map-level like `Token` (not tied to a layer/grid type), since the flag
+ * bar (`MapFileData.clocks`'s own array order = left-to-right display order) is meant to stay visible
+ * and constant across layer switches. Can also be wired to a `WallSegment` via `WallClockTrigger` so a
+ * player forcing their way through a door advances/reverses it automatically.
+ */
+export interface Clock {
+	id: string;
+	name: string;
+	segments: ClockSegment[];
+	/** How many of `segments`, from the start, count as filled — clamped to `[0, segments.length]`. */
+	currentSegments: number;
+	/** `false` hides this clock entirely on the player-facing "Vue joueur" mirror. Unset/`true` means shown. */
+	visibleToPlayers?: boolean;
+	/**
+	 * `false` hides just the name label on the "Vue joueur" mirror while the clock itself (its wedges)
+	 * stays visible there — independent of `visibleToPlayers`, which hides the whole clock. The GM's
+	 * own edit/embed windows always show the name regardless of this flag (there's no reason to hide it
+	 * from the GM); only `ClockBar`'s non-interactive (mirror) instance ever reads it. Unset/`true`
+	 * means shown, same "positive default" convention as `visibleToPlayers`.
+	 */
+	nameVisibleToPlayers?: boolean;
+}
+
+/**
+ * Applies a `WallClockTrigger` link's signed `delta` to `clock.currentSegments`, in place — `delta` is
+ * added (fills more wedges) or subtracted (unfills some), clamped to `[0, segments.length]`. A no-op
+ * for `delta === 0`.
+ */
+export function applyClockDelta(clock: Clock, delta: number): void {
+	clock.currentSegments = Math.min(clock.segments.length, Math.max(0, clock.currentSegments + delta));
+}
+
 export interface MapFileData {
-	version: 15;
+	version: 16;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -432,6 +510,8 @@ export interface MapFileData {
 	 * under whichever grid is active).
 	 */
 	tokens: Token[];
+	/** Map-level progress trackers — see `Clock`'s own doc comment. */
+	clocks: Clock[];
 	/** Per-map zoom range, editable in the toolbar. Clamped to [ABS_MIN_ZOOM, ABS_MAX_ZOOM]. */
 	minZoom: number;
 	maxZoom: number;
@@ -496,12 +576,13 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 15,
+		version: 16,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
 		activeLayerId: layer.id,
 		tokens: [],
+		clocks: [],
 		minZoom: clampZoomSetting(defaults.minZoom),
 		maxZoom: clampZoomSetting(defaults.maxZoom),
 		fogEnabled: false,
@@ -573,11 +654,26 @@ function parseBlockerType(value: unknown): VisionBlockerType | null {
 	return null;
 }
 
+function parseWallClockLink(value: unknown): WallClockLink | null {
+	if (!isRecord(value) || !isString(value.clockId) || typeof value.delta !== "number") return null;
+	return { clockId: value.clockId, delta: value.delta };
+}
+
+function parseWallClockTrigger(value: unknown): WallClockTrigger | undefined {
+	if (!isRecord(value) || typeof value.chance !== "number" || !Array.isArray(value.links)) return undefined;
+	const links = value.links.map(parseWallClockLink).filter((l): l is WallClockLink => l !== null);
+	return { links, chance: clampChance(value.chance) };
+}
+
+function clampChance(value: number): number {
+	return Math.min(20, Math.max(1, Math.round(value)));
+}
+
 function parseWallSegment(value: unknown): WallSegment | null {
 	if (!isRecord(value) || !isString(value.id) || !isString(value.aId) || !isString(value.bId)) return null;
 	const blockerType = parseBlockerType(value.blockerType);
 	if (blockerType === null) return null;
-	return { id: value.id, aId: value.aId, bId: value.bId, blockerType };
+	return { id: value.id, aId: value.aId, bId: value.bId, blockerType, clockTrigger: parseWallClockTrigger(value.clockTrigger) };
 }
 
 /** Drops segments referencing a point that doesn't exist among `points` (e.g. hand-edited/corrupted files). */
@@ -667,6 +763,56 @@ function isMarkerEmpty(marker: Marker): boolean {
 
 function purgeEmptyMarkers(markers: Marker[]): Marker[] {
 	return markers.filter((m) => !isMarkerEmpty(m));
+}
+
+function parseClockSegment(value: unknown): ClockSegment | null {
+	if (!isRecord(value)) return null;
+	return { link: isString(value.link) ? value.link : undefined };
+}
+
+function parseClockSegmentArray(raw: unknown): ClockSegment[] {
+	if (!Array.isArray(raw)) return [];
+	const segments = raw.map(parseClockSegment).filter((s): s is ClockSegment => s !== null);
+	// A clock with no wedges left has nothing to fill/link — same "at least one" floor
+	// `MapController.setClockTotalSegments` enforces going forward.
+	return segments.length > 0 ? segments : [{}];
+}
+
+/**
+ * Pre-`currentSegments` clocks (built and possibly filled-in during this feature's first draft) stored
+ * each wedge's own `filled: boolean` instead of one counter — recovers a sensible `currentSegments`
+ * from that shape (however many wedges have `filled: true`) rather than silently resetting an
+ * already-in-progress clock back to 0 the first time such a file is reopened.
+ */
+function legacyFilledCount(raw: unknown): number {
+	if (!Array.isArray(raw)) return 0;
+	let count = 0;
+	for (const item of raw) {
+		if (isRecord(item) && item.filled === true) count++;
+	}
+	return count;
+}
+
+function parseClock(value: unknown): Clock | null {
+	if (!isRecord(value) || !isString(value.id)) return null;
+	const segments = parseClockSegmentArray(value.segments);
+	const currentSegments =
+		typeof value.currentSegments === "number"
+			? Math.min(segments.length, Math.max(0, Math.round(value.currentSegments)))
+			: Math.min(segments.length, legacyFilledCount(value.segments));
+	return {
+		id: value.id,
+		name: isString(value.name) ? value.name : "",
+		segments,
+		currentSegments,
+		visibleToPlayers: typeof value.visibleToPlayers === "boolean" ? value.visibleToPlayers : undefined,
+		nameVisibleToPlayers: typeof value.nameVisibleToPlayers === "boolean" ? value.nameVisibleToPlayers : undefined,
+	};
+}
+
+function parseClockArray(raw: unknown): Clock[] {
+	if (!Array.isArray(raw)) return [];
+	return raw.map(parseClock).filter((c): c is Clock => c !== null);
 }
 
 /** v4 (per-layer) and v5 (map-level) both stored tokens as one array per grid type. */
@@ -765,6 +911,9 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 		tokens = parseTokenArray(p.tokens);
 	}
 
+	// Clocks are new in v16; pre-v16 files simply have none yet.
+	const clocks = version >= 16 ? parseClockArray(p.clocks) : [];
+
 	const activeLayerId = isString(p.activeLayerId) && layers.some((l) => l.id === p.activeLayerId) ? p.activeLayerId : (layers[0]?.id ?? "");
 
 	const minZoom = clampZoomSetting(typeof p.minZoom === "number" ? p.minZoom : defaults.minZoom);
@@ -777,7 +926,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 15, gridType, cellSize, layers, activeLayerId, tokens, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
+	return { version: 16, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

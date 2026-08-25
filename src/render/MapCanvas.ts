@@ -1624,6 +1624,28 @@ export class MapCanvas {
 		return this.wallCrossing(fromKey, toKey, wallSegments) !== "clear";
 	}
 
+	/**
+	 * Ids of every interact-crossable (`wallPassableWithInteract`) segment actually crossed between
+	 * `fromKey`/`toKey`'s cell centers — the same intersection test `wallCrossing` runs, kept as its
+	 * own method (rather than folded into `wallCrossing`'s own return value) so `edgeBlocked`/
+	 * `tokenCanInteract` don't need to change shape for a detail only `handleGamepadMove` cares about:
+	 * which specific `WallSegment`(s) to roll `MapController.triggerWallClock` against once a forced
+	 * crossing actually succeeds. Only meaningful when `wallCrossing` already returned `"interact"` for
+	 * this same pair (a `"blocked"` crossing may include non-interact-crossable segments too, which
+	 * this deliberately excludes).
+	 */
+	private interactCrossedSegmentIds(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): string[] {
+		const a = this.hit.cellCenter(fromKey);
+		const b = this.hit.cellCenter(toKey);
+		const ids: string[] = [];
+		for (const seg of wallSegments) {
+			if (!wallPassableWithInteract(seg.type)) continue;
+			if (segmentIntersection(a, b, seg.a, seg.b) === null) continue;
+			ids.push(seg.id);
+		}
+		return ids;
+	}
+
 	/** Smallest angular distance between two degree angles (0..180), direction-agnostic — used by `nearestNeighborKey` to find whichever grid direction a gamepad's held angle points closest to. */
 	private static angularDistanceDeg(a: number, b: number): number {
 		const diff = Math.abs(a - b) % 360;
@@ -1683,10 +1705,16 @@ export class MapCanvas {
 		if (!token?.cellKey) return;
 		const target = this.nearestNeighborKey(token.cellKey, inputAngleDeg);
 		if (!target) return;
-		const crossing = this.wallCrossing(token.cellKey, target.key, this.resolveWallSegments());
+		const fromKey = token.cellKey;
+		const wallSegments = this.resolveWallSegments();
+		const crossing = this.wallCrossing(fromKey, target.key, wallSegments);
 		if (crossing === "blocked") return;
 		if (crossing === "interact" && !interactHeld) return;
-		const from = this.hit.cellCenter(token.cellKey);
+		// Resolved before `moveToken` mutates `token.cellKey` — geometry only depends on `fromKey`/
+		// `target.key`, both already captured — and only actually rolled once the crossing below
+		// succeeds (see the loop at the bottom of this method).
+		const triggeredSegmentIds = crossing === "interact" ? this.interactCrossedSegmentIds(fromKey, target.key, wallSegments) : [];
+		const from = this.hit.cellCenter(fromKey);
 		const to = this.hit.cellCenter(target.key);
 		// Start the hop's render override on this canvas *and* broadcast it to any player-mirror window
 		// *before* `moveToken` — `MapController.update` calls its listeners synchronously, and that
@@ -1701,6 +1729,12 @@ export class MapCanvas {
 		if (!this.controller.moveToken(tokenId, target.key, target.angleDeg)) {
 			this.cellHops.delete(tokenId);
 			return;
+		}
+		// The crossing actually succeeded: this is "a player interacting with the wall" — roll every
+		// crossed segment's clock trigger, if any (see `MapController.triggerWallClock`).
+		for (const segmentId of triggeredSegmentIds) {
+			const result = this.controller.triggerWallClock(segmentId);
+			if (result?.fired) new Notice("Une horloge a été déclenchée.");
 		}
 	}
 

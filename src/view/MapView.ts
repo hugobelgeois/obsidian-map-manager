@@ -9,6 +9,7 @@ import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWind
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas, PathAnimationRoute } from "../render/MapCanvas";
+import { ClockBar } from "../ui/ClockBar";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
 
@@ -17,6 +18,7 @@ export const VIEW_TYPE_MAP = "map-manager-map-view";
 export class MapView extends TextFileView {
 	private controller: MapController | null = null;
 	private canvasComp: MapCanvas | null = null;
+	private clockBarComp: ClockBar | null = null;
 	private toolbarComp: Toolbar | null = null;
 	private infoPanelComp: InfoPanel | null = null;
 	private unsubscribeAutoPublish: (() => void) | null = null;
@@ -127,6 +129,7 @@ export class MapView extends TextFileView {
 				for (const cb of this.aimListeners) cb(tokenId, angleDeg);
 			},
 		});
+		this.clockBarComp = new ClockBar(canvasHost, this.controller, { interactive: true });
 		if (this.file) {
 			this.unregisterMirror = registerMirrorSource(this.file.path, {
 				controller: this.controller,
@@ -201,12 +204,14 @@ export class MapView extends TextFileView {
 
 	private destroyComponents(): void {
 		this.canvasComp?.destroy();
+		this.clockBarComp?.destroy();
 		this.toolbarComp?.destroy();
 		this.infoPanelComp?.destroy();
 		this.unsubscribeAutoPublish?.();
 		this.unsubscribeSettings?.();
 		this.unregisterMirror?.();
 		this.canvasComp = null;
+		this.clockBarComp = null;
 		this.toolbarComp = null;
 		this.infoPanelComp = null;
 		this.unsubscribeAutoPublish = null;

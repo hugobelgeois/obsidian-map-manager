@@ -9,6 +9,7 @@ import { isPlayerWindowOpen, openPlayerWindow } from "../platform/openPlayerWind
 import { wireAutoPublish } from "../platform/autoPublish";
 import { publishPublicSnapshot } from "../platform/publishPublicSnapshot";
 import { MapCanvas, PathAnimationRoute } from "../render/MapCanvas";
+import { ClockBar } from "../ui/ClockBar";
 import { InfoPanel } from "../ui/InfoPanel";
 import { Toolbar } from "../ui/Toolbar";
 
@@ -132,6 +133,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 		},
 	});
 	canvasRef = canvas;
+	const clockBar = new ClockBar(canvasHost, controller, { interactive: true });
 	const scrollListeners = new Set<(scrollTop: number) => void>();
 	const unregisterMirror = registerMirrorSource(file.path, {
 		controller,
@@ -181,6 +183,7 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	ctx.addChild(
 		new MapEmbedChild(host, () => {
 			canvas.destroy();
+			clockBar.destroy();
 			toolbar.destroy();
 			infoPanel.destroy();
 			unsubscribeAutoPublish();

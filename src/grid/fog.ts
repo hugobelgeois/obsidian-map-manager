@@ -25,6 +25,8 @@ export const FOG_RAY_COUNT = 180;
 export const FOG_BUCKET_SCALE = 1.25;
 /** A `WallSegment` with its two endpoints resolved to world coordinates, for ray casting/flood-fill. */
 export interface ResolvedWallSegment {
+	/** The originating `WallSegment.id` — lets a caller (e.g. `MapCanvas.interactCrossedSegmentIds`) look the segment itself back up (its `clockTrigger`, in particular) once geometry alone has picked it out. */
+	id: string;
 	a: Point;
 	b: Point;
 	type: VisionBlockerType;
@@ -159,7 +161,7 @@ export function resolveWallSegments(data: MapFileData): ResolvedWallSegment[] {
 			const a = pointsById.get(segment.aId);
 			const b = pointsById.get(segment.bId);
 			if (!a || !b) continue;
-			result.push({ a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y }, type: segment.blockerType });
+			result.push({ id: segment.id, a: { x: a.x, y: a.y }, b: { x: b.x, y: b.y }, type: segment.blockerType });
 		}
 	}
 	return result;

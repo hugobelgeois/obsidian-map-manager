@@ -4,6 +4,7 @@ import { MapController, PlayerMirrorCameraMode } from "../controller/MapControll
 import { footprintCenter } from "../grid/fog";
 import { getMirrorSource, MirrorSource } from "../platform/mirrorRegistry";
 import { MapCanvas } from "../render/MapCanvas";
+import { ClockBar } from "../ui/ClockBar";
 import { InfoPanel } from "../ui/InfoPanel";
 
 export const VIEW_TYPE_MAP_PLAYER_MIRROR = "map-manager-player-mirror-view";
@@ -37,6 +38,7 @@ export class MapPlayerMirrorView extends ItemView {
 	private source: MirrorSource | null = null;
 	private controller: MapController | null = null;
 	private canvasComp: MapCanvas | null = null;
+	private clockBarComp: ClockBar | null = null;
 	private infoPanelComp: InfoPanel | null = null;
 	private unsubscribeViewport: (() => void) | null = null;
 	private unsubscribeController: (() => void) | null = null;
@@ -105,6 +107,7 @@ export class MapPlayerMirrorView extends ItemView {
 			isMirror: true,
 			forceFog: true,
 		});
+		this.clockBarComp = new ClockBar(canvasHost, source.controller, { interactive: false });
 		this.lastAppliedCameraMode = null;
 		this.centeredDataVersion = null;
 		this.applyCameraForMode();
@@ -181,6 +184,7 @@ export class MapPlayerMirrorView extends ItemView {
 
 	private destroyComponents(): void {
 		this.canvasComp?.destroy();
+		this.clockBarComp?.destroy();
 		this.infoPanelComp?.destroy();
 		this.unsubscribeViewport?.();
 		this.unsubscribeController?.();
@@ -190,6 +194,7 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribeCellHop?.();
 		this.unsubscribeAim?.();
 		this.canvasComp = null;
+		this.clockBarComp = null;
 		this.infoPanelComp = null;
 		this.unsubscribeViewport = null;
 		this.unsubscribeController = null;

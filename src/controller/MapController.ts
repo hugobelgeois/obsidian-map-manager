@@ -1,4 +1,19 @@
-import { CellData, Marker, VisionBlockerType, WallPoint, WallSegment, createLayer, generateLocalId, getActiveLayer, Layer, MapFileData, Token } from "../data/mapData";
+import {
+	CellData,
+	Clock,
+	Marker,
+	VisionBlockerType,
+	WallClockTrigger,
+	WallPoint,
+	WallSegment,
+	applyClockDelta,
+	createLayer,
+	generateLocalId,
+	getActiveLayer,
+	Layer,
+	MapFileData,
+	Token,
+} from "../data/mapData";
 import { footprintCellKeys, footprintCenter, occupiedFootprintCells, worldPointToCellKey } from "../grid/fog";
 import { WallShapeKind, clamp, wallShapeCorners } from "../grid/gridMath";
 import { addWallSegment, optimizeWallNetwork } from "../grid/wallOptimize";
@@ -53,6 +68,8 @@ export class MapController {
 	selectedWallPointId: string | null = null;
 	/** A single wall *segment* selected for editing (as opposed to `selectedWallPointId`, one of its endpoints) — see `selectWallSegment`. */
 	selectedWallSegmentId: string | null = null;
+	/** A `Clock` selected for editing (name/wedges) — see `selectClock`. Set from `ClockBar`'s name label, or right back after `addClock`. */
+	selectedClockId: string | null = null;
 	mode: MapMode;
 	/** Whether the grid/cell overlay is shown in view mode (edit mode always shows it). Session-only, not persisted. */
 	showCells = true;
@@ -319,7 +336,8 @@ export class MapController {
 			this.selectedTokenId === null &&
 			this.selectedMarkerId === null &&
 			this.selectedWallPointId === null &&
-			this.selectedWallSegmentId === null
+			this.selectedWallSegmentId === null &&
+			this.selectedClockId === null
 		)
 			return;
 		this.selectedCellKey = key;
@@ -327,6 +345,7 @@ export class MapController {
 		this.selectedMarkerId = null;
 		this.selectedWallPointId = null;
 		this.selectedWallSegmentId = null;
+		this.selectedClockId = null;
 		this.resetInfoTabState();
 		this.notify();
 	}
@@ -337,7 +356,8 @@ export class MapController {
 			this.selectedCellKey === null &&
 			this.selectedMarkerId === null &&
 			this.selectedWallPointId === null &&
-			this.selectedWallSegmentId === null
+			this.selectedWallSegmentId === null &&
+			this.selectedClockId === null
 		)
 			return;
 		this.selectedTokenId = tokenId;
@@ -345,6 +365,7 @@ export class MapController {
 		this.selectedMarkerId = null;
 		this.selectedWallPointId = null;
 		this.selectedWallSegmentId = null;
+		this.selectedClockId = null;
 		this.resetInfoTabState();
 		this.notify();
 	}
@@ -355,7 +376,8 @@ export class MapController {
 			this.selectedCellKey === null &&
 			this.selectedTokenId === null &&
 			this.selectedWallPointId === null &&
-			this.selectedWallSegmentId === null
+			this.selectedWallSegmentId === null &&
+			this.selectedClockId === null
 		)
 			return;
 		this.selectedMarkerId = markerId;
@@ -363,6 +385,7 @@ export class MapController {
 		this.selectedTokenId = null;
 		this.selectedWallPointId = null;
 		this.selectedWallSegmentId = null;
+		this.selectedClockId = null;
 		this.resetInfoTabState();
 		this.notify();
 	}
@@ -373,7 +396,8 @@ export class MapController {
 			this.selectedCellKey === null &&
 			this.selectedTokenId === null &&
 			this.selectedMarkerId === null &&
-			this.selectedWallSegmentId === null
+			this.selectedWallSegmentId === null &&
+			this.selectedClockId === null
 		)
 			return;
 		this.selectedWallPointId = pointId;
@@ -381,6 +405,7 @@ export class MapController {
 		this.selectedTokenId = null;
 		this.selectedMarkerId = null;
 		this.selectedWallSegmentId = null;
+		this.selectedClockId = null;
 		this.resetInfoTabState();
 		this.notify();
 	}
@@ -392,7 +417,8 @@ export class MapController {
 			this.selectedCellKey === null &&
 			this.selectedTokenId === null &&
 			this.selectedMarkerId === null &&
-			this.selectedWallPointId === null
+			this.selectedWallPointId === null &&
+			this.selectedClockId === null
 		)
 			return;
 		this.selectedWallSegmentId = segmentId;
@@ -400,6 +426,28 @@ export class MapController {
 		this.selectedTokenId = null;
 		this.selectedMarkerId = null;
 		this.selectedWallPointId = null;
+		this.selectedClockId = null;
+		this.resetInfoTabState();
+		this.notify();
+	}
+
+	/** Selects a `Clock` for editing (name/wedges) — see `ClockBar`'s name-label click and `addClock`. */
+	selectClock(clockId: string | null): void {
+		if (
+			this.selectedClockId === clockId &&
+			this.selectedCellKey === null &&
+			this.selectedTokenId === null &&
+			this.selectedMarkerId === null &&
+			this.selectedWallPointId === null &&
+			this.selectedWallSegmentId === null
+		)
+			return;
+		this.selectedClockId = clockId;
+		this.selectedCellKey = null;
+		this.selectedTokenId = null;
+		this.selectedMarkerId = null;
+		this.selectedWallPointId = null;
+		this.selectedWallSegmentId = null;
 		this.resetInfoTabState();
 		this.notify();
 	}
@@ -427,6 +475,15 @@ export class MapController {
 	getSelectedWallSegment(): WallSegment | undefined {
 		if (!this.selectedWallSegmentId) return undefined;
 		return this.findWallSegment(this.selectedWallSegmentId);
+	}
+
+	getSelectedClock(): Clock | undefined {
+		if (!this.selectedClockId) return undefined;
+		return this.findClock(this.selectedClockId);
+	}
+
+	findClock(clockId: string): Clock | undefined {
+		return this.data.clocks.find((c) => c.id === clockId);
 	}
 
 	findToken(tokenId: string): Token | undefined {
@@ -1364,6 +1421,138 @@ export class MapController {
 			for (const layer of data.layers) layer.markers = layer.markers.filter((m) => m.id !== markerId);
 		});
 		if (this.selectedMarkerId === markerId) this.selectMarker(null);
+	}
+
+	// ---- Clocks (map-level progress trackers — see `Clock`'s own doc comment) ----
+
+	/** Creates a new, empty 4-wedge clock and selects it, ready for the InfoPanel's "Horloge" panel to rename/reshape — see `ClockBar`'s "+" button. */
+	addClock(): Clock {
+		const clock: Clock = { id: generateLocalId("clock"), name: "Horloge", segments: [{}, {}, {}, {}], currentSegments: 0 };
+		this.update((data) => {
+			data.clocks.push(clock);
+		});
+		this.selectClock(clock.id);
+		return clock;
+	}
+
+	updateClock(clockId: string, mutator: (clock: Clock) => void): void {
+		this.update((data) => {
+			const clock = data.clocks.find((c) => c.id === clockId);
+			if (clock) mutator(clock);
+		});
+	}
+
+	/** Deletes a clock outright, also sweeping every layer's wall segments so none keeps referencing it — same "don't leave a dangling reference behind" spirit as `unassignGamepadsForTokens`. */
+	removeClock(clockId: string): void {
+		this.update((data) => {
+			data.clocks = data.clocks.filter((c) => c.id !== clockId);
+			for (const layer of data.layers) {
+				for (const segment of layer.wallSegments) {
+					if (!segment.clockTrigger) continue;
+					segment.clockTrigger.links = segment.clockTrigger.links.filter((l) => l.clockId !== clockId);
+				}
+			}
+		});
+		if (this.selectedClockId === clockId) this.selectClock(null);
+	}
+
+	/** Sets `clock.currentSegments` directly (the InfoPanel's "morceaux actuels" number field), clamped to `[0, segments.length]`. */
+	setClockProgress(clockId: string, current: number): void {
+		this.updateClock(clockId, (clock) => {
+			clock.currentSegments = Math.min(clock.segments.length, Math.max(0, Math.round(current)));
+		});
+	}
+
+	/**
+	 * A single wedge click (`ClockBar`, or the InfoPanel's per-wedge row) — since wedges can only ever
+	 * fill/unfill in order (see `Clock`'s own doc comment), there's no per-wedge toggle any more: this
+	 * just sets the fill boundary at `index` — rewinding to `index` if that wedge is already filled
+	 * (unchecking it and everything after it), or advancing up to and including it if it's still empty.
+	 * Either way the result is always "the first N wedges are filled, the rest aren't", so this is the
+	 * *only* way `currentSegments` is ever changed from a click, letting a GM jump several steps at
+	 * once by clicking further ahead just as naturally as a single step by clicking the very next wedge.
+	 */
+	clickClockSegment(clockId: string, index: number): void {
+		const clock = this.findClock(clockId);
+		if (!clock) return;
+		this.setClockProgress(clockId, index < clock.currentSegments ? index : index + 1);
+	}
+
+	/**
+	 * Resizes a clock's wedge count ("morceaux totaux" in the InfoPanel) to `total`, clamped to at
+	 * least 1: growing appends empty (linkless) wedges; shrinking drops trailing ones (along with
+	 * whatever notes they were linked to). `currentSegments` is clamped down to fit if it now exceeds
+	 * the new total.
+	 */
+	setClockTotalSegments(clockId: string, total: number): void {
+		const clamped = Math.max(1, Math.round(total));
+		this.updateClock(clockId, (clock) => {
+			if (clamped > clock.segments.length) {
+				while (clock.segments.length < clamped) clock.segments.push({});
+			} else if (clamped < clock.segments.length) {
+				clock.segments.length = clamped;
+			}
+			clock.currentSegments = Math.min(clock.currentSegments, clamped);
+		});
+	}
+
+	/** Reorders a clock within `data.clocks` — that array's own order is the flag bar's left-to-right display order (mirrors `moveLayer`). */
+	moveClock(clockId: string, direction: -1 | 1): void {
+		this.update((data) => {
+			const index = data.clocks.findIndex((c) => c.id === clockId);
+			const target = index + direction;
+			if (index === -1 || target < 0 || target >= data.clocks.length) return;
+			const [clock] = data.clocks.splice(index, 1);
+			if (clock) data.clocks.splice(target, 0, clock);
+		});
+	}
+
+	/** Finds `segmentId` across every layer (like `setWallSegmentBlockerType`), lazily creating its `clockTrigger` (defaulting to no links, a 10-in-20 chance) before applying `mutator` — the InfoPanel's wall-segment clock-trigger editor. */
+	updateWallSegmentClockTrigger(segmentId: string, mutator: (trigger: WallClockTrigger) => void): void {
+		this.update((data) => {
+			for (const layer of data.layers) {
+				const segment = layer.wallSegments.find((s) => s.id === segmentId);
+				if (!segment) continue;
+				segment.clockTrigger ??= { links: [], chance: 10 };
+				mutator(segment.clockTrigger);
+				return;
+			}
+		});
+	}
+
+	/** Removes a wall segment's clock trigger entirely ("Retirer le déclencheur"). */
+	clearWallSegmentClockTrigger(segmentId: string): void {
+		this.update((data) => {
+			for (const layer of data.layers) {
+				const segment = layer.wallSegments.find((s) => s.id === segmentId);
+				if (segment) {
+					segment.clockTrigger = undefined;
+					return;
+				}
+			}
+		});
+	}
+
+	/**
+	 * Rolls a d20 against `segmentId`'s `clockTrigger.chance` and, on success, applies every linked
+	 * clock's `delta` (see `applyClockDelta`) — called from `MapCanvas.handleGamepadMove` exactly when
+	 * a player forces a crossing of this segment via the gamepad's interact-to-pass action. `null` if
+	 * the segment has no trigger configured (or the trigger links to nothing) — nothing to roll for.
+	 */
+	triggerWallClock(segmentId: string): { fired: boolean; roll: number } | null {
+		const trigger = this.findWallSegment(segmentId)?.clockTrigger;
+		if (!trigger || trigger.links.length === 0) return null;
+		const roll = 1 + Math.floor(Math.random() * 20);
+		const fired = roll < trigger.chance;
+		if (fired) {
+			this.update((data) => {
+				for (const link of trigger.links) {
+					const clock = data.clocks.find((c) => c.id === link.clockId);
+					if (clock) applyClockDelta(clock, link.delta);
+				}
+			});
+		}
+		return { fired, roll };
 	}
 
 	// ---- Fog of war ----

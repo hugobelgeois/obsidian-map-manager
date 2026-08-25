@@ -3,6 +3,7 @@ import { GamepadInfo, listConnectedGamepads } from "../controller/gamepadInput";
 import { MapController } from "../controller/MapController";
 import {
 	CellData,
+	Clock,
 	configuredLightRadius,
 	DEFAULT_EYE_TIER_ANGLES,
 	DEFAULT_SIDE_EYE_ANGLE,
@@ -25,6 +26,7 @@ import {
 	WallSegment,
 } from "../data/mapData";
 import { formatFrontmatterValue, stripFrontmatter } from "../data/noteFormatting";
+import { clamp } from "../grid/gridMath";
 import { resizeImageToSquare } from "../platform/resizeImage";
 import { MapManagerSettings, PLAYER_TEMPLATE_ID } from "../settings/types";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
@@ -261,6 +263,22 @@ export class InfoPanel {
 				this.renderPanelHeader("Segment de mur", () => this.controller.selectWallSegment(null), false);
 
 				this.renderWallSegmentPanel(found);
+				return;
+			}
+		}
+
+		if (this.controller.selectedClockId) {
+			const found = this.controller.findClock(this.controller.selectedClockId);
+			if (found) {
+				this.setOpen(true);
+				// No eye toggle: a clock is already always shown to players via `ClockBar` regardless of
+				// `showInfoToPlayers` — that flag/button only governs whether *this* InfoPanel selection
+				// mirrors onto the player window (see `renderPanelHeader`'s own doc comment), which is
+				// meaningless here since `MapPlayerMirrorView`'s `forPlayers` InfoPanel never shows a
+				// clock panel to begin with (see `renderPlayerPanel`).
+				this.renderPanelHeader("Horloge", () => this.controller.selectClock(null), false);
+
+				this.renderClockPanel(found);
 				return;
 			}
 		}
@@ -794,9 +812,186 @@ export class InfoPanel {
 		const hint = this.el.createDiv({ cls: "map-manager-infopanel-empty" });
 		hint.setText("Double-cliquez sur ce segment pour y ajouter un point et modifier sa forme.");
 
+		this.renderWallClockTriggerSection(segment);
+
 		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 		const deleteBtn = footer.createEl("button", { text: "Supprimer ce segment", cls: "map-manager-btn map-manager-btn-danger" });
 		deleteBtn.onclick = () => this.controller.removeWallSegment(segment.id);
+	}
+
+	/**
+	 * Wires a wall segment to one or more `Clock`s via `WallClockTrigger` — only ever actually rolled
+	 * when a player forces a crossing of this segment with the gamepad's interact-to-pass action (see
+	 * `MapCanvas.handleGamepadMove`/`MapController.triggerWallClock`), i.e. only for "Passage"/"Passage
+	 * vitré" walls (`WALL_BLOCKER_TYPE_OPTIONS`) — an "Opaque"/"Transparent" wall can never be crossed
+	 * at all, so a trigger configured there would simply never fire.
+	 */
+	private renderWallClockTriggerSection(segment: WallSegment): void {
+		const clocks = this.controller.getData().clocks;
+		const section = this.el.createDiv({ cls: "map-manager-field" });
+		section.createEl("label", { text: "Horloge(s) déclenchée(s) à l'interaction" });
+
+		const hint = section.createDiv({ cls: "map-manager-view-empty" });
+		hint.setText('Ne se déclenche que si un joueur force le passage (manette) sur un mur "passage" ou "passage vitré".');
+
+		if (clocks.length === 0) {
+			section.createDiv({ cls: "map-manager-view-empty", text: "Aucune horloge créée pour l'instant (voir la barre de drapeaux en haut de la carte)." });
+			return;
+		}
+
+		const trigger = segment.clockTrigger;
+
+		const chanceField = section.createDiv({ cls: "map-manager-field-inline" });
+		chanceField.createEl("label", { text: "Chance (1-20, jet ≥ ce chiffre = rien)" });
+		const chanceInput = chanceField.createEl("input", { type: "number" });
+		chanceInput.min = "1";
+		chanceInput.max = "20";
+		chanceInput.value = String(trigger?.chance ?? 10);
+		chanceInput.onchange = () => {
+			const v = clamp(parseInt(chanceInput.value, 10) || 1, 1, 20);
+			this.controller.updateWallSegmentClockTrigger(segment.id, (t) => (t.chance = v));
+		};
+
+		const list = section.createDiv({ cls: "map-manager-clock-trigger-list" });
+		for (const clock of clocks) {
+			const link = trigger?.links.find((l) => l.clockId === clock.id);
+			const row = list.createDiv({ cls: "map-manager-clock-trigger-row" });
+
+			const checkboxLabel = row.createEl("label", { cls: "map-manager-clock-trigger-checkbox" });
+			const checkbox = checkboxLabel.createEl("input", { type: "checkbox" });
+			checkbox.checked = !!link;
+			checkboxLabel.appendText(` ${clock.name || "Horloge"}`);
+
+			const deltaInput = row.createEl("input", { type: "number", cls: "map-manager-clock-trigger-delta" });
+			deltaInput.value = String(link?.delta ?? 1);
+			deltaInput.disabled = !link;
+			deltaInput.title = "Cases cochées (positif) ou décochées (négatif)";
+
+			checkbox.onchange = () => {
+				const checked = checkbox.checked;
+				this.controller.updateWallSegmentClockTrigger(segment.id, (t) => {
+					if (checked) {
+						if (!t.links.some((l) => l.clockId === clock.id)) t.links.push({ clockId: clock.id, delta: Number(deltaInput.value) || 1 });
+					} else {
+						t.links = t.links.filter((l) => l.clockId !== clock.id);
+					}
+				});
+			};
+			deltaInput.onchange = () => {
+				const v = Number(deltaInput.value);
+				if (Number.isNaN(v) || v === 0) return;
+				this.controller.updateWallSegmentClockTrigger(segment.id, (t) => {
+					const l = t.links.find((l) => l.clockId === clock.id);
+					if (l) l.delta = v;
+				});
+			};
+		}
+
+		if (trigger && trigger.links.length > 0) {
+			const clearBtn = section.createEl("button", { text: "Retirer le déclencheur", cls: "map-manager-btn" });
+			clearBtn.onclick = () => this.controller.clearWallSegmentClockTrigger(segment.id);
+		}
+	}
+
+	// ---- Clocks (map-level progress trackers, editable in both edit and view mode) ----
+
+	/**
+	 * The "Horloge" panel: an optional name, a "visible sur la vue joueur" toggle, the two counters
+	 * ("morceaux totaux"/"morceaux actuels" — see `Clock`'s own doc comment on why there's no more
+	 * one-row-per-wedge add/remove), a chronological (index-order) list of each wedge's own note link,
+	 * and a delete footer. Shown identically in edit and view mode — same reasoning as
+	 * `renderLightRadiusField`: a GM plausibly ticks a clock live mid-session, not just authors it
+	 * ahead of time.
+	 */
+	private renderClockPanel(clock: Clock): void {
+		const nameField = this.el.createDiv({ cls: "map-manager-field" });
+		nameField.createEl("label", { text: "Nom (facultatif)" });
+		const nameInput = nameField.createEl("input", { type: "text" });
+		nameInput.value = clock.name;
+		nameInput.placeholder = "Sans nom";
+		nameInput.onchange = () => this.controller.updateClock(clock.id, (c) => (c.name = nameInput.value.trim()));
+
+		const visibleField = this.el.createDiv({ cls: "map-manager-checkbox-field" });
+		const visibleLabel = visibleField.createEl("label");
+		const visibleCheckbox = visibleLabel.createEl("input", { type: "checkbox" });
+		visibleCheckbox.checked = clock.visibleToPlayers !== false;
+		visibleLabel.appendText(" Horloge visible sur la vue joueur");
+		visibleCheckbox.onchange = () => this.controller.updateClock(clock.id, (c) => (c.visibleToPlayers = visibleCheckbox.checked));
+
+		// Meaningless with no name to hide — only offered once one's actually set. Always shown (and
+		// always effective) on the GM's own edit/embed windows regardless of this flag — see
+		// `Clock.nameVisibleToPlayers`'s own doc comment; this only ever hides it on the mirror.
+		if (clock.name.trim()) {
+			const nameVisibleField = this.el.createDiv({ cls: "map-manager-checkbox-field" });
+			const nameVisibleLabel = nameVisibleField.createEl("label");
+			const nameVisibleCheckbox = nameVisibleLabel.createEl("input", { type: "checkbox" });
+			nameVisibleCheckbox.checked = clock.nameVisibleToPlayers !== false;
+			nameVisibleLabel.appendText(" Nom visible sur la vue joueur");
+			nameVisibleCheckbox.onchange = () => this.controller.updateClock(clock.id, (c) => (c.nameVisibleToPlayers = nameVisibleCheckbox.checked));
+		}
+
+		const countsRow = this.el.createDiv({ cls: "map-manager-vision-row" });
+		const totalField = countsRow.createDiv({ cls: "map-manager-field-inline" });
+		totalField.createEl("label", { text: "Morceaux totaux" });
+		const totalInput = totalField.createEl("input", { type: "number" });
+		totalInput.min = "1";
+		totalInput.value = String(clock.segments.length);
+		totalInput.onchange = () => {
+			const v = parseInt(totalInput.value, 10);
+			if (!Number.isNaN(v) && v > 0) this.controller.setClockTotalSegments(clock.id, v);
+		};
+
+		const currentField = countsRow.createDiv({ cls: "map-manager-field-inline" });
+		currentField.createEl("label", { text: "Morceaux actuels" });
+		const currentInput = currentField.createEl("input", { type: "number" });
+		currentInput.min = "0";
+		currentInput.max = String(clock.segments.length);
+		currentInput.value = String(clock.currentSegments);
+		currentInput.onchange = () => {
+			const v = parseInt(currentInput.value, 10);
+			if (!Number.isNaN(v)) this.controller.setClockProgress(clock.id, v);
+		};
+
+		const segmentsField = this.el.createDiv({ cls: "map-manager-field" });
+		segmentsField.createEl("label", { text: "Notes liées, dans l'ordre chronologique des morceaux" });
+		const list = segmentsField.createDiv({ cls: "map-manager-clock-segment-list" });
+		clock.segments.forEach((segment, i) => {
+			const filled = i < clock.currentSegments;
+			const row = list.createDiv({ cls: "map-manager-clock-segment-row" });
+
+			const toggleBtn = row.createEl("button", { text: filled ? "●" : "○", cls: "map-manager-btn map-manager-btn-icon" });
+			setTooltip(toggleBtn, `Morceau ${i + 1}`);
+			toggleBtn.onclick = () => this.controller.clickClockSegment(clock.id, i);
+
+			if (segment.link) {
+				const pill = row.createDiv({ cls: "map-manager-link-pill" });
+				const a = pill.createEl("a", { text: linkTabLabel(segment.link), href: "#" });
+				const linkValue = segment.link;
+				a.onclick = (e) => {
+					e.preventDefault();
+					void this.app.workspace.openLinkText(linkValue, "", false);
+				};
+				const remove = pill.createEl("span", { text: "×", cls: "map-manager-link-remove" });
+				remove.onclick = () =>
+					this.controller.updateClock(clock.id, (c) => {
+						const s = c.segments[i];
+						if (s) s.link = undefined;
+					});
+			} else {
+				const pickBtn = row.createEl("button", { text: "Lier une note", cls: "map-manager-btn" });
+				pickBtn.onclick = () =>
+					this.pickLink((link) =>
+						this.controller.updateClock(clock.id, (c) => {
+							const s = c.segments[i];
+							if (s) s.link = link;
+						})
+					);
+			}
+		});
+
+		const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
+		const deleteBtn = footer.createEl("button", { text: "Supprimer l'horloge", cls: "map-manager-btn map-manager-btn-danger" });
+		deleteBtn.onclick = () => this.controller.removeClock(clock.id);
 	}
 
 	// ---- Tokens (full edit panel in edit mode; reduced read-mostly panel in view mode) ----

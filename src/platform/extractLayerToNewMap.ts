@@ -8,10 +8,12 @@ import { sanitizeFileName } from "../utils";
  * that a lone layer can't sensibly choose for itself (grid type, cell size, zoom range, fog on/off)
  * are cloned as-is from the source map.
  *
- * Tokens are map-level, not per-layer (see `MapFileData.tokens`), so there's no reliable way to tell
- * which ones "belong" to this layer — they're copied wholesale rather than silently dropped; the user
- * can delete the ones that don't apply on the new map. Fog memory is not carried over
- * (`exploredCells` starts empty) since it was traced against the full source map, not this one layer.
+ * Tokens and clocks are map-level, not per-layer (see `MapFileData.tokens`/`clocks`), so there's no
+ * reliable way to tell which ones "belong" to this layer — they're copied wholesale rather than
+ * silently dropped; the user can delete the ones that don't apply on the new map. Copying clocks
+ * as-is (same ids) also keeps this layer's own wall segments' `clockTrigger.links` valid on the new
+ * map. Fog memory is not carried over (`exploredCells` starts empty) since it was traced against the
+ * full source map, not this one layer.
  *
  * Returns `null` if `layerId` doesn't match a layer on `data` (e.g. stale UI state).
  */
@@ -21,12 +23,13 @@ export async function extractLayerToNewMap(app: App, sourceFile: TFile, data: Ma
 
 	const clonedLayer: Layer = { ...structuredClone(layer), id: generateLocalId("layer") };
 	const newData: MapFileData = {
-		version: 15,
+		version: 16,
 		gridType: data.gridType,
 		cellSize: data.cellSize,
 		layers: [clonedLayer],
 		activeLayerId: clonedLayer.id,
 		tokens: structuredClone(data.tokens),
+		clocks: structuredClone(data.clocks),
 		minZoom: data.minZoom,
 		maxZoom: data.maxZoom,
 		fogEnabled: data.fogEnabled,

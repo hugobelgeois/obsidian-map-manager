@@ -713,3 +713,170 @@
 	min-width: 0;
 }
 
+/* ---- Clocks (ClockBar overlay + InfoPanel's "Horloge"/wall-trigger sections) ---- */
+
+/* Overlays the top of the canvas host, same z-index tier as the "Seau à murs" magnifier (5) but above
+   it (6) since it's a permanent fixture, not a transient tooltip. `pointer-events: none` on the row
+   itself lets clicks in the gaps between flags fall straight through to panning the map underneath;
+   each flag/button below opts back in with `pointer-events: auto`. */
+.map-manager-clock-bar {
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	z-index: 6;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-start;
+	gap: 0.6em;
+	padding: 0.4em 0.6em;
+	pointer-events: none;
+}
+
+.map-manager-clock-flag {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	pointer-events: auto;
+}
+
+/* Dims the whole flag on the GM's own (interactive) view when the clock is hidden from the player
+   mirror — see `ClockBar.renderClockFlag`. Never applied on the mirror itself, since a hidden clock
+   simply isn't rendered there at all. */
+.map-manager-clock-flag.is-hidden-from-players {
+	opacity: 0.5;
+}
+
+/* Visually a thin 1px line, but with real click-target height/width around it (via the pseudo-element
+   below carrying the actual line) — the flag's own "handle": always present, so there's always a way
+   to reopen a nameless clock's editor (see `Clock`'s own doc comment) even with no name label to click. */
+.map-manager-clock-pole {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 100%;
+	height: 10px;
+}
+
+.map-manager-clock-pole::after {
+	content: "";
+	width: 1px;
+	height: 6px;
+	background: var(--background-modifier-border);
+}
+
+.map-manager-clock-pole.is-clickable {
+	cursor: pointer;
+}
+
+.map-manager-clock-pole.is-active::after {
+	background: var(--interactive-accent);
+	width: 2px;
+}
+
+.map-manager-clock-name {
+	font-size: 0.75em;
+	color: var(--text-muted);
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s, 4px);
+	padding: 0.1em 0.4em;
+	max-width: 8em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.map-manager-clock-name.is-clickable {
+	cursor: pointer;
+}
+
+.map-manager-clock-name.is-active {
+	border-color: var(--interactive-accent);
+	color: var(--text-normal);
+}
+
+.map-manager-clock-svg {
+	display: block;
+	filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+}
+
+.map-manager-clock-svg path {
+	fill: var(--background-primary);
+	stroke: var(--background-modifier-border);
+	stroke-width: 1;
+}
+
+.map-manager-clock-svg path.is-filled {
+	fill: var(--text-muted);
+}
+
+.map-manager-clock-svg path.has-link {
+	stroke: var(--interactive-accent);
+	stroke-width: 1.5;
+}
+
+.map-manager-clock-svg path.is-clickable {
+	cursor: pointer;
+}
+
+.map-manager-clock-add-btn {
+	background: var(--interactive-normal);
+	color: var(--text-normal);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 50%;
+	width: 1.6em;
+	height: 1.6em;
+	line-height: 1;
+	cursor: pointer;
+	pointer-events: auto;
+}
+
+.map-manager-clock-add-btn:hover {
+	background: var(--interactive-hover);
+}
+
+.map-manager-clock-segment-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3em;
+	margin-bottom: 0.4em;
+}
+
+.map-manager-clock-segment-row {
+	display: flex;
+	align-items: center;
+	gap: 0.3em;
+}
+
+.map-manager-clock-segment-row .map-manager-link-pill {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.map-manager-clock-trigger-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3em;
+	margin: 0.4em 0;
+}
+
+.map-manager-clock-trigger-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.5em;
+	font-size: 0.85em;
+}
+
+.map-manager-clock-trigger-checkbox {
+	display: flex;
+	align-items: center;
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.map-manager-clock-trigger-delta {
+	width: 3.5em;
+}
+
