@@ -896,10 +896,12 @@ export class InfoPanel {
 	// ---- Clocks (map-level progress trackers, editable in both edit and view mode) ----
 
 	/**
-	 * The "Horloge" panel: an optional name, a "visible sur la vue joueur" toggle, the two counters
-	 * ("morceaux totaux"/"morceaux actuels" — see `Clock`'s own doc comment on why there's no more
-	 * one-row-per-wedge add/remove), a chronological (index-order) list of each wedge's own note link,
-	 * and a delete footer. Shown identically in edit and view mode — same reasoning as
+	 * The "Horloge" panel: an optional name, its two "visible sur la vue joueur" toggles (whole clock,
+	 * and just the name), the "morceaux totaux" wedge count (see `Clock`'s own doc comment on why
+	 * there's no more one-row-per-wedge add/remove), a chronological (index-order) list of each wedge's
+	 * own note link plus its fill-boundary toggle (`clickClockSegment` — the only way progress is ever
+	 * changed, same as clicking a wedge on `ClockBar` itself; there's no separate "morceaux actuels"
+	 * field), and a delete footer. Shown identically in edit and view mode — same reasoning as
 	 * `renderLightRadiusField`: a GM plausibly ticks a clock live mid-session, not just authors it
 	 * ahead of time.
 	 */
@@ -930,8 +932,7 @@ export class InfoPanel {
 			nameVisibleCheckbox.onchange = () => this.controller.updateClock(clock.id, (c) => (c.nameVisibleToPlayers = nameVisibleCheckbox.checked));
 		}
 
-		const countsRow = this.el.createDiv({ cls: "map-manager-vision-row" });
-		const totalField = countsRow.createDiv({ cls: "map-manager-field-inline" });
+		const totalField = this.el.createDiv({ cls: "map-manager-field" });
 		totalField.createEl("label", { text: "Morceaux totaux" });
 		const totalInput = totalField.createEl("input", { type: "number" });
 		totalInput.min = "1";
@@ -941,17 +942,8 @@ export class InfoPanel {
 			if (!Number.isNaN(v) && v > 0) this.controller.setClockTotalSegments(clock.id, v);
 		};
 
-		const currentField = countsRow.createDiv({ cls: "map-manager-field-inline" });
-		currentField.createEl("label", { text: "Morceaux actuels" });
-		const currentInput = currentField.createEl("input", { type: "number" });
-		currentInput.min = "0";
-		currentInput.max = String(clock.segments.length);
-		currentInput.value = String(clock.currentSegments);
-		currentInput.onchange = () => {
-			const v = parseInt(currentInput.value, 10);
-			if (!Number.isNaN(v)) this.controller.setClockProgress(clock.id, v);
-		};
-
+		// No standalone "morceaux actuels" field any more — progress is only ever changed by clicking a
+		// wedge (`clickClockSegment`, below), same as on `ClockBar` itself, or via a wall's clock trigger.
 		const segmentsField = this.el.createDiv({ cls: "map-manager-field" });
 		segmentsField.createEl("label", { text: "Notes liées, dans l'ordre chronologique des morceaux" });
 		const list = segmentsField.createDiv({ cls: "map-manager-clock-segment-list" });

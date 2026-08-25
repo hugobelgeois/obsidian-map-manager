@@ -253,6 +253,81 @@ export function castLightRays(data: MapFileData, token: Token, wallSegments: Res
 	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments) };
 }
 
+/**
+ * Whether a straight line from `from` to `to` crosses any vision-blocking wall segment. Used to gate
+ * a light's visible reach on whether a player token can actually see each part of it (see
+ * `clipLightToPlayerLineOfSight`), and — exported for this — to gate a lit *entity*'s own visibility
+ * on an exact check to its precise position (see `FogRenderer.isEntityRevealed`) rather than the
+ * coarser, sampled-ray approximation `clipLightToPlayerLineOfSight` uses for the fog overlay's own
+ * smooth area reveal.
+ */
+export function hasLineOfSight(from: Point, to: Point, wallSegments: ResolvedWallSegment[]): boolean {
+	const dx = to.x - from.x;
+	const dy = to.y - from.y;
+	const dist = Math.hypot(dx, dy);
+	if (dist <= 0) return true;
+	const ux = dx / dist;
+	const uy = dy / dist;
+	for (const seg of wallSegments) {
+		if (!wallBlocksVision(seg.type)) continue;
+		const hit = raySegmentDistance(from, ux, uy, dist, seg.a, seg.b);
+		// A hair short of `dist` so a wall sitting essentially right at the target (a light placed
+		// flush against its own wall, most commonly) doesn't self-block on float rounding.
+		if (hit !== null && hit < dist - 0.01) return false;
+	}
+	return true;
+}
+
+/**
+ * Number of stepped samples checked along each light ray, from its far end inward, when clipping to
+ * player line-of-sight (see `clipLightToPlayerLineOfSight`). A single point (either the light's own
+ * source, or just the ray's far endpoint) isn't enough: a doorway standing between a player and a
+ * lit room beyond it genuinely blocks LOS to *most* of that room from an off-center player position,
+ * while still leaving the near portion of that very same ray visible — a whole-light on/off gate
+ * wrongly reveals the entire far room the moment the player can see the light itself (e.g. through
+ * that same doorway), and a single far-endpoint check wrongly zeroes an entire ray the moment its
+ * exact tip happens to graze a wall's shadow, even when most of that ray's length is plainly open.
+ * Stepping inward and keeping the farthest sample that's actually visible approximates the true
+ * (continuous) visible sub-segment without needing a real polygon intersection.
+ */
+const LIGHT_LOS_SAMPLE_STEPS = 10;
+
+/**
+ * Clips a light source's own traced reach (`vision`, from `castLightRays` — already blocked by any
+ * wall standing between the light and *itself*) down to only the parts a player could actually see:
+ * each ray is walked inward from its traced endpoint in `LIGHT_LOS_SAMPLE_STEPS` steps (see its own
+ * doc comment for why a single sample isn't enough), kept out to the farthest sample where at least
+ * one of `playerCenters` has an unobstructed `hasLineOfSight` to it, and collapsed to 0 if none of
+ * them do. This is a second, independent check from the light's own reach — walls between the
+ * *viewer* and a given point, rather than walls between the light and empty space — so a light can
+ * be fully "on" (reaching some open area from its own position) while a player standing on the other
+ * side of a wall from it still can't see any (or only part) of that area.
+ *
+ * With no player tokens on the map at all, nothing can see any light, so every ray collapses to 0.
+ */
+export function clipLightToPlayerLineOfSight(vision: VisionRays, playerCenters: Point[], wallSegments: ResolvedWallSegment[]): VisionRays {
+	if (playerCenters.length === 0) return { center: vision.center, rays: vision.rays.map(() => ({ clearEnd: 0, dimEnd: 0 })) };
+	const rayCount = vision.rays.length;
+	const rays = vision.rays.map((ray, i) => {
+		if (ray.clearEnd <= 0) return ray;
+		const angle = (360 / rayCount) * i;
+		const rad = (angle * Math.PI) / 180;
+		const dx = Math.cos(rad);
+		const dy = Math.sin(rad);
+		let visibleEnd = 0;
+		for (let s = LIGHT_LOS_SAMPLE_STEPS; s >= 1; s--) {
+			const d = (ray.clearEnd * s) / LIGHT_LOS_SAMPLE_STEPS;
+			const point = { x: vision.center.x + dx * d, y: vision.center.y + dy * d };
+			if (playerCenters.some((center) => hasLineOfSight(center, point, wallSegments))) {
+				visibleEnd = d;
+				break;
+			}
+		}
+		return { clearEnd: visibleEnd, dimEnd: visibleEnd };
+	});
+	return { center: vision.center, rays };
+}
+
 /** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
 export function isPointLit(cache: VisionRays[], worldX: number, worldY: number, useDim: boolean): boolean {
 	for (const { center, rays } of cache) {

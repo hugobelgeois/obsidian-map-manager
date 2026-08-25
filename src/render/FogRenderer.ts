@@ -8,8 +8,10 @@ import {
 	castEntityConeRays,
 	castLightRays,
 	cellVisualWidth,
+	clipLightToPlayerLineOfSight,
 	effectiveCellSize,
 	fogBucketSize as baseFogBucketSize,
+	hasLineOfSight,
 	isPointLit,
 	isWorldPointExplored,
 } from "../grid/fog";
@@ -109,14 +111,33 @@ export class FogRenderer {
 	/** Every player token's traced light rays (their fog-reveal source — see `castLightRaysForToken`), recomputed once per `MapCanvas.render()` and reused by both `drawFog` and `MapCanvas.drawTokens`. */
 	private frameVisionCache: PlayerVisionRays[] = [];
 	/**
-	 * Every non-player token's traced `lightRadius` reach, recomputed once per `MapCanvas.render()`.
-	 * Reused by `drawFog` (to hide fog without writing to `exploredCells` — see `drawFog`'s doc
-	 * comment) and `isEntityRevealed` (so a lit entity is noticed regardless of any player's own
-	 * light). Player tokens are deliberately excluded: a player's `lightRadius` *is* its vision reach
-	 * post-refactor, so `frameVisionCache` already traces and fans that exact same shape — including
-	 * them here too would just re-trace/re-fan/re-punch identical geometry for nothing.
+	 * Every non-player token's traced `lightRadius` reach, recomputed once per `MapCanvas.render()`,
+	 * clipped down to only the parts actually visible to a player token (`clipLightToPlayerLineOfSight`
+	 * — a wall between a player and a given part of the light hides that part just as much as a wall
+	 * between the light and empty space does, see that function's own doc comment). Reused by
+	 * `drawFog` (to hide fog without writing to `exploredCells` — see `drawFog`'s doc comment) and
+	 * `isEntityRevealed` (so a lit entity is noticed regardless of any player's own light, but — same
+	 * clipping — only once a player could actually see the light illuminating it). Player tokens are
+	 * deliberately excluded: a player's `lightRadius` *is* its vision reach post-refactor, so
+	 * `frameVisionCache` already traces and fans that exact same shape — including them here too would
+	 * just re-trace/re-fan/re-punch identical geometry for nothing (and trivially pass their own
+	 * line-of-sight check against themselves).
 	 */
 	private frameLightCache: PlayerVisionRays[] = [];
+	/**
+	 * Same tokens as `frameLightCache`, but each one's *raw* traced reach — before the
+	 * `clipLightToPlayerLineOfSight` sampling that approximates the visible sub-area for the smooth
+	 * fog-overlay fan. `isEntityRevealed` uses this instead of `frameLightCache` for its own
+	 * "is this exact point lit" half of the check, then does an exact (unsampled) `hasLineOfSight`
+	 * call itself for the "…and can a player actually see this exact point" half — a single point can
+	 * afford an exact check that the whole-area fan (necessarily an approximation, sampled every 2°)
+	 * can't, so entity visibility never inherits that approximation's edge cases. See
+	 * `isEntityRevealed`'s own doc comment.
+	 */
+	private frameLightRawCache: PlayerVisionRays[] = [];
+	/** This frame's player token centers and resolved wall segments, kept for `isEntityRevealed`'s own exact `hasLineOfSight` check — set alongside the two caches above in `recomputeFrame`. */
+	private framePlayerCenters: Point[] = [];
+	private frameWallSegments: ResolvedWallSegment[] = [];
 
 	/**
 	 * Memoizes the actual (expensive) ray/wall tracing behind `castLightRaysForToken`/`castEntityConeVision`,
@@ -130,6 +151,18 @@ export class FogRenderer {
 	private entityConeRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
 	/** Same memoization as `entityConeRaysCache`, for `castLightRaysForToken` — keyed by token id, any category. */
 	private lightRaysCache: Map<string, { version: number; result: VisionRays }> = new Map();
+	/**
+	 * Same memoization idea, for `clipLightToPlayerLineOfSight`'s own result — keyed by (light) token
+	 * id. Distinct from `lightRaysCache`: that one memoizes the light's own raw wall-blocked trace,
+	 * this one memoizes the *further* per-ray clipping against every player's line of sight, which
+	 * costs `FOG_RAY_COUNT * LIGHT_LOS_SAMPLE_STEPS * playerCount * wallCount` — expensive enough that
+	 * redoing it on every pan/zoom/hover frame (`recomputeFrame` runs on all of them) was visibly
+	 * laggy once clipping stopped being a single cheap point check. `recomputeFrame` only reads this
+	 * cache when neither the light itself nor any player token has a live "Animation" tween in flight
+	 * (see the `pose`/`anyPlayerAnimated` checks there) — `dataVersion` alone doesn't change mid-tween,
+	 * but the player positions clipping depends on very much do.
+	 */
+	private lightClipCache: Map<string, { version: number; result: VisionRays }> = new Map();
 
 	/** Offscreen buffer fog is composited on before being drawn onto the main canvas as one image — see `renderFogLayer`. */
 	private fogCanvas: HTMLCanvasElement = document.createElement("canvas");
@@ -242,20 +275,46 @@ export class FogRenderer {
 	 * supposed to be revealing it as it goes has already finished playing.
 	 */
 	recomputeFrame(wallSegments: ResolvedWallSegment[]): void {
-		this.frameVisionCache = this.controller
-			.getData()
-			.tokens.filter((t) => (t.category ?? "entity") === "player")
-			.map((t) => this.castLightRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined));
-		// Any non-player token with an effective light radius > 0 — see `frameLightCache`'s own doc comment.
-		this.frameLightCache = this.controller
-			.getData()
-			.tokens.filter((t) => (t.category ?? "entity") !== "player" && resolveLightRadius(t) > 0)
-			.map((t) => this.castLightRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined));
+		const data = this.controller.getData();
+		// Tracked while building `frameVisionCache` so the `frameLightCache` clipping below knows
+		// whether it's safe to trust `lightClipCache` (keyed on `dataVersion` alone) or whether a
+		// player's live tween position makes that stale this frame — see `lightClipCache`'s own doc
+		// comment.
+		let anyPlayerAnimated = false;
+		this.frameVisionCache = data.tokens
+			.filter((t) => (t.category ?? "entity") === "player")
+			.map((t) => {
+				const pose = this.getAnimatedPose(t.id);
+				if (pose) anyPlayerAnimated = true;
+				return this.castLightRaysForToken(t, wallSegments, pose ?? undefined);
+			});
+		const playerCenters = this.frameVisionCache.map((v) => v.center);
+		this.framePlayerCenters = playerCenters;
+		this.frameWallSegments = wallSegments;
+		const version = this.controller.dataVersion;
+		// Any non-player token with an effective light radius > 0 — see `frameLightCache`'s own doc
+		// comment.
+		const lightEntries = data.tokens
+			.filter((t) => (t.category ?? "entity") !== "player" && resolveLightRadius(t) > 0)
+			.map((t) => ({ token: t, raw: this.castLightRaysForToken(t, wallSegments, this.getAnimatedPose(t.id) ?? undefined) }));
+		this.frameLightRawCache = lightEntries.map((e) => e.raw);
+		this.frameLightCache = lightEntries.map(({ token: t, raw }) => {
+			const pose = this.getAnimatedPose(t.id);
+			if (pose || anyPlayerAnimated) return { ...clipLightToPlayerLineOfSight(raw, playerCenters, wallSegments), phase: raw.phase };
+			const cached = this.lightClipCache.get(t.id);
+			if (cached && cached.version === version) return { ...cached.result, phase: raw.phase };
+			const clipped = clipLightToPlayerLineOfSight(raw, playerCenters, wallSegments);
+			this.lightClipCache.set(t.id, { version, result: clipped });
+			return { ...clipped, phase: raw.phase };
+		});
 	}
 
 	clearFrame(): void {
 		this.frameVisionCache = [];
 		this.frameLightCache = [];
+		this.frameLightRawCache = [];
+		this.framePlayerCenters = [];
+		this.frameWallSegments = [];
 	}
 
 	/**
@@ -381,16 +440,24 @@ export class FogRenderer {
 
 	/**
 	 * Whether an entity token at `center` should be shown despite fog: standing within any player
-	 * token's own light reach (`isLitByCache` against `frameVisionCache` — a player's fog reveal,
-	 * see `castLightRaysForToken`), or within any non-player token's own traced `lightRadius` reach
-	 * (`isLitByCache` against `frameLightCache`) — both wall-aware (see `castLightRays`). Callers
-	 * still gate this on `fogActive` and `!isPlayer` themselves — see
-	 * `MapCanvas.drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
+	 * token's own light reach (`isLitByCache` against `frameVisionCache` — a player's fog reveal, see
+	 * `castLightRaysForToken`; this half already implies player line-of-sight, since a player's own
+	 * vision is traced from their own position in the first place), or lit by a light source a player
+	 * can actually see it by.
+	 *
+	 * That second half deliberately checks `frameLightRawCache` (a light's *raw* reach, not
+	 * `frameLightCache`'s player-clipped one) plus its own exact `hasLineOfSight` call to `center`
+	 * itself, rather than reusing `frameLightCache` the way `drawFog`'s area punch does: that fan is
+	 * only an approximation (each ray sampled every 2°, then walked in `LIGHT_LOS_SAMPLE_STEPS` coarse
+	 * steps — see `clipLightToPlayerLineOfSight`), acceptable for a smooth area of terrain but not for
+	 * a single, gameplay-significant point like "is this monster visible" — a single point can always
+	 * afford the exact, unsampled check instead. Callers still gate this on `fogActive` and `!isPlayer`
+	 * themselves — see `MapCanvas.drawTokens`/`findTokenAtScreenPoint`/`tokensInRect`.
 	 */
-	isEntityRevealed(center: { x: number; y: number }): boolean {
+	isEntityRevealed(center: Point): boolean {
 		if (this.isLitByCache(this.frameVisionCache, center.x, center.y, false)) return true;
-		if (this.isLitByCache(this.frameLightCache, center.x, center.y, false)) return true;
-		return false;
+		if (!this.isLitByCache(this.frameLightRawCache, center.x, center.y, false)) return false;
+		return this.framePlayerCenters.some((p) => hasLineOfSight(p, center, this.frameWallSegments));
 	}
 
 	private effectiveMode(): MapMode {
@@ -451,8 +518,10 @@ export class FogRenderer {
 	 * Wall-aware (`castLightRaysForToken`/`castLightRays`, blocked by any vision-blocking wall —
 	 * `wallBlocksVision`) fan preview of every `tokens` token's `lightRadius`, any category — batched into a single
 	 * `Path2D`/fill regardless of how many tokens are on screen, same as `drawEntityEyeCones`. Tokens
-	 * with no light radius set contribute nothing. This is the exact shape `drawFog` also punches
-	 * through the real fog overlay for (see `frameLightCache`), just drawn as a GM preview instead —
+	 * with no light radius set contribute nothing. This is the light's own raw reach — deliberately
+	 * *not* clipped to player line-of-sight the way `frameLightCache` (what `drawFog` actually punches
+	 * through the real fog overlay) is: this is a GM-only tactical preview of what a light source could
+	 * reveal, useful while placing/tuning it regardless of where any player token currently stands —
 	 * live-tracking a token's animated pose during an in-flight move the same way.
 	 */
 	private drawTokenLightZones(tokens: Token[], wallSegments: ResolvedWallSegment[], ctx: CanvasRenderingContext2D): void {
