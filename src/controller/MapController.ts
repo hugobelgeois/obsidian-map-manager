@@ -1464,18 +1464,37 @@ export class MapController {
 	}
 
 	/**
-	 * A single wedge click (`ClockBar`, or the InfoPanel's per-wedge row) — since wedges can only ever
-	 * fill/unfill in order (see `Clock`'s own doc comment), there's no per-wedge toggle any more: this
-	 * just sets the fill boundary at `index` — rewinding to `index` if that wedge is already filled
-	 * (unchecking it and everything after it), or advancing up to and including it if it's still empty.
-	 * Either way the result is always "the first N wedges are filled, the rest aren't", so this is the
-	 * *only* way `currentSegments` is ever changed from a click, letting a GM jump several steps at
-	 * once by clicking further ahead just as naturally as a single step by clicking the very next wedge.
+	 * A single wedge click in the InfoPanel's "Horloge" panel — since wedges can only ever fill/unfill
+	 * in order (see `Clock`'s own doc comment), there's no per-wedge toggle any more: this just sets the
+	 * fill boundary at `index` — rewinding to `index` if that wedge is already filled (unchecking it and
+	 * everything after it), or advancing up to and including it if it's still empty. Either way the
+	 * result is always "the first N wedges are filled, the rest aren't", letting a GM jump several steps
+	 * at once by clicking further ahead just as naturally as a single step by clicking the very next
+	 * wedge. Deliberate, precise editing like this only happens here, inside the panel that's already
+	 * open on this clock — contrast `clickClockWedgeOnBar`, `ClockBar`'s own quicker click behaviour.
 	 */
 	clickClockSegment(clockId: string, index: number): void {
 		const clock = this.findClock(clockId);
 		if (!clock) return;
 		this.setClockProgress(clockId, index < clock.currentSegments ? index : index + 1);
+	}
+
+	/**
+	 * A wedge click on `ClockBar` itself (the flag overlaid on the map) — a quicker, coarser action than
+	 * `clickClockSegment`'s panel-row jump, meant for ticking a clock along during play without opening
+	 * its editor first. Clicking a *filled* wedge, or the very next *empty* one right after the filled
+	 * run (`index <= currentSegments`), just advances the clock by one more segment — so the next empty
+	 * wedge in order always simply fills in, same as clicking a filled one. Clicking any *other* empty
+	 * wedge (further ahead than the next one) instead opens the clock's own editor (`selectClock`, same
+	 * as clicking its name label/pole) rather than jumping progress there, since on the bar that's far
+	 * more often a GM reaching for the clock's settings (rename it, resize it, link a wedge to a note)
+	 * than a deliberate multi-step jump.
+	 */
+	clickClockWedgeOnBar(clockId: string, index: number): void {
+		const clock = this.findClock(clockId);
+		if (!clock) return;
+		if (index <= clock.currentSegments) this.setClockProgress(clockId, clock.currentSegments + 1);
+		else this.selectClock(clockId);
 	}
 
 	/**

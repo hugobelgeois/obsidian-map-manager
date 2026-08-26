@@ -90,7 +90,7 @@ export class ClockBar {
 		this.renderWedges(flag, clock);
 	}
 
-	/** The clock's own pie, divided into `clock.segments.length` equal wedges via simple polar-to-cartesian arc math — self-contained here since nothing else in the codebase draws a pie chart. Filled state is derived from `i < clock.currentSegments` — see `Clock`'s own doc comment on why there's no per-wedge boolean any more. */
+	/** The clock's own pie, divided into `clock.segments.length` equal wedges via simple polar-to-cartesian arc math — self-contained here since nothing else in the codebase draws a pie chart. Filled state is derived from `i < clock.currentSegments` — see `Clock`'s own doc comment on why there's no per-wedge boolean any more. A click here goes through `clickClockWedgeOnBar` (not `clickClockSegment`, the InfoPanel row's own jump-to-wedge behaviour) — see that method's doc comment for why the bar's click behaviour is deliberately coarser. */
 	private renderWedges(container: HTMLElement, clock: Clock): void {
 		const size = 36;
 		const center = size / 2;
@@ -112,7 +112,7 @@ export class ClockBar {
 			if (segment.link) path.addClass("has-link");
 			if (this.deps.interactive) {
 				path.addClass("is-clickable");
-				path.onclick = () => this.controller.clickClockSegment(clock.id, i);
+				path.onclick = () => this.controller.clickClockWedgeOnBar(clock.id, i);
 			}
 		});
 	}
