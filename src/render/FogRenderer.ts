@@ -833,8 +833,9 @@ export class FogRenderer {
 	 *   room shows only exactly where this player's line of sight reaches it;
 	 * - when "Adoucir le brouillard" is on, a soft (animated, when zoom allows) fade on the explored
 	 *   side of every explored/fog border, never spilling onto the fog cells;
-	 * - a cell wholly inside a player's light (`isCellFullyLit`) is written to `exploredCellsByGridType`
-	 *   via `markExplored`, unless fog is frozen.
+	 * - a cell a player can wholly see right now (`isCellFullyLit` — lit by the player's own light or
+	 *   by an outside light source in the player's line of sight) is written to
+	 *   `exploredCellsByGridType` via `markExplored`, unless fog is frozen.
 	 *
 	 * All per-cell work is bounded by the explored cells actually on screen (`exploredCellsInRect`)
 	 * plus a small neighbourhood around each light, so it stays cheap however far the view is zoomed
@@ -934,21 +935,26 @@ export class FogRenderer {
 		ctx.drawImage(this.fogCanvas, rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
 		ctx.restore();
 
-		// Cells now wholly within a player's light become permanently explored — last, since
-		// `markExplored` re-enters `MapCanvas.render()` synchronously (which redraws + reblits this
-		// same buffer). `markExplored` itself is a no-op while `fogFrozen`. Only cells in a light's
-		// own neighbourhood are ever tested, so this stays cheap regardless of zoom.
+		// Cells a player can wholly see right now — lit by the player's own light OR by an outside
+		// light source the player has line of sight to — become permanently explored. Last, since
+		// `markExplored` re-enters `MapCanvas.render()` synchronously (redraws + reblits this same
+		// buffer). A no-op while `fogFrozen`. Only cells in some light's own neighbourhood are ever
+		// tested, so this stays cheap regardless of zoom.
 		if (!data.fogFrozen && this.frameVisionCache.length > 0) {
+			const lightSources = [...this.frameVisionCache, ...this.frameLightRawCache];
+			const viewerCenters = this.frameVisionCache.map((v) => v.center);
 			const newlyExplored: string[] = [];
 			const seen = new Set<string>();
-			for (const vision of this.frameVisionCache) {
-				if (vision.radius <= 0) continue;
-				for (const key of this.cellKeysInDisc(data, vision.center, vision.radius)) {
+			const consider = (center: Point, radius: number) => {
+				if (radius <= 0) return;
+				for (const key of this.cellKeysInDisc(data, center, radius)) {
 					if (seen.has(key) || exploredSet.has(key)) continue;
 					seen.add(key);
-					if (isCellFullyLit(data, key, this.frameVisionCache, wallSegments)) newlyExplored.push(key);
+					if (isCellFullyLit(data, key, lightSources, viewerCenters, wallSegments)) newlyExplored.push(key);
 				}
-			}
+			};
+			for (const vision of this.frameVisionCache) consider(vision.center, vision.radius);
+			for (const light of this.frameLightRawCache) consider(light.center, light.radius);
 			if (newlyExplored.length > 0) this.controller.markExplored(newlyExplored);
 		}
 	}

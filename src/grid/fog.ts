@@ -424,23 +424,32 @@ function cellSamplePoints(poly: Point[]): Point[] {
 }
 
 /**
- * Whether every part of cell `key` is currently visible to some player token: each sample point
- * (corners, edge midpoints, centroid) has to be within that token's light `radius` *and* in its
- * direct line of sight (`hasLineOfSight`, an exact wall test — not the angularly-quantized ray
- * cache, which makes points near the circle edge fail on rounding). Drives the live "a fully-revealed
- * cell becomes permanently explored" rule (`FogRenderer.renderCellFog` → `MapController.markExplored`).
- * A cell the wall cuts through stays unexplored on its far side (those samples fail line of sight).
+ * Whether every part of cell `key` is currently visible to a player: each sample point (corners,
+ * edge midpoints, centroid) has to be (a) inside some `lightSources` circle *and* in that light's own
+ * direct line of sight — the player's own light, or an external light source such as a torch — and
+ * (b) in some `viewerCenters` (player token) line of sight. Exact wall tests (`hasLineOfSight`), not
+ * the angularly-quantized ray cache, so a point near a circle edge doesn't fail on rounding. Drives
+ * the live "a fully-revealed cell becomes permanently explored" rule (`FogRenderer.renderCellFog` →
+ * `MapController.markExplored`) — so a room lit by an outside torch that a player can see gets
+ * unlocked even though it's outside the player's own light radius. A cell a wall cuts through stays
+ * unexplored on its far side (those samples fail one of the line-of-sight checks).
  */
-export function isCellFullyLit(data: MapFileData, key: string, visionCache: VisionRays[], wallSegments: ResolvedWallSegment[]): boolean {
-	if (visionCache.length === 0) return false;
+export function isCellFullyLit(
+	data: MapFileData,
+	key: string,
+	lightSources: VisionRays[],
+	viewerCenters: Point[],
+	wallSegments: ResolvedWallSegment[]
+): boolean {
+	if (lightSources.length === 0 || viewerCenters.length === 0) return false;
 	for (const p of cellSamplePoints(cellPolygon(data, key))) {
-		const seen = visionCache.some((v) => {
-			if (v.radius <= 0) return false;
-			const dist = Math.hypot(p.x - v.center.x, p.y - v.center.y);
+		const lit = lightSources.some((l) => {
+			if (l.radius <= 0) return false;
 			// A hair of slack so a sample sitting exactly on the radius still counts.
-			return dist <= v.radius + 0.01 && hasLineOfSight(v.center, p, wallSegments);
+			return Math.hypot(p.x - l.center.x, p.y - l.center.y) <= l.radius + 0.01 && hasLineOfSight(l.center, p, wallSegments);
 		});
-		if (!seen) return false;
+		if (!lit) return false;
+		if (!viewerCenters.some((c) => hasLineOfSight(c, p, wallSegments))) return false;
 	}
 	return true;
 }
