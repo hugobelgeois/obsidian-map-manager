@@ -163,12 +163,15 @@ export default class MapManagerPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		const loaded = (await this.loadData()) as (Partial<MapManagerSettings> & { fogAnimations?: boolean }) | null;
+		const loaded = (await this.loadData()) as (Partial<MapManagerSettings> & { fogAnimations?: boolean; fogAnimationMode?: string }) | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
-		// Pre-combo-box settings stored a plain boolean here; map it onto the new mode so users who
-		// had the (old, single) animation turned on don't silently lose it after this update.
-		if (loaded && loaded.fogAnimationMode === undefined && loaded.fogAnimations !== undefined) {
-			this.settings.fogAnimationMode = loaded.fogAnimations ? "simple" : "none";
+		// The old fog-edge tremble (`fogAnimations` boolean, then the `fogAnimationMode` 3-way) is
+		// superseded by `fogSoftening`. An install that had any animation on keeps a softened fog;
+		// one that had explicitly turned it off keeps it off. A fresh install (neither key) takes the
+		// `DEFAULT_SETTINGS.fogSoftening` default (on).
+		if (loaded && loaded.fogSoftening === undefined) {
+			if (loaded.fogAnimationMode !== undefined) this.settings.fogSoftening = loaded.fogAnimationMode !== "none";
+			else if (loaded.fogAnimations !== undefined) this.settings.fogSoftening = loaded.fogAnimations;
 		}
 		// Pre-"Modèle de statistiques verrouillé" installs saved their own `defaultTokenTemplates`
 		// array without the reserved "Joueur" template — `Object.assign` above just keeps that old

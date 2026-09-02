@@ -2421,17 +2421,24 @@ export class MapCanvas {
 			}
 		}
 
-		// Patches solid black back over content drawn right above, but only within a margin of an
-		// actual wall and only where fog wouldn't otherwise reveal it — see the method doc. Away from
-		// any wall, `drawBackgrounds`/`drawGridAndCells` above are left completely untouched, so open
-		// territory keeps exactly its original smooth vision-cone look with no masking artifacts.
-		if (this.fog.isCurrentlyVisible()) this.fog.drawWallShadowBlackout(ctx, dpr, imageBounds, getWallSegments());
+		// Grid type "none" keeps the legacy ray-traced/blurred fog: patch solid black back over
+		// content drawn right above, but only within a margin of an actual wall and only where fog
+		// wouldn't otherwise reveal it — see the method doc. Celled grids ("avec grillage" fog,
+		// `renderCellFog` below) don't need this: each cell is filled black in the fog buffer itself
+		// and the wall-clipped light circle is punched out of that, so nothing near a wall ever needs
+		// re-patching on the main canvas.
+		const celledFog = this.controller.getData().gridType !== "none";
+		if (this.fog.isCurrentlyVisible() && !celledFog) this.fog.drawWallShadowBlackout(ctx, dpr, imageBounds, getWallSegments());
 
 		const noGrid = this.controller.getData().gridType === "none";
 		if (noGrid) this.drawer.drawMarkers(ctx, this.draggingMarker);
 		this.drawer.drawWalls(ctx, cellsVisible, this.effectiveMode(), this.isMirror, this.draggingWallPoint);
 
-		if (this.fog.isCurrentlyVisible()) this.fog.renderAndComposite(ctx, dpr, imageBounds);
+		if (this.fog.isCurrentlyVisible()) {
+			if (celledFog) this.fog.renderCellFog(ctx, dpr, imageBounds, getWallSegments());
+			else this.fog.renderAndComposite(ctx, dpr, imageBounds);
+			this.fog.drawDebugVisionRays(ctx, getWallSegments());
+		}
 
 		// GM's own window always shows this tactical hint; a player-mirror window only shows it while
 		// the GM has explicitly toggled it on (see `MapController.showEntityVisionToPlayers` and the

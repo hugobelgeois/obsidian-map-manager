@@ -12,8 +12,8 @@ import { sanitizeFileName } from "../utils";
  * reliable way to tell which ones "belong" to this layer — they're copied wholesale rather than
  * silently dropped; the user can delete the ones that don't apply on the new map. Copying clocks
  * as-is (same ids) also keeps this layer's own wall segments' `clockTrigger.links` valid on the new
- * map. Fog memory is not carried over (`exploredCells` starts empty) since it was traced against the
- * full source map, not this one layer.
+ * map. Fog memory is not carried over (both `exploredCells` and `exploredCellsByGridType` start
+ * empty) since it was traced against the full source map, not this one layer.
  *
  * Returns `null` if `layerId` doesn't match a layer on `data` (e.g. stale UI state).
  */
@@ -23,7 +23,7 @@ export async function extractLayerToNewMap(app: App, sourceFile: TFile, data: Ma
 
 	const clonedLayer: Layer = { ...structuredClone(layer), id: generateLocalId("layer") };
 	const newData: MapFileData = {
-		version: 17,
+		version: 18,
 		gridType: data.gridType,
 		cellSize: data.cellSize,
 		layers: [clonedLayer],
@@ -35,6 +35,7 @@ export async function extractLayerToNewMap(app: App, sourceFile: TFile, data: Ma
 		fogEnabled: data.fogEnabled,
 		fogFrozen: data.fogFrozen,
 		exploredCells: [],
+		exploredCellsByGridType: { square: [], "hex-pointy": [], "hex-flat": [] },
 	};
 
 	const folder = sourceFile.parent?.path ?? "";

@@ -9,7 +9,7 @@ import {
 	squareKey,
 	wallBlocksVision,
 } from "../data/mapData";
-import { Point, SQUARE_CELL_SCALE, hexCellToWorldCenter, hexWorldToCell, raySegmentDistance, squareWorldToCell } from "./gridMath";
+import { Point, SQUARE_CELL_SCALE, collinearOverlap, hexCellToWorldCenter, hexCorners, hexWorldToCell, raySegmentDistance, squareWorldToCell } from "./gridMath";
 
 /**
  * Rays cast per player token when tracing vision (ray/path tracing, not grid tracing) — fixed
@@ -49,6 +49,13 @@ export interface RaySample {
 export interface VisionRays {
 	center: { x: number; y: number };
 	rays: RaySample[];
+	/**
+	 * The light's *configured* reach in world units (before any wall clipping) — i.e. the radius of
+	 * the true circle it would light in the open. `FogRenderer.renderCellFog` punches this exact
+	 * circle (`ctx.arc`) so the lit area reads as a real circle with no ray-fan facets, then subtracts
+	 * wall shadows separately. `0` for a directional-only entity cone.
+	 */
+	radius: number;
 }
 
 /**
@@ -223,7 +230,7 @@ function traceRays(center: Point, radius: number, range: number, halfAngle: numb
 export function castEntityConeRays(data: MapFileData, token: Token, direction: number, fullAngleDeg: number, wallSegments: ResolvedWallSegment[]): VisionRays {
 	const center = footprintCenter(data, token);
 	const range = (token.visionRange ?? DEFAULT_VISION_RANGE) * cellVisualWidth(data);
-	return { center, rays: traceRays(center, 0, range, fullAngleDeg / 2, direction, wallSegments) };
+	return { center, rays: traceRays(center, 0, range, fullAngleDeg / 2, direction, wallSegments), radius: 0 };
 }
 
 /**
@@ -250,7 +257,7 @@ export function buildVisionCache(data: MapFileData): VisionRays[] {
 export function castLightRays(data: MapFileData, token: Token, wallSegments: ResolvedWallSegment[], pose?: { center: Point; direction: number }): VisionRays {
 	const center = pose?.center ?? footprintCenter(data, token);
 	const radius = resolveLightRadius(token) * cellVisualWidth(data);
-	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments) };
+	return { center, rays: traceRays(center, radius, 0, 0, 0, wallSegments), radius };
 }
 
 /**
@@ -306,7 +313,7 @@ const LIGHT_LOS_SAMPLE_STEPS = 10;
  * With no player tokens on the map at all, nothing can see any light, so every ray collapses to 0.
  */
 export function clipLightToPlayerLineOfSight(vision: VisionRays, playerCenters: Point[], wallSegments: ResolvedWallSegment[]): VisionRays {
-	if (playerCenters.length === 0) return { center: vision.center, rays: vision.rays.map(() => ({ clearEnd: 0, dimEnd: 0 })) };
+	if (playerCenters.length === 0) return { center: vision.center, radius: vision.radius, rays: vision.rays.map(() => ({ clearEnd: 0, dimEnd: 0 })) };
 	const rayCount = vision.rays.length;
 	const rays = vision.rays.map((ray, i) => {
 		if (ray.clearEnd <= 0) return ray;
@@ -325,7 +332,7 @@ export function clipLightToPlayerLineOfSight(vision: VisionRays, playerCenters: 
 		}
 		return { clearEnd: visibleEnd, dimEnd: visibleEnd };
 	});
-	return { center: vision.center, rays };
+	return { center: vision.center, radius: vision.radius, rays };
 }
 
 /** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
@@ -355,4 +362,184 @@ export function fogBucketKeyAt(data: MapFileData, worldX: number, worldY: number
 
 export function isWorldPointExplored(exploredSet: ReadonlySet<string>, data: MapFileData, worldX: number, worldY: number): boolean {
 	return exploredSet.has(fogBucketKeyAt(data, worldX, worldY));
+}
+
+// ---------------- "Avec grillage" per-cell fog (celled grid types) ----------------
+
+export interface FogWorldRect {
+	minX: number;
+	minY: number;
+	maxX: number;
+	maxY: number;
+}
+
+/**
+ * Explored-memory cell keys whose center falls within `rect` grown by `margin` — bounds all per-cell
+ * fog work by what's actually on screen rather than by the grid's extent, so it stays cheap however
+ * far the view is zoomed out (`FogRenderer.renderCellFog` / `drawCellFogMask`).
+ */
+export function exploredCellsInRect(data: MapFileData, exploredSet: ReadonlySet<string>, rect: FogWorldRect, margin: number): string[] {
+	const out: string[] = [];
+	for (const key of exploredSet) {
+		const c = cellCenter(data, key);
+		if (c.x >= rect.minX - margin && c.x <= rect.maxX + margin && c.y >= rect.minY - margin && c.y <= rect.maxY + margin) out.push(key);
+	}
+	return out;
+}
+
+/** Corners of the grid cell `key`, world coordinates — 4 for a square grid, 6 for a hex grid (order: `[NW, NE, SE, SW]` for square). */
+export function cellPolygon(data: MapFileData, key: string): Point[] {
+	const { a, b } = parseCellKey(key);
+	const size = effectiveCellSize(data);
+	if (data.gridType === "square" || data.gridType === "none") {
+		const x0 = a * size;
+		const y0 = b * size;
+		return [
+			{ x: x0, y: y0 },
+			{ x: x0 + size, y: y0 },
+			{ x: x0 + size, y: y0 + size },
+			{ x: x0, y: y0 + size },
+		];
+	}
+	const orientation = data.gridType === "hex-pointy" ? "pointy" : "flat";
+	const center = hexCellToWorldCenter(a, b, size, orientation);
+	return hexCorners(center.x, center.y, size, orientation);
+}
+
+/** Sample points used to decide whether a cell is *entirely* lit: its corners, centroid, and edge midpoints. */
+function cellSamplePoints(poly: Point[]): Point[] {
+	const pts: Point[] = [...poly];
+	let sx = 0;
+	let sy = 0;
+	for (let i = 0; i < poly.length; i++) {
+		const p = poly[i];
+		const q = poly[(i + 1) % poly.length];
+		if (!p || !q) continue;
+		sx += p.x;
+		sy += p.y;
+		pts.push({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 });
+	}
+	pts.push({ x: sx / poly.length, y: sy / poly.length });
+	return pts;
+}
+
+/**
+ * Whether every part of cell `key` is currently visible to some player token: each sample point
+ * (corners, edge midpoints, centroid) has to be within that token's light `radius` *and* in its
+ * direct line of sight (`hasLineOfSight`, an exact wall test — not the angularly-quantized ray
+ * cache, which makes points near the circle edge fail on rounding). Drives the live "a fully-revealed
+ * cell becomes permanently explored" rule (`FogRenderer.renderCellFog` → `MapController.markExplored`).
+ * A cell the wall cuts through stays unexplored on its far side (those samples fail line of sight).
+ */
+export function isCellFullyLit(data: MapFileData, key: string, visionCache: VisionRays[], wallSegments: ResolvedWallSegment[]): boolean {
+	if (visionCache.length === 0) return false;
+	for (const p of cellSamplePoints(cellPolygon(data, key))) {
+		const seen = visionCache.some((v) => {
+			if (v.radius <= 0) return false;
+			const dist = Math.hypot(p.x - v.center.x, p.y - v.center.y);
+			// A hair of slack so a sample sitting exactly on the radius still counts.
+			return dist <= v.radius + 0.01 && hasLineOfSight(v.center, p, wallSegments);
+		});
+		if (!seen) return false;
+	}
+	return true;
+}
+
+/** Coarse safety ring of ray angles in `traceVisibilityPolygon`, on top of the rays aimed at wall corners — just enough that a wall-less direction still produces a far-field vertex. */
+const VISIBILITY_RING = 24;
+
+/**
+ * The player's line of sight as a polygon, in angular order — the classic 2D visibility polygon,
+ * traced `far` world units outward ("jusqu'au prochain mur / à l'infini" — the caller passes a
+ * distance well past anything on screen). Rays are cast at every vision-blocking wall corner (± a
+ * hair, so a shadow edge comes out as one straight line running from the token past the corner, not
+ * a per-step staircase), plus a coarse ring for wall-less directions. `FogRenderer.renderCellFog`
+ * clips its fog punch to this polygon and then punches the actual *light* inside it (the token's own
+ * radius circle as a true `ctx.arc`; every other light source's own reach) — so what the player sees
+ * is exactly "line of sight ∩ light": a smooth circle edge where the light just runs out, a straight
+ * edge where a wall cuts it, other lit rooms revealed only where this same line of sight reaches
+ * them.
+ */
+export function traceVisibilityPolygon(center: Point, far: number, wallSegments: ResolvedWallSegment[]): Point[] {
+	const blockers = wallSegments.filter((seg) => wallBlocksVision(seg.type));
+	const TWO_PI = 2 * Math.PI;
+	const norm = (a: number) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
+	const angles: number[] = [];
+	for (let i = 0; i < VISIBILITY_RING; i++) angles.push((TWO_PI * i) / VISIBILITY_RING);
+	const eps = 1e-4;
+	for (const seg of blockers) {
+		for (const p of [seg.a, seg.b]) {
+			const base = Math.atan2(p.y - center.y, p.x - center.x);
+			angles.push(norm(base - eps), norm(base), norm(base + eps));
+		}
+	}
+	angles.sort((a, b) => a - b);
+
+	const out: Point[] = [];
+	let prevAngle = Number.NaN;
+	for (const angle of angles) {
+		if (angle === prevAngle) continue;
+		prevAngle = angle;
+		const dx = Math.cos(angle);
+		const dy = Math.sin(angle);
+		let end = far;
+		for (const seg of blockers) {
+			const t = raySegmentDistance(center, dx, dy, end, seg.a, seg.b);
+			if (t !== null && t < end) end = t;
+		}
+		out.push({ x: center.x + dx * end, y: center.y + dy * end });
+	}
+	return out;
+}
+
+/** The world-space segment shared by the touching edge of two orthogonally-adjacent cells, or `null` if they don't share a full edge. Square grids only. */
+function sharedSquareEdge(data: MapFileData, keyA: string, keyB: string): [Point, Point] | null {
+	const size = effectiveCellSize(data);
+	const A = parseCellKey(keyA);
+	const B = parseCellKey(keyB);
+	const da = B.a - A.a;
+	const db = B.b - A.b;
+	if (Math.abs(da) + Math.abs(db) !== 1) return null;
+	const x0 = A.a * size;
+	const y0 = A.b * size;
+	if (da === 1) return [{ x: x0 + size, y: y0 }, { x: x0 + size, y: y0 + size }];
+	if (da === -1) return [{ x: x0, y: y0 }, { x: x0, y: y0 + size }];
+	if (db === 1) return [{ x: x0, y: y0 + size }, { x: x0 + size, y: y0 + size }];
+	return [{ x: x0, y: y0 }, { x: x0 + size, y: y0 }];
+}
+
+/** Whether a wall segment runs along the edge shared by cells `keyA`/`keyB` (any blocker type — a see-through window still physically separates them). Square grids only. */
+export function cellsWallSeparated(data: MapFileData, keyA: string, keyB: string, wallSegments: ResolvedWallSegment[]): boolean {
+	const edge = sharedSquareEdge(data, keyA, keyB);
+	if (!edge) return false;
+	return wallSegments.some((seg) => collinearOverlap(edge[0], edge[1], seg.a, seg.b) !== null);
+}
+
+/**
+ * Black half-cell triangles for the diagonal split at concave corners of an explored square cell:
+ * for each of the 4 corners, if both orthogonally-adjacent cells there are "fog" per `isFogNeighbour`
+ * (which must already exclude neighbours separated by a wall — "sans prendre en compte les angles à
+ * travers les murs"), the cell is cut along the diagonal between the two *other* corners and the
+ * half containing the concave corner is returned, to be filled at full fog opacity while the rest
+ * stays at explored opacity. Square grids only (hex has no natural diagonal) — returns `[]` otherwise.
+ */
+export function concaveCornerBlackTriangles(data: MapFileData, key: string, isFogNeighbour: (neighbourKey: string) => boolean): Point[][] {
+	if (data.gridType !== "square") return [];
+	const { a, b } = parseCellKey(key);
+	const [nw, ne, se, sw] = cellPolygon(data, key);
+	if (!nw || !ne || !se || !sw) return [];
+	const N = squareKey(a, b - 1);
+	const S = squareKey(a, b + 1);
+	const E = squareKey(a + 1, b);
+	const W = squareKey(a - 1, b);
+	const fogN = isFogNeighbour(N);
+	const fogS = isFogNeighbour(S);
+	const fogE = isFogNeighbour(E);
+	const fogW = isFogNeighbour(W);
+	const tris: Point[][] = [];
+	if (fogN && fogW) tris.push([nw, ne, sw]); // concave at NW → diagonal NE–SW
+	if (fogN && fogE) tris.push([ne, nw, se]); // concave at NE → diagonal NW–SE
+	if (fogS && fogE) tris.push([se, ne, sw]); // concave at SE → diagonal NE–SW
+	if (fogS && fogW) tris.push([sw, nw, se]); // concave at SW → diagonal NW–SE
+	return tris;
 }

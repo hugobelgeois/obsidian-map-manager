@@ -1,4 +1,4 @@
-import { buildVisionCache, cellCenter, footprintCenter, isPointLit, isWorldPointExplored } from "../grid/fog";
+import { buildVisionCache, footprintCenter, isPointLit, isWorldPointExplored, worldPointToCellKey } from "../grid/fog";
 import { CELLED_GRID_TYPES, CellsByGridType, Layer, MapFileData } from "./mapData";
 
 /**
@@ -9,43 +9,60 @@ import { CELLED_GRID_TYPES, CellsByGridType, Layer, MapFileData } from "./mapDat
  * Rules (confirmed with the map's owner):
  * - `fogEnabled === false` → nothing is redacted, the whole map is exported as-is — except "light"
  *   tokens (see below), which are never exported regardless of fog.
- * - cell content (zone/stamp/label/links) → kept only if the cell's center was ever explored.
+ * - cell content (zone/stamp/label/links) → kept only if the cell is explored. Celled grids test
+ *   the cell key against `exploredCellsByGridType[gridType]` (the "avec grillage" per-cell fog);
+ *   grid type "none" (legacy ray-traced fog) tests the cell's center against the coarse
+ *   `exploredCells` bucket grid.
  * - markers (stamps) → kept if explored OR currently within a player's vision.
  * - "entity" tokens → kept only if currently within a player's vision (even if the ground under
  *   them was explored before — they can walk back out of sight).
  * - "player" tokens → always kept.
  * - "light" tokens → never kept, fog on or off: a pure light fixture, not something a player ever
  *   sees directly — same rule as the live player-mirror canvas (`MapCanvas.isLightTokenHiddenFromMirror`).
- *   Its actual `lightRadius` effect (hiding fog, revealing nearby entities) is a live-view-only
- *   concept, deliberately not reflected here — this snapshot's own vision (`isLitWorld` below) still
- *   comes from real player vision alone, same as `Token.visionRadius`'s own scope decision.
  * - wall points/segments → always stripped: the public viewer never re-traces vision (it just
- *   paints the exported `exploredCells` as a static mask), and keeping wall geometry around would
+ *   paints the exported explored memory as a static mask), and keeping wall geometry around would
  *   otherwise leak the shape of unexplored rooms.
+ * - `exploredCellsByGridType` for grid types other than the active one → cleared (irrelevant to the
+ *   export, and needless bulk).
  */
 export function buildPublicSnapshot(data: MapFileData): MapFileData {
 	const clone = structuredClone(data);
 	clone.tokens = clone.tokens.filter((token) => (token.category ?? "entity") !== "light");
 	if (!clone.fogEnabled) return clone;
 
-	const exploredSet = new Set(clone.exploredCells);
+	const gridType = clone.gridType;
 	const visionCache = buildVisionCache(clone);
-	const isExploredWorld = (x: number, y: number) => isWorldPointExplored(exploredSet, clone, x, y);
 	const isLitWorld = (x: number, y: number) => isPointLit(visionCache, x, y, false);
 
-	clone.layers = clone.layers.map((layer) => redactLayer(clone, layer, isExploredWorld, isLitWorld));
+	let isCellExplored: (key: string) => boolean;
+	let isExploredWorld: (x: number, y: number) => boolean;
+	if (gridType === "none") {
+		const exploredSet = new Set(clone.exploredCells);
+		isCellExplored = () => false;
+		isExploredWorld = (x, y) => isWorldPointExplored(exploredSet, clone, x, y);
+	} else {
+		const exploredSet = new Set(clone.exploredCellsByGridType[gridType]);
+		isCellExplored = (key) => exploredSet.has(key);
+		isExploredWorld = (x, y) => exploredSet.has(worldPointToCellKey(clone, x, y));
+	}
+
+	clone.layers = clone.layers.map((layer) => redactLayer(layer, isCellExplored, isExploredWorld, isLitWorld));
 	clone.tokens = clone.tokens.filter((token) => {
 		if ((token.category ?? "entity") === "player") return true;
 		const center = footprintCenter(clone, token);
 		return isLitWorld(center.x, center.y);
 	});
 
+	for (const gt of CELLED_GRID_TYPES) {
+		if (gt !== gridType) clone.exploredCellsByGridType[gt] = [];
+	}
+
 	return clone;
 }
 
 function redactLayer(
-	data: MapFileData,
 	layer: Layer,
+	isCellExplored: (key: string) => boolean,
 	isExploredWorld: (x: number, y: number) => boolean,
 	isLitWorld: (x: number, y: number) => boolean
 ): Layer {
@@ -53,8 +70,7 @@ function redactLayer(
 	for (const gridType of CELLED_GRID_TYPES) {
 		const cells: CellsByGridType[typeof gridType] = {};
 		for (const [key, cell] of Object.entries(layer.cellsByGridType[gridType])) {
-			const center = cellCenter(data, key);
-			if (isExploredWorld(center.x, center.y)) cells[key] = cell;
+			if (isCellExplored(key)) cells[key] = cell;
 		}
 		cellsByGridType[gridType] = cells;
 	}

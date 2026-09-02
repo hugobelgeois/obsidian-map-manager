@@ -1,16 +1,6 @@
 import { DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM } from "../grid/gridMath";
 import { GridType, TokenTemplate, ZoneType } from "../data/mapData";
 
-/**
- * `"none"` — static fog, no redraw loop.
- * `"simple"` — the previous boolean `fogAnimations: true` behavior: the whole explored/unexplored
- * frontier trembles together as one shared shift, plus each player's vision-fan edge wobbles.
- * `"advanced"` — the frontier trembles per-tile instead of as one shared shift, so different patches
- * of fog drift independently ("chaque zone bouge individuellement") instead of the whole boundary
- * moving in lockstep — see `organicJitter2D` in `MapCanvas.ts`.
- */
-export type FogAnimationMode = "none" | "simple" | "advanced";
-
 export interface MapManagerSettings {
 	defaultGridType: GridType;
 	defaultCellSize: number;
@@ -22,8 +12,16 @@ export interface MapManagerSettings {
 	infoPanelWidth: number;
 	defaultMinZoom: number;
 	defaultMaxZoom: number;
-	/** Subtle animated flicker on the fog of war's vision edge ("none" by default — a continuous redraw loop while active). */
-	fogAnimationMode: FogAnimationMode;
+	/**
+	 * "Adoucir le brouillard" — when on (the default), the celled-grid fog (`FogRenderer.renderCellFog`)
+	 * draws a light animated fade on the explored side of every explored/fog cell border (fog cells stay
+	 * fully black), and grid type "none" keeps its legacy edge tremble; a continuous redraw loop runs
+	 * while a map with fog is open. When off, fog is crisp and fully static (no redraw loop). Replaces
+	 * the old 3-way `fogAnimationMode`.
+	 */
+	fogSoftening: boolean;
+	/** Debug overlay: strokes each player token's line-of-sight polygon, the rays to its vertices, and its light-radius circle over the celled-grid fog (view mode). Off by default. */
+	fogDebugVisionRays: boolean;
 	/** Seconds of inactivity after a map edit before `<map>.json` (see `publishPublicSnapshot`) is regenerated automatically — see `wireAutoPublish`. `0` disables auto-publishing entirely. */
 	autoPublishDelaySeconds: number;
 	/** Degree increment for a token's rotation dial (see `InfoPanel.makeRotationDialField`) — both its jog-dial slider and its paired number input step by this amount. */
@@ -66,7 +64,8 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	infoPanelWidth: 280,
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
-	fogAnimationMode: "none",
+	fogSoftening: true,
+	fogDebugVisionRays: false,
 	autoPublishDelaySeconds: 10,
 	tokenRotationStep: 10,
 	tokenImageSize: 256,

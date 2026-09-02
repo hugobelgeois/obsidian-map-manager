@@ -12,7 +12,7 @@ import {
 	squareWorldToCell,
 	worldToScreen,
 } from "../grid/gridMath";
-import { drawFogMemoryMask, drawLinkBadge, drawMarker, drawStampAndLabel, drawToken, drawZoneFill } from "../render/drawing";
+import { drawCellFogMask, drawFogMemoryMask, drawLinkBadge, drawMarker, drawStampAndLabel, drawToken, drawZoneFill } from "../render/drawing";
 import { PublicViewController } from "./PublicViewController";
 
 const MIN_CELL_PIXELS = 12;
@@ -85,12 +85,16 @@ export class PublicMapCanvas {
 	private lastPointer = { x: 0, y: 0 };
 
 	private readonly resolveAssetUrl: (path: string) => string;
+	/** Explored fog memory: per-cell keys for a celled grid, coarse world buckets for grid type "none". */
 	private readonly exploredSet: Set<string>;
+	/** Non-null while the soft-fog fade loop is re-rendering every frame (celled grid + `snapshot.fogSoftening`). */
+	private fogAnimationFrameId: number | null = null;
 	private unsubscribe: () => void;
 
 	constructor(private container: HTMLElement, private controller: PublicViewController, options: PublicMapCanvasOptions = {}) {
 		this.resolveAssetUrl = options.resolveAssetUrl ?? defaultResolveAssetUrl;
-		this.exploredSet = new Set(controller.snapshot.map.exploredCells);
+		const map = controller.snapshot.map;
+		this.exploredSet = new Set(map.gridType === "none" ? map.exploredCells : map.exploredCellsByGridType[map.gridType]);
 
 		this.canvas = document.createElement("canvas");
 		this.canvas.className = "map-manager-public-canvas";
@@ -126,6 +130,7 @@ export class PublicMapCanvas {
 	}
 
 	destroy(): void {
+		if (this.fogAnimationFrameId !== null) cancelAnimationFrame(this.fogAnimationFrameId);
 		this.resizeObserver.disconnect();
 		this.canvas.removeEventListener("pointerdown", this.onPointerDown);
 		this.canvas.removeEventListener("pointermove", this.onPointerMove);
@@ -437,15 +442,44 @@ export class PublicMapCanvas {
 		if (data.gridType === "none") this.drawMarkers(ctx);
 
 		if (data.fogEnabled) {
-			const viewportRect = this.visibleWorldRect();
-			const fogRect = this.renderFogLayer(dpr, viewportRect);
-			ctx.drawImage(this.fogBlurCanvas, fogRect.minX, fogRect.minY, fogRect.maxX - fogRect.minX, fogRect.maxY - fogRect.minY);
+			if (data.gridType === "none") {
+				// Legacy ray-traced fog memory: coarse buckets, blurred to soften the blocky edges.
+				const viewportRect = this.visibleWorldRect();
+				const fogRect = this.renderFogLayer(dpr, viewportRect);
+				ctx.drawImage(this.fogBlurCanvas, fogRect.minX, fogRect.minY, fogRect.maxX - fogRect.minX, fogRect.maxY - fogRect.minY);
+			} else {
+				// "Avec grillage" per-cell fog: crisp cells (+ optional soft fade), no light circles
+				// (the export carries no live vision) — drawn straight onto the main canvas.
+				const soft = this.controller.snapshot.fogSoftening;
+				drawCellFogMask(ctx, data, this.exploredSet, this.visibleWorldRect(), soft, soft ? performance.now() / 1000 : 0);
+			}
 		}
 
 		this.drawTokens(ctx, data.tokens);
 		this.drawSelectionHighlight(ctx, cellSize);
 
 		ctx.restore();
+		this.syncFogAnimation();
+	}
+
+	/**
+	 * Keeps a `requestAnimationFrame` loop running only while the soft fade is actually visible
+	 * (celled grid + `snapshot.fogSoftening` + fog enabled), so the fade breathes; otherwise the fog
+	 * is fully static and this never fires.
+	 */
+	private syncFogAnimation(): void {
+		const map = this.controller.snapshot.map;
+		const shouldAnimate = map.fogEnabled && map.gridType !== "none" && this.controller.snapshot.fogSoftening;
+		if (shouldAnimate && this.fogAnimationFrameId === null) {
+			const tick = () => {
+				this.fogAnimationFrameId = requestAnimationFrame(tick);
+				this.render();
+			};
+			this.fogAnimationFrameId = requestAnimationFrame(tick);
+		} else if (!shouldAnimate && this.fogAnimationFrameId !== null) {
+			cancelAnimationFrame(this.fogAnimationFrameId);
+			this.fogAnimationFrameId = null;
+		}
 	}
 
 	private visibleWorldRect(): { minX: number; minY: number; maxX: number; maxY: number } {

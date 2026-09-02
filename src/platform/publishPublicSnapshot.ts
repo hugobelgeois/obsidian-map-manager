@@ -19,7 +19,7 @@ import { renderNoteSnapshot } from "./renderNoteSnapshot";
 export async function publishPublicSnapshot(app: App, mapFile: TFile, data: MapFileData, settings: MapManagerSettings): Promise<TFile> {
 	const redacted = buildPublicSnapshot(data);
 	const rewritten = rewriteAssetPathsForSite(redacted);
-	const snapshot = await renderNoteSnapshot(app, rewritten, settings.defaultZoneTypes, settings.defaultTokenTemplates);
+	const snapshot = await renderNoteSnapshot(app, rewritten, settings.defaultZoneTypes, settings.defaultTokenTemplates, settings.fogSoftening);
 	const json = JSON.stringify(snapshot, null, "\t");
 	const path = publicSnapshotPath(mapFile.path);
 	const existing = app.vault.getAbstractFileByPath(path);

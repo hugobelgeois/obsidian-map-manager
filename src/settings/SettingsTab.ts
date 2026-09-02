@@ -1,7 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { DEFAULT_TOKEN_TAB_NAMES, GRID_TYPE_LABELS, GRID_TYPES, GridType } from "../data/mapData";
-import { FogAnimationMode } from "./types";
 import { generateId } from "../utils";
 
 export class MapManagerSettingsTab extends PluginSettingTab {
@@ -100,17 +99,25 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Animation du brouillard")
+			.setName("Adoucir le brouillard")
 			.setDesc(
-				"Fait légèrement trembler le bord du brouillard de guerre, au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. « poussée » fait bouger chaque zone du brouillard indépendamment plutôt que l'ensemble d'un seul bloc."
+				"Ajoute un léger fondu animé entre les cases explorées et les cases brouillard (le fondu reste du côté des cases explorées, les cases brouillard restent entièrement noires), au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. Désactivé : rendu net (case brouillard / explorée / visible bien distinctes), aucune animation."
 			)
-			.addDropdown((dd) => {
-				dd.addOption("none", "Pas d'animation");
-				dd.addOption("simple", "Animation simple");
-				dd.addOption("advanced", "Animation poussée");
-				dd.setValue(settings.fogAnimationMode);
-				dd.onChange(async (value) => {
-					settings.fogAnimationMode = value as FogAnimationMode;
+			.addToggle((toggle) => {
+				toggle.setValue(settings.fogSoftening);
+				toggle.onChange(async (value) => {
+					settings.fogSoftening = value;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Afficher les rayons de vision (debug)")
+			.setDesc("Trace, en mode vue avec brouillard, le polygone de ligne de vue de chaque pion joueur, les rayons vers ses sommets et son cercle de lumière. À n'activer que pour diagnostiquer le brouillard.")
+			.addToggle((toggle) => {
+				toggle.setValue(settings.fogDebugVisionRays);
+				toggle.onChange(async (value) => {
+					settings.fogDebugVisionRays = value;
 					await this.plugin.saveSettings();
 				});
 			});

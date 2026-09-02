@@ -1632,12 +1632,26 @@ export class MapController {
 	}
 
 	resetFog(): void {
-		this.update((data) => (data.exploredCells = []));
+		this.update((data) => {
+			if (data.gridType === "none") data.exploredCells = [];
+			else data.exploredCellsByGridType[data.gridType] = [];
+		});
+	}
+
+	/**
+	 * The "ever explored" memory store for the current grid type: the per-cell
+	 * `exploredCellsByGridType` array for celled grids, or the legacy coarse-bucket `exploredCells`
+	 * for grid type "none" (which keeps the ray-traced fog). Returned by reference so `getExploredSet`
+	 * can key its cache on identity — switching grid type yields a different array.
+	 */
+	private exploredArray(data: MapFileData): string[] {
+		return data.gridType === "none" ? data.exploredCells : data.exploredCellsByGridType[data.gridType];
 	}
 
 	getExploredSet(): Set<string> {
-		if (this.exploredSetCache?.source !== this.data.exploredCells) {
-			this.exploredSetCache = { source: this.data.exploredCells, set: new Set(this.data.exploredCells) };
+		const source = this.exploredArray(this.data);
+		if (this.exploredSetCache?.source !== source) {
+			this.exploredSetCache = { source, set: new Set(source) };
 		}
 		return this.exploredSetCache.set;
 	}
@@ -1661,7 +1675,7 @@ export class MapController {
 		for (const key of toAdd) existing.add(key);
 		this.update(
 			(data) => {
-				data.exploredCells.push(...toAdd);
+				this.exploredArray(data).push(...toAdd);
 			},
 			{ history: false }
 		);

@@ -192,7 +192,8 @@ export async function renderNoteSnapshot(
 	app: App,
 	redactedMap: MapFileData,
 	zoneTypes: ZoneType[],
-	tokenTemplates: TokenTemplate[]
+	tokenTemplates: TokenTemplate[],
+	fogSoftening: boolean
 ): Promise<PublicMapSnapshot> {
 	const map = materializeTokenTabs(redactedMap, tokenTemplates);
 	const notes: PublicMapSnapshot["notes"] = {};
@@ -200,5 +201,5 @@ export async function renderNoteSnapshot(
 		const html = await renderNoteHtml(app, link);
 		if (html !== null) notes[link] = { html };
 	}
-	return { map, notes, tokenStats: resolveTokenStats(app, map, tokenTemplates), zoneTypes };
+	return { map, notes, tokenStats: resolveTokenStats(app, map, tokenTemplates), zoneTypes, fogSoftening };
 }

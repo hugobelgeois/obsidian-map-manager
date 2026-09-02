@@ -1,26 +1,43 @@
 import { MapController, MapMode } from "../controller/MapController";
-import { FogAnimationMode, MapManagerSettings } from "../settings/types";
-import { Token, resolveEyeCones, resolveLightRadius } from "../data/mapData";
-import { Point, ViewTransform, getVisibleHexCells, getVisibleSquareCells, hexCellToWorldCenter, hexCorners, screenToWorld } from "../grid/gridMath";
+import { MapManagerSettings } from "../settings/types";
+import { MapFileData, Token, resolveEyeCones, resolveLightRadius } from "../data/mapData";
+import {
+	Point,
+	ViewTransform,
+	getVisibleHexCells,
+	getVisibleSquareCells,
+	hexCellToWorldCenter,
+	hexCellsInWorldRect,
+	hexCorners,
+	screenToWorld,
+	squareCellsInWorldRect,
+} from "../grid/gridMath";
 import {
 	ResolvedWallSegment,
 	VisionRays,
 	castEntityConeRays,
 	castLightRays,
+	cellPolygon,
 	cellVisualWidth,
+	cellsWallSeparated,
 	clipLightToPlayerLineOfSight,
+	concaveCornerBlackTriangles,
 	effectiveCellSize,
+	exploredCellsInRect,
 	fogBucketSize as baseFogBucketSize,
 	hasLineOfSight,
+	isCellFullyLit,
 	isPointLit,
 	isWorldPointExplored,
+	traceVisibilityPolygon,
+	worldPointToCellKey,
 } from "../grid/fog";
 import { ImageBounds, WorldRect } from "./canvasTypes";
 
 /** Fog opacity for ground that has never been in a player's vision. */
 const FOG_OPACITY_UNEXPLORED = 1;
-/** Fog opacity for ground that has been seen before but isn't currently lit. */
-const FOG_OPACITY_EXPLORED = 0.55;
+/** Fog opacity for ground that has been seen before but isn't currently lit ("noir à 50 %"). */
+const FOG_OPACITY_EXPLORED = 0.5;
 
 /**
  * Hard cap on how many fog-memory buckets get scanned per axis in one frame — see
@@ -38,13 +55,6 @@ const FOG_TREMBLE_SCREEN_PX = 4;
 const FOG_MEMORY_TREMBLE_SCREEN_PX = 10;
 /** Angular speed (rad/s) of the tremble's sine wave. */
 const FOG_TREMBLE_SPEED = 1.6;
-/**
- * World-unit wavelength of the "advanced" memory-frontier tremble's spatial noise (see
- * `organicJitter2D`) — roughly the size of one independently-drifting "zone" of fog. Tiles much
- * closer together than this move almost identically (no seam at their shared edge); tiles farther
- * apart than this drift increasingly out of sync.
- */
-const FOG_ORGANIC_WAVELENGTH = 260;
 /** Fixed screen-pixel blur radius for the fog buffer (see `drawFog`) — independent of zoom or the LOD tile size. */
 const FOG_BLUR_SCREEN_PX = 22;
 /** Fixed screen-pixel overdraw margin on the offscreen fog buffer — see `renderFogLayer`. Comfortably larger than `FOG_BLUR_SCREEN_PX`. */
@@ -56,8 +66,11 @@ const FOG_OVERDRAW_PX = FOG_BLUR_SCREEN_PX * 3;
  * this needs real headroom past that nominal radius, not just a few px of slack.
  */
 const FOG_LEAK_INSET_PX = FOG_BLUR_SCREEN_PX * 2.5;
-/** Fog animations (the tremble, and the render loop driving it) are force-disabled at or past this zoom — see `activeFogAnimationMode`. */
+/** Fog animation (the tremble/fade, and the render loop driving it) is force-disabled below this zoom — see `fogAnimationActive`. */
 const FOG_ANIMATION_MIN_ZOOM = 0.5;
+
+/** Depth of the "adoucir le brouillard" fade band, as a fraction of a cell width — see `drawCellFogSoftening`. */
+const FOG_SOFTEN_DEPTH_RATIO = 0.4;
 
 /** Stable per-token phase offset (radians) so several tokens' fog tremble doesn't move in lockstep. */
 function tremblePhase(tokenId: string): number {
@@ -66,27 +79,17 @@ function tremblePhase(tokenId: string): number {
 	return (hash % 1000) / 1000;
 }
 
-/**
- * Smooth 2D pseudo-noise sampled at a world position and time, each axis roughly in [-1, 1] —
- * used only in "advanced" fog animation mode, for the memory frontier's per-tile drift (`drawFog`).
- *
- * This is deliberately a sum of a couple of *mismatched* sine waves (different spatial wavelengths,
- * different speeds, unrelated phase offsets) rather than either a single shared offset ("simple"
- * mode's `sharedJitterX`/`sharedJitterY`) or fully independent per-tile random phase. A single
- * offset moves the whole frontier as one rigid block — not what "advanced" asks for. Fully
- * independent per-tile randomness was tried first and looked like flickering static: neighboring
- * tiles got uncorrelated offsets, so gaps of raw unexplored-opacity fog flashed open between them
- * every frame as their offsets drifted apart. Because this function is continuous in `worldX`/
- * `worldY`, two points closer together than `FOG_ORGANIC_WAVELENGTH` come out nearly identical (no
- * seam at a shared tile edge), while points farther apart drift independently and out of phase —
- * which is what actually reads as "separate zones of fog, each alive on its own" instead of either
- * a single rigid shift or noise.
- */
-function organicJitter2D(worldX: number, worldY: number, time: number): { x: number; y: number } {
-	const k = (2 * Math.PI) / FOG_ORGANIC_WAVELENGTH;
-	const x = Math.sin(worldX * k + time * 0.5) * 0.55 + Math.sin(worldY * k * 1.7 - time * 0.33 + 1.3) * 0.45;
-	const y = Math.sin(worldY * k * 1.3 + time * 0.41 + 2.1) * 0.55 + Math.sin(worldX * k * 0.8 - time * 0.27 + 0.7) * 0.45;
-	return { x, y };
+/** Stable pseudo-random phase in `[0, 2π)` from an arbitrary string key — for de-syncing the soft fade band per cell edge. */
+function hashPhase(key: string): number {
+	let hash = 0;
+	for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
+	return (((hash >>> 0) % 1000) / 1000) * Math.PI * 2;
+}
+
+/** Appends `poly` as one closed subpath of `path`. */
+function polyToPath(path: Path2D, poly: Point[]): void {
+	poly.forEach((p, i) => (i === 0 ? path.moveTo(p.x, p.y) : path.lineTo(p.x, p.y)));
+	path.closePath();
 }
 
 /** A player token's traced vision for the current frame: 0..360° rays fanning out from its center (see `../grid/fog.ts`). */
@@ -253,14 +256,15 @@ export class FogRenderer {
 	}
 
 	/**
-	 * The active fog tremble mode right now: the setting has to be something other than "none", and
-	 * zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a render every
-	 * frame while zoomed out that far is the one combination that's shown fog visibly breaking near
-	 * the edges, so it's disabled there as a hard safety net regardless of the exact cause.
+	 * Whether the fog should animate right now: "Adoucir le brouillard" (`settings.fogSoftening`) has
+	 * to be on, and zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a
+	 * render every frame while zoomed out that far is the one combination that's shown fog visibly
+	 * breaking near the edges, so it's disabled there as a hard safety net regardless of the cause.
+	 * Drives both the celled-grid fade band (`drawCellFogSoftening`) and the legacy grid-"none" edge
+	 * tremble (`drawFog`/`appendVisionFan`).
 	 */
-	private activeFogAnimationMode(): FogAnimationMode {
-		if (this.settings.fogAnimationMode === "none" || this.transform.zoom < FOG_ANIMATION_MIN_ZOOM) return "none";
-		return this.settings.fogAnimationMode;
+	private fogAnimationActive(): boolean {
+		return this.settings.fogSoftening && this.transform.zoom >= FOG_ANIMATION_MIN_ZOOM;
 	}
 
 	/**
@@ -319,12 +323,12 @@ export class FogRenderer {
 
 	/**
 	 * Keeps a `requestAnimationFrame` loop running for as long as (and only while) fog is visible
-	 * and animations are actually active (see `activeFogAnimationMode`), so the vision edge's subtle
-	 * tremble (see `appendVisionFan`) keeps redrawing; otherwise fog is static and this never fires,
-	 * costing nothing when the setting is "none" (its default) or zoomed out too far.
+	 * and animation is active (see `fogAnimationActive`), so the soft fade band / vision-edge tremble
+	 * keeps redrawing; otherwise fog is fully static and this never fires, costing nothing when
+	 * "Adoucir le brouillard" is off or the view is zoomed out too far.
 	 */
 	syncAnimationLoop(): void {
-		const shouldAnimate = this.activeFogAnimationMode() !== "none" && this.isCurrentlyVisible();
+		const shouldAnimate = this.fogAnimationActive() && this.isCurrentlyVisible();
 		if (shouldAnimate && this.animationFrameId === null) {
 			const tick = () => {
 				this.animationFrameId = requestAnimationFrame(tick);
@@ -365,9 +369,9 @@ export class FogRenderer {
 		if (pose) return { ...castLightRays(this.controller.getData(), token, wallSegments, pose), phase: tremblePhase(token.id) };
 		const version = this.controller.dataVersion;
 		const cached = this.lightRaysCache.get(token.id);
-		const { center, rays } = cached && cached.version === version ? cached.result : castLightRays(this.controller.getData(), token, wallSegments);
-		if (!cached || cached.version !== version) this.lightRaysCache.set(token.id, { version, result: { center, rays } });
-		return { center, rays, phase: tremblePhase(token.id) };
+		const result = cached && cached.version === version ? cached.result : castLightRays(this.controller.getData(), token, wallSegments);
+		if (!cached || cached.version !== version) this.lightRaysCache.set(token.id, { version, result });
+		return { ...result, phase: tremblePhase(token.id) };
 	}
 
 	/** Same idea as `castLightRaysForToken`, for one of an entity's `resolveEyeCones` cones — see `drawEntityEyeCones`. */
@@ -375,10 +379,10 @@ export class FogRenderer {
 		const version = this.controller.dataVersion;
 		const key = `${token.id}|${direction}|${fullAngleDeg}`;
 		const cached = this.entityConeRaysCache.get(key);
-		const { center, rays } =
+		const result =
 			cached && cached.version === version ? cached.result : castEntityConeRays(this.controller.getData(), token, direction, fullAngleDeg, wallSegments);
-		if (!cached || cached.version !== version) this.entityConeRaysCache.set(key, { version, result: { center, rays } });
-		return { center, rays, phase: tremblePhase(token.id) };
+		if (!cached || cached.version !== version) this.entityConeRaysCache.set(key, { version, result });
+		return { ...result, phase: tremblePhase(token.id) };
 	}
 
 	/**
@@ -391,7 +395,7 @@ export class FogRenderer {
 	 * afterward from ever visibly bleeding past a ray's *true* reach; every other caller (GM tactical
 	 * previews, `buildRevealedPath`) leaves it at 0, the real, unshrunk reach.
 	 */
-	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, mode: FogAnimationMode, time: number, inset = 0): void {
+	private appendVisionFan(path: Path2D, vision: PlayerVisionRays, useDim: boolean, animate: boolean, time: number, inset = 0): void {
 		const { center, rays, phase } = vision;
 		let started = false;
 		for (let i = 0; i < rays.length; i++) {
@@ -400,26 +404,12 @@ export class FogRenderer {
 			const angle = (360 / rays.length) * i;
 			const rad = (angle * Math.PI) / 180;
 			let dist = Math.max(0, (useDim ? ray.dimEnd : ray.clearEnd) - inset);
-			if (mode !== "none" && dist > 0) {
+			if (animate && dist > 0) {
 				// Fixed screen-pixel amplitude (divided by zoom) so it stays equally visible at any
 				// zoom, capped to a fraction of `dist` so it can't push the drawn point past the
 				// center (dividing a fixed px amount by a shrinking zoom is unbounded on its own).
 				const wobblePx = Math.min(FOG_TREMBLE_SCREEN_PX / this.transform.zoom, dist * 0.3);
-				if (mode === "advanced") {
-					// Sum of a few mismatched angular harmonics (integer multiples of `rad` — integer
-					// so the closed fan shape still lines up seamlessly at the 0/360 wrap, no seam)
-					// at different speeds and phases, instead of "simple"'s single traveling wave (one
-					// direction, one speed for the whole edge — see the `else` branch, unchanged).
-					// Summing mismatched harmonics makes different lobes of the fan edge bulge and
-					// recede on their own schedule rather than one ripple sweeping uniformly around it.
-					dist +=
-						wobblePx *
-						(Math.sin(time * 1.3 + rad * 3 + phase) * 0.5 +
-							Math.sin(time * 0.8 + rad * 7 + phase * 1.7) * 0.3 +
-							Math.sin(time * 1.9 + rad * 13 + phase * 2.3) * 0.2);
-				} else {
-					dist += wobblePx * Math.sin(time * FOG_TREMBLE_SPEED + angle * 0.11 + phase);
-				}
+				dist += wobblePx * Math.sin(time * FOG_TREMBLE_SPEED + angle * 0.11 + phase);
 			}
 			const x = center.x + Math.cos(rad) * dist;
 			const y = center.y + Math.sin(rad) * dist;
@@ -531,7 +521,7 @@ export class FogRenderer {
 			if (resolveLightRadius(token) <= 0) continue;
 			any = true;
 			const vision = this.castLightRaysForToken(token, wallSegments, this.getAnimatedPose(token.id) ?? undefined);
-			this.appendVisionFan(path, vision, false, "none", 0);
+			this.appendVisionFan(path, vision, false, false, 0);
 		}
 		if (!any) return;
 		ctx.fillStyle = FogRenderer.TOKEN_LIGHT_ZONE_COLOR;
@@ -552,7 +542,7 @@ export class FogRenderer {
 			const path = new Path2D();
 			for (const token of tokens) {
 				for (const cone of resolveEyeCones(token)) {
-					this.appendVisionFan(path, this.castEntityConeVision(token, cone.direction, cone[key], wallSegments), false, "none", 0);
+					this.appendVisionFan(path, this.castEntityConeVision(token, cone.direction, cone[key], wallSegments), false, false, 0);
 				}
 			}
 			ctx.fillStyle = `rgba(220, 38, 38, ${alpha})`;
@@ -656,10 +646,10 @@ export class FogRenderer {
 			}
 		}
 
-		for (const vision of this.frameVisionCache) this.appendVisionFan(path, vision, true, "none", 0);
+		for (const vision of this.frameVisionCache) this.appendVisionFan(path, vision, true, false, 0);
 		// A wall standing inside a light's own (already wall-blocked) reach must not get its shadow
 		// patch redrawn over that same light — see `frameLightCache`.
-		for (const vision of this.frameLightCache) this.appendVisionFan(path, vision, true, "none", 0);
+		for (const vision of this.frameLightCache) this.appendVisionFan(path, vision, true, false, 0);
 		return path;
 	}
 
@@ -824,6 +814,310 @@ export class FogRenderer {
 		ctx.restore();
 	}
 
+	// ---- "Avec grillage" per-cell fog (celled grid types) ----
+
+	/**
+	 * Fog for celled grid types (`square`/`hex-pointy`/`hex-flat`), replacing the legacy ray-traced
+	 * bucket fog (`renderAndComposite`, kept for grid type `"none"`):
+	 *
+	 * - the whole visible area starts fully black, every explored cell (`getExploredSet()`) punched
+	 *   back to half opacity — a "fog" cell is thus full-opacity, an "explored" one half;
+	 * - a concave corner of an explored cell (two orthogonally-adjacent fog neighbours, wall-separated
+	 *   ones excluded) is cut on the diagonal, the half toward the corner going full black
+	 *   (`concaveCornerBlackTriangles`);
+	 * - each player token sees exactly "line of sight ∩ light": the fog punch is clipped to that
+	 *   token's line-of-sight polygon (`traceVisibilityPolygon`, traced well past the screen so a wall
+	 *   shadow edge is one straight line from the token past the corner), then, inside that clip, its
+	 *   own light circle is punched as a real `ctx.arc` (round edge where the light just runs out) plus
+	 *   every other light source's own wall-clipped reach (`frameLightRawCache`) — so a distant lit
+	 *   room shows only exactly where this player's line of sight reaches it;
+	 * - when "Adoucir le brouillard" is on, a soft (animated, when zoom allows) fade on the explored
+	 *   side of every explored/fog border, never spilling onto the fog cells;
+	 * - a cell wholly inside a player's light (`isCellFullyLit`) is written to `exploredCellsByGridType`
+	 *   via `markExplored`, unless fog is frozen.
+	 *
+	 * All per-cell work is bounded by the explored cells actually on screen (`exploredCellsInRect`)
+	 * plus a small neighbourhood around each light, so it stays cheap however far the view is zoomed
+	 * out. Drawn crisp on the offscreen `fogCanvas` (no blur pass) and blitted back.
+	 */
+	renderCellFog(ctx: CanvasRenderingContext2D, dpr: number, imageBounds: ImageBounds | null, wallSegments: ResolvedWallSegment[]): void {
+		const data = this.controller.getData();
+		if (data.gridType === "none") return;
+		const rect = this.visibleWorldRect();
+		const { w: viewportW, h: viewportH } = this.getViewportSize();
+		const w = Math.max(1, Math.round(viewportW * dpr));
+		const h = Math.max(1, Math.round(viewportH * dpr));
+		if (this.fogCanvas.width !== w || this.fogCanvas.height !== h) {
+			this.fogCanvas.width = w;
+			this.fogCanvas.height = h;
+		}
+
+		const fctx = this.fogCtx;
+		fctx.save();
+		fctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		fctx.clearRect(0, 0, viewportW, viewportH);
+		fctx.translate(this.transform.panX, this.transform.panY);
+		fctx.scale(this.transform.zoom, this.transform.zoom);
+
+		const exploredSet = this.controller.getExploredSet();
+		const margin = effectiveCellSize(data) * 2;
+		const exploredKeys = exploredCellsInRect(data, exploredSet, rect, margin);
+
+		const exploredPath = new Path2D();
+		for (const key of exploredKeys) polyToPath(exploredPath, cellPolygon(data, key));
+		// Diagonal split at concave corners (square only — hex has no natural diagonal).
+		const concavePath = new Path2D();
+		if (data.gridType === "square") {
+			for (const key of exploredKeys) {
+				const isFogNeighbour = (nk: string) => !exploredSet.has(nk) && !cellsWallSeparated(data, key, nk, wallSegments);
+				for (const tri of concaveCornerBlackTriangles(data, key, isFogNeighbour)) polyToPath(concavePath, tri);
+			}
+		}
+
+		// Everything fogged first, then explored cells punched back to half opacity, then the
+		// concave-corner halves back to full black.
+		fctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+		fctx.fillRect(rect.minX - margin, rect.minY - margin, rect.maxX - rect.minX + margin * 2, rect.maxY - rect.minY + margin * 2);
+		if (exploredKeys.length > 0) {
+			fctx.globalCompositeOperation = "destination-out";
+			fctx.fillStyle = "rgba(0, 0, 0, 1)";
+			fctx.fill(exploredPath);
+			fctx.globalCompositeOperation = "source-over";
+			fctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_EXPLORED})`;
+			fctx.fill(exploredPath);
+			fctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+			fctx.fill(concavePath);
+		}
+
+		// Soft fade on the explored side of explored/fog borders (static shape when zoomed out, else
+		// animated) — drawn before the light punch so a currently-lit border isn't darkened.
+		if (this.settings.fogSoftening) this.drawCellFogSoftening(fctx, data, exploredSet, exploredKeys, this.fogAnimationActive());
+
+		// What the player sees = "line of sight ∩ light". For each player token: clip the punch to that
+		// token's line-of-sight polygon (`traceVisibilityPolygon`, traced well past the screen so a
+		// wall shadow edge is one straight line from the token past the corner — and so a distant lit
+		// room is reachable by this same line of sight), then, inside that clip, punch its own light
+		// circle as a real `ctx.arc` AND every other light source's own wall-clipped reach
+		// (`frameLightRawCache`). So another lit room shows only where this player can actually see it,
+		// exactly — no loose ray-sample approximation, no light bleeding past a wall.
+		const losFar = Math.hypot(rect.maxX - rect.minX, rect.maxY - rect.minY) * 1.5 + 1;
+		for (const vision of this.frameVisionCache) {
+			if (vision.radius <= 0) continue;
+			const verts = traceVisibilityPolygon(vision.center, losFar, wallSegments);
+			if (verts.length < 3) continue;
+			fctx.save();
+			fctx.beginPath();
+			verts.forEach((p, i) => (i === 0 ? fctx.moveTo(p.x, p.y) : fctx.lineTo(p.x, p.y)));
+			fctx.closePath();
+			fctx.clip();
+			fctx.globalCompositeOperation = "destination-out";
+			fctx.fillStyle = "rgba(0, 0, 0, 1)";
+			fctx.beginPath();
+			fctx.arc(vision.center.x, vision.center.y, vision.radius, 0, Math.PI * 2);
+			fctx.fill();
+			for (const light of this.frameLightRawCache) {
+				const fan = new Path2D();
+				this.appendVisionFan(fan, light, false, false, 0);
+				fctx.fill(fan);
+			}
+			fctx.restore();
+		}
+		fctx.globalCompositeOperation = "source-over";
+		fctx.restore();
+
+		ctx.save();
+		if (imageBounds) {
+			ctx.beginPath();
+			ctx.rect(imageBounds.x, imageBounds.y, imageBounds.w, imageBounds.h);
+			ctx.clip();
+		}
+		ctx.drawImage(this.fogCanvas, rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
+		ctx.restore();
+
+		// Cells now wholly within a player's light become permanently explored — last, since
+		// `markExplored` re-enters `MapCanvas.render()` synchronously (which redraws + reblits this
+		// same buffer). `markExplored` itself is a no-op while `fogFrozen`. Only cells in a light's
+		// own neighbourhood are ever tested, so this stays cheap regardless of zoom.
+		if (!data.fogFrozen && this.frameVisionCache.length > 0) {
+			const newlyExplored: string[] = [];
+			const seen = new Set<string>();
+			for (const vision of this.frameVisionCache) {
+				if (vision.radius <= 0) continue;
+				for (const key of this.cellKeysInDisc(data, vision.center, vision.radius)) {
+					if (seen.has(key) || exploredSet.has(key)) continue;
+					seen.add(key);
+					if (isCellFullyLit(data, key, this.frameVisionCache, wallSegments)) newlyExplored.push(key);
+				}
+			}
+			if (newlyExplored.length > 0) this.controller.markExplored(newlyExplored);
+		}
+	}
+
+	/**
+	 * Debug overlay (`settings.fogDebugVisionRays`): for every player token, strokes the rays out to
+	 * its line-of-sight polygon vertices (`traceVisibilityPolygon`, unclamped — so rays that hit no
+	 * wall visibly overshoot the light circle), the polygon outline itself, and its light-radius
+	 * circle — straight onto the main canvas under the world transform. Only meaningful while fog is
+	 * visible (`frameVisionCache` is populated); a no-op otherwise.
+	 */
+	drawDebugVisionRays(ctx: CanvasRenderingContext2D, wallSegments: ResolvedWallSegment[]): void {
+		if (!this.settings.fogDebugVisionRays || this.frameVisionCache.length === 0) return;
+		const zoom = this.transform.zoom;
+		const r = this.visibleWorldRect();
+		const losFar = Math.hypot(r.maxX - r.minX, r.maxY - r.minY) * 1.5 + 1;
+		ctx.save();
+		ctx.lineWidth = 1 / zoom;
+		for (const vision of this.frameVisionCache) {
+			const { x: cx, y: cy } = vision.center;
+			// Same polygon the punch uses (`renderCellFog`) — rays run well past the screen.
+			const verts = traceVisibilityPolygon(vision.center, losFar, wallSegments);
+
+			ctx.strokeStyle = "rgba(0, 200, 255, 0.3)";
+			ctx.beginPath();
+			for (const p of verts) {
+				ctx.moveTo(cx, cy);
+				ctx.lineTo(p.x, p.y);
+			}
+			ctx.stroke();
+
+			ctx.strokeStyle = "rgba(0, 200, 255, 0.9)";
+			ctx.beginPath();
+			verts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+			ctx.closePath();
+			ctx.stroke();
+
+			// Magenta wash over the region the fog punch actually clears for this player: inside its
+			// line of sight, its own light circle plus every other light source's own reach.
+			if (vision.radius > 0 && verts.length >= 3) {
+				ctx.save();
+				ctx.beginPath();
+				verts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+				ctx.closePath();
+				ctx.clip();
+				ctx.fillStyle = "rgba(255, 0, 255, 0.18)";
+				ctx.beginPath();
+				ctx.arc(cx, cy, vision.radius, 0, Math.PI * 2);
+				ctx.fill();
+				for (const light of this.frameLightRawCache) {
+					ctx.beginPath();
+					light.rays.forEach((ray, i) => {
+						const ang = (2 * Math.PI * i) / light.rays.length;
+						const x = light.center.x + Math.cos(ang) * ray.clearEnd;
+						const y = light.center.y + Math.sin(ang) * ray.clearEnd;
+						return i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+					});
+					ctx.closePath();
+					ctx.fill();
+				}
+				ctx.restore();
+			}
+
+			if (vision.radius > 0) {
+				ctx.strokeStyle = "rgba(255, 210, 0, 0.9)";
+				ctx.beginPath();
+				ctx.arc(cx, cy, vision.radius, 0, Math.PI * 2);
+				ctx.stroke();
+			}
+
+			ctx.fillStyle = "rgba(255, 40, 40, 0.95)";
+			ctx.beginPath();
+			ctx.arc(cx, cy, 3 / zoom, 0, Math.PI * 2);
+			ctx.fill();
+		}
+
+		// Every other light source's own wall-clipped reach (`frameLightRawCache`), before it is
+		// clipped to any player's line of sight — outlined green so it's clear when one of those, not
+		// the player's own vision, is what reveals an area, and how much of it the player can see.
+		ctx.strokeStyle = "rgba(50, 220, 80, 0.9)";
+		for (const light of this.frameLightRawCache) {
+			const { center, rays } = light;
+			ctx.beginPath();
+			rays.forEach((ray, i) => {
+				const ang = (2 * Math.PI * i) / rays.length;
+				const x = center.x + Math.cos(ang) * ray.clearEnd;
+				const y = center.y + Math.sin(ang) * ray.clearEnd;
+				return i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+			});
+			ctx.closePath();
+			ctx.stroke();
+		}
+		ctx.restore();
+	}
+
+	/** Cell keys whose cell intersects the axis-aligned bounding box of the disc `center`/`radius`, current grid type. */
+	private cellKeysInDisc(data: MapFileData, center: Point, radius: number): string[] {
+		const size = effectiveCellSize(data);
+		const cells =
+			data.gridType === "square"
+				? squareCellsInWorldRect(center.x - radius, center.y - radius, center.x + radius, center.y + radius, size)
+				: hexCellsInWorldRect(
+						center.x - radius,
+						center.y - radius,
+						center.x + radius,
+						center.y + radius,
+						size,
+						data.gridType === "hex-pointy" ? "pointy" : "flat"
+				  );
+		return cells.map((c) => `${c.a},${c.b}`);
+	}
+
+	/**
+	 * The "Adoucir le brouillard" fade: for every explored cell edge that borders a fog cell, a
+	 * gradient band on the *explored* side only (edge → `FOG_SOFTEN_DEPTH_RATIO` of a cell inward,
+	 * `FOG_OPACITY_EXPLORED`-ish down to 0), so the fog cells across the border stay fully black. When
+	 * `animate`, the band depth/alpha breathe on a slow per-edge-desynced sine.
+	 */
+	private drawCellFogSoftening(ctx: CanvasRenderingContext2D, data: MapFileData, exploredSet: ReadonlySet<string>, exploredKeys: string[], animate: boolean): void {
+		const time = animate ? performance.now() / 1000 : 0;
+		const cell = effectiveCellSize(data);
+		const eps = cell * 0.1;
+		const maxDepth = cell * 0.45;
+		ctx.save();
+		ctx.globalCompositeOperation = "source-over";
+		for (const key of exploredKeys) {
+			const poly = cellPolygon(data, key);
+			let sx = 0;
+			let sy = 0;
+			for (const p of poly) {
+				sx += p.x;
+				sy += p.y;
+			}
+			const ccx = sx / poly.length;
+			const ccy = sy / poly.length;
+			for (let i = 0; i < poly.length; i++) {
+				const p = poly[i];
+				const q = poly[(i + 1) % poly.length];
+				if (!p || !q) continue;
+				const mx = (p.x + q.x) / 2;
+				const my = (p.y + q.y) / 2;
+				let nx = mx - ccx;
+				let ny = my - ccy;
+				const nl = Math.hypot(nx, ny) || 1;
+				nx /= nl;
+				ny /= nl;
+				if (exploredSet.has(worldPointToCellKey(data, mx + nx * eps, my + ny * eps))) continue;
+				const phase = hashPhase(`${key}|${i}`);
+				const wob = animate ? 0.8 + 0.3 * Math.sin(time * 1.4 + phase) : 1;
+				const depth = Math.min(FOG_SOFTEN_DEPTH_RATIO * cellVisualWidth(data) * wob, maxDepth);
+				const edgeAlpha = FOG_OPACITY_EXPLORED * 0.8 * (animate ? 0.85 + 0.15 * Math.sin(time * 1.1 + phase * 1.3) : 1);
+				const ix = -nx;
+				const iy = -ny;
+				const grad = ctx.createLinearGradient(mx, my, mx + ix * depth, my + iy * depth);
+				grad.addColorStop(0, `rgba(8, 8, 12, ${edgeAlpha})`);
+				grad.addColorStop(1, "rgba(8, 8, 12, 0)");
+				ctx.fillStyle = grad;
+				ctx.beginPath();
+				ctx.moveTo(p.x, p.y);
+				ctx.lineTo(q.x, q.y);
+				ctx.lineTo(q.x + ix * depth, q.y + iy * depth);
+				ctx.lineTo(p.x + ix * depth, p.y + iy * depth);
+				ctx.closePath();
+				ctx.fill();
+			}
+		}
+		ctx.restore();
+	}
+
 	/**
 	 * Scales a pair of insets eroding a tile's two *opposite* edges (e.g. west/east) down together,
 	 * only when they'd otherwise overlap and flip the tile's width negative — a narrow corridor or an
@@ -862,25 +1156,17 @@ export class FogRenderer {
 		const lightCache = this.frameLightCache;
 		const baseBucket = this.fogBucketSize();
 		const tile = this.fogIterationBucketSize(rect);
-		const mode = this.activeFogAnimationMode();
-		const animate = mode !== "none";
+		const animate = this.fogAnimationActive();
 		const time = animate ? performance.now() / 1000 : 0;
 		// A fixed screen-pixel amplitude, converted to world units by the current zoom, so the
 		// tremble stays equally visible at any zoom instead of shrinking away when zoomed out (a
 		// world-space amplitude like "a fraction of the tile size" shrinks on screen right along
 		// with everything else once zoom drops, which read as "the animation stops"). Capped to a
-		// fraction of `tile` so it can never exceed a sane range at extreme zoom.
-		//
-		// In "simple" mode this is a *single* offset applied uniformly to every tile's drawn
-		// position (not each tile's own size — see `jitterX`/`jitterY` below); in "advanced" mode
-		// each tile instead samples smooth spatial noise (see `organicJitter2D`) so different
-		// patches of the frontier drift independently instead of the whole boundary moving in
-		// lockstep. Neither mode touches which world point is sampled for the persisted-memory
-		// lookup a few lines down. Perturbing each tile's own rect *size* (an earlier version of
-		// this) could shrink a tile to zero or negative at extreme/changing zoom, which is what
-		// actually broke near the edges; a position-only shift can't do that, and keeping the memory
-		// lookup itself un-jittered means resetting fog has no bearing on the animation — it's
-		// purely cosmetic.
+		// fraction of `tile` so it can never exceed a sane range at extreme zoom. A single shared
+		// offset applied uniformly to every tile's drawn position (not each tile's own size — see
+		// `jitterX`/`jitterY` below), so adjacent tiles never separate; it doesn't touch which world
+		// point is sampled for the persisted-memory lookup a few lines down, so resetting fog has no
+		// bearing on the animation — it's purely cosmetic.
 		const jitterAmplitude = animate ? Math.min(FOG_MEMORY_TREMBLE_SCREEN_PX / this.transform.zoom, tile * 0.4) : 0;
 		const sharedJitterX = jitterAmplitude * Math.sin(time * FOG_TREMBLE_SPEED * 0.7);
 		const sharedJitterY = jitterAmplitude * Math.cos(time * FOG_TREMBLE_SPEED * 0.9);
@@ -953,35 +1239,16 @@ export class FogRenderer {
 			for (let bx = bx0; bx <= bx1; bx++) {
 				if (!isRevealedTile(bx, by)) continue;
 				hasExplored = true;
-				const worldX = bx * tile + tile / 2;
-				const worldY = by * tile + tile / 2;
-				// "simple": every tile of the explored/unexplored frontier shifts together a
-				// little (rather than only the vision fan near a token), so the whole fog
-				// boundary feels alive. "advanced": each tile instead samples smooth spatial
-				// noise (see `organicJitter2D`) at its own world position, so different zones of
-				// fog drift independently instead of the whole frontier moving as one block.
-				let jitterX = sharedJitterX;
-				let jitterY = sharedJitterY;
-				// In "advanced" mode, neighboring tiles can end up with slightly different
-				// offsets (that's the point — see above), which would otherwise crack open a
-				// sliver of raw unexplored-opacity fog between them right at their shared edge.
-				// `organicJitter2D` is built to keep that difference far smaller than
-				// `jitterAmplitude` between adjacent tiles, but inflating every tile by that same
-				// amplitude on all sides guarantees neighbors always overlap regardless, so nothing
-				// in this loop depends on exactly how smooth the noise turns out to be. "simple"
-				// needs none of this: one shared offset moves every tile identically, so adjacent
-				// tiles never separate in the first place.
-				let overlap = 0;
-				if (mode === "advanced") {
-					const n = organicJitter2D(worldX, worldY, time);
-					jitterX = jitterAmplitude * n.x;
-					jitterY = jitterAmplitude * n.y;
-					overlap = jitterAmplitude;
-				}
-				const left = bx * tile + jitterX - overlap;
-				const right = (bx + 1) * tile + jitterX + overlap;
-				const top = by * tile + jitterY - overlap;
-				const bottom = (by + 1) * tile + jitterY + overlap;
+				// Every tile of the explored/unexplored frontier shifts together by one shared offset
+				// (rather than only the vision fan near a token), so the whole fog boundary feels
+				// alive; one shared offset moves every tile identically, so adjacent tiles never
+				// separate and crack open a sliver of raw unexplored fog between them.
+				const jitterX = sharedJitterX;
+				const jitterY = sharedJitterY;
+				const left = bx * tile + jitterX;
+				const right = (bx + 1) * tile + jitterX;
+				const top = by * tile + jitterY;
+				const bottom = (by + 1) * tile + jitterY;
 				const westInset = isRevealedTile(bx - 1, by) ? 0 : erosionInset;
 				const eastInset = isRevealedTile(bx + 1, by) ? 0 : erosionInset;
 				const northInset = isRevealedTile(bx, by - 1) ? 0 : erosionInset;
@@ -1032,8 +1299,8 @@ export class FogRenderer {
 			// stick out past it and carve its own separate leak through the base layer.
 			const dimInset = FOG_LEAK_INSET_PX / this.transform.zoom;
 			for (const vision of cache) {
-				this.appendVisionFan(dimFan, vision, true, mode, time, dimInset);
-				this.appendVisionFan(clearFan, vision, false, mode, time, dimInset);
+				this.appendVisionFan(dimFan, vision, true, animate, time, dimInset);
+				this.appendVisionFan(clearFan, vision, false, animate, time, dimInset);
 			}
 			// Punch the full (dim) reach to transparent, repaint it at "explored" opacity, then punch
 			// the inner (clear) reach again so it ends up fully see-through.
@@ -1058,7 +1325,7 @@ export class FogRenderer {
 			// already stopped at (`castLightRays`).
 			const lightFan = new Path2D();
 			const lightInset = FOG_LEAK_INSET_PX / this.transform.zoom;
-			for (const vision of lightCache) this.appendVisionFan(lightFan, vision, false, mode, time, lightInset);
+			for (const vision of lightCache) this.appendVisionFan(lightFan, vision, false, animate, time, lightInset);
 			ctx.globalCompositeOperation = "destination-out";
 			ctx.fillStyle = "rgba(0, 0, 0, 1)";
 			ctx.fill(lightFan);

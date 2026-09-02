@@ -523,7 +523,7 @@ export function applyClockDelta(clock: Clock, delta: number): void {
 }
 
 export interface MapFileData {
-	version: 17;
+	version: 18;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -552,11 +552,19 @@ export interface MapFileData {
 	 */
 	fogFrozen: boolean;
 	/**
-	 * "Ever explored" fog memory, as coarse world-space bucket keys ("bx,by") — not grid cells.
-	 * Fog is traced by ray/path tracing rather than tested per grid cell (see MapCanvas), and this
-	 * memory grid is deliberately coarser than the visible grid and independent of grid type/shape.
+	 * "Ever explored" fog memory for grid type `"none"` only, as coarse world-space bucket keys
+	 * ("bx,by") — not grid cells. Grid type "none" keeps the legacy ray-traced/blurred fog (see
+	 * `FogRenderer.drawFog`), whose memory grid is deliberately coarser than any visible grid and
+	 * independent of grid shape. Celled grids use `exploredCellsByGridType` instead.
 	 */
 	exploredCells: string[];
+	/**
+	 * "Ever explored" fog memory for celled grid types, as actual cell keys (`squareKey`/`hexKey`),
+	 * stored per grid type exactly like `Layer.cellsByGridType` — the "avec grillage" fog
+	 * (`FogRenderer.renderCellFog`) is per-cell, so switching grid type starts that type's fog fresh
+	 * rather than reinterpreting keys under a different grid.
+	 */
+	exploredCellsByGridType: Record<CelledGridType, string[]>;
 }
 
 export interface MapDefaults {
@@ -573,6 +581,20 @@ export function isCellEmpty(cell: CellData | undefined): boolean {
 
 function emptyCellsByGridType(): CellsByGridType {
 	return { square: {}, "hex-pointy": {}, "hex-flat": {} };
+}
+
+function emptyExploredCellsByGridType(): Record<CelledGridType, string[]> {
+	return { square: [], "hex-pointy": [], "hex-flat": [] };
+}
+
+function parseExploredCellsByGridType(raw: unknown): Record<CelledGridType, string[]> {
+	const out = emptyExploredCellsByGridType();
+	if (!isRecord(raw)) return out;
+	for (const gt of CELLED_GRID_TYPES) {
+		const src = raw[gt];
+		if (Array.isArray(src)) out[gt] = [...new Set(src.filter(isString))];
+	}
+	return out;
 }
 
 let idCounter = 0;
@@ -600,7 +622,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 17,
+		version: 18,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
@@ -612,6 +634,7 @@ export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 		fogEnabled: false,
 		fogFrozen: false,
 		exploredCells: [],
+		exploredCellsByGridType: emptyExploredCellsByGridType(),
 	};
 }
 
@@ -948,6 +971,12 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// v17: token light gained a `lightLife` (0-100, doubling as the lit fraction of `lightRadius`) plus
 	// per-move/per-action drain settings, replacing the old boolean `lightEnabled` on/off flag — see
 	// `parseToken` (which folds a pre-v17 `lightEnabled: false` onto `lightRadius: 0`).
+	// v18: celled-grid fog switched from the coarse world-space bucket grid (`exploredCells`) to
+	// actual per-grid-type cell keys (`exploredCellsByGridType`) — a different coordinate system, so
+	// pre-v18 celled-grid memory is dropped rather than misinterpreted (same call as the v11 bucket
+	// switch). `exploredCells` is kept as-is: it stays the memory store for grid type "none", which
+	// keeps the legacy ray-traced fog.
+	const exploredCellsByGridType = version >= 18 ? parseExploredCellsByGridType(p.exploredCellsByGridType) : emptyExploredCellsByGridType();
 
 	const activeLayerId = isString(p.activeLayerId) && layers.some((l) => l.id === p.activeLayerId) ? p.activeLayerId : (layers[0]?.id ?? "");
 
@@ -961,7 +990,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 17, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
+	return { version: 18, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells, exploredCellsByGridType };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {
@@ -1041,4 +1070,10 @@ export interface PublicMapSnapshot {
 	notes: Record<string, PublicNoteContent>;
 	tokenStats: Record<string, PublicTokenStat[]>;
 	zoneTypes: ZoneType[];
+	/**
+	 * Frozen-at-publish-time copy of `settings.fogSoftening` (not part of `MapFileData` — see
+	 * "Settings" in CLAUDE.md): whether the exported viewer draws the soft animated fade between
+	 * explored and fog cells (`drawCellFogMask`) or crisp cell edges.
+	 */
+	fogSoftening: boolean;
 }

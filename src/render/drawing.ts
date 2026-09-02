@@ -1,12 +1,14 @@
-import { DEFAULT_TOKEN_COLOR, Marker, Token, ZoneType } from "../data/mapData";
+import { DEFAULT_TOKEN_COLOR, MapFileData, Marker, Token, ZoneType } from "../data/mapData";
+import { FogWorldRect, cellPolygon, cellVisualWidth, concaveCornerBlackTriangles, effectiveCellSize, exploredCellsInRect, worldPointToCellKey } from "../grid/fog";
+import { Point } from "../grid/gridMath";
 
 /** Below this on-screen font size (in px), a cell's label hides and its stamp grows to fill the space instead. */
 export const MIN_LABEL_PIXELS = 9;
 
 /** Fog opacity for ground that has never been in a player's vision. */
 export const FOG_OPACITY_UNEXPLORED = 1;
-/** Fog opacity for ground that has been seen before but isn't currently lit. */
-export const FOG_OPACITY_EXPLORED = 0.55;
+/** Fog opacity for ground that has been seen before but isn't currently lit ("noir à 50 %"). */
+export const FOG_OPACITY_EXPLORED = 0.5;
 
 /** Mixes a #rrggbb color toward white by `ratio` (0 = unchanged, 1 = white). Used for the selected-token border. */
 export function lightenColor(hex: string, ratio: number): string {
@@ -198,6 +200,114 @@ export function drawFogMemoryMask(
 		ctx.globalCompositeOperation = "source-over";
 		ctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_EXPLORED})`;
 		ctx.fill(exploredPath);
+	}
+	ctx.restore();
+}
+
+/** Appends `poly` as one closed subpath of `path`. */
+function polyToPath(path: Path2D, poly: Point[]): void {
+	poly.forEach((p, i) => (i === 0 ? path.moveTo(p.x, p.y) : path.lineTo(p.x, p.y)));
+	path.closePath();
+}
+
+/** Stable pseudo-random phase in `[0, 2π)` from a string key — de-syncs the soft fade band per cell edge. */
+function edgePhase(key: string): number {
+	let hash = 0;
+	for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
+	return (((hash >>> 0) % 1000) / 1000) * Math.PI * 2;
+}
+
+/**
+ * "Avec grillage" fog for a celled grid type, the read-only export counterpart to
+ * `FogRenderer.renderCellFog` — no light circles (the exported snapshot carries no live vision or
+ * walls, just the explored-cell set): fog cells filled full black, explored cells half, concave
+ * corners of explored cells cut on the diagonal (square grids), and, when `softening`, a soft fade
+ * on the explored side of every explored/fog border (animated via `time`, seconds). Drawn crisp
+ * under the caller's world transform, straight onto the given context with plain `source-over` fills
+ * (no `destination-out`) so it's safe on a shared canvas that already has the map drawn under it.
+ */
+export function drawCellFogMask(
+	ctx: CanvasRenderingContext2D,
+	data: MapFileData,
+	exploredSet: ReadonlySet<string>,
+	rect: FogWorldRect,
+	softening: boolean,
+	time: number
+): void {
+	const margin = effectiveCellSize(data) * 2;
+	const exploredKeys = exploredCellsInRect(data, exploredSet, rect, margin);
+
+	const exploredPath = new Path2D();
+	for (const key of exploredKeys) polyToPath(exploredPath, cellPolygon(data, key));
+	const fogBackPath = new Path2D();
+	if (data.gridType === "square") {
+		for (const key of exploredKeys) {
+			for (const tri of concaveCornerBlackTriangles(data, key, (nk) => !exploredSet.has(nk))) polyToPath(fogBackPath, tri);
+		}
+	}
+
+	ctx.save();
+	// Fog = the whole rect minus the explored cells, filled opaque via the even-odd rule (outer rect
+	// as one subpath, each explored cell polygon as a hole) — no `destination-out`, so the map drawn
+	// underneath survives everywhere the fog doesn't cover.
+	const fogRegion = new Path2D();
+	fogRegion.rect(rect.minX - margin, rect.minY - margin, rect.maxX - rect.minX + margin * 2, rect.maxY - rect.minY + margin * 2);
+	for (const key of exploredKeys) polyToPath(fogRegion, cellPolygon(data, key));
+	ctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+	ctx.fill(fogRegion, "evenodd");
+	if (exploredKeys.length > 0) {
+		ctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_EXPLORED})`;
+		ctx.fill(exploredPath);
+		// Diagonal concave-corner halves go back to full black.
+		ctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+		ctx.fill(fogBackPath);
+	}
+
+	if (softening) {
+		const cell = effectiveCellSize(data);
+		const eps = cell * 0.1;
+		const maxDepth = cell * 0.45;
+		for (const key of exploredKeys) {
+			const poly = cellPolygon(data, key);
+			let sx = 0;
+			let sy = 0;
+			for (const p of poly) {
+				sx += p.x;
+				sy += p.y;
+			}
+			const ccx = sx / poly.length;
+			const ccy = sy / poly.length;
+			for (let i = 0; i < poly.length; i++) {
+				const p = poly[i];
+				const q = poly[(i + 1) % poly.length];
+				if (!p || !q) continue;
+				const mx = (p.x + q.x) / 2;
+				const my = (p.y + q.y) / 2;
+				let nx = mx - ccx;
+				let ny = my - ccy;
+				const nl = Math.hypot(nx, ny) || 1;
+				nx /= nl;
+				ny /= nl;
+				if (exploredSet.has(worldPointToCellKey(data, mx + nx * eps, my + ny * eps))) continue;
+				const phase = edgePhase(`${key}|${i}`);
+				const wob = 0.8 + 0.3 * Math.sin(time * 1.4 + phase);
+				const depth = Math.min(0.4 * cellVisualWidth(data) * wob, maxDepth);
+				const edgeAlpha = FOG_OPACITY_EXPLORED * 0.8 * (0.85 + 0.15 * Math.sin(time * 1.1 + phase * 1.3));
+				const ix = -nx;
+				const iy = -ny;
+				const grad = ctx.createLinearGradient(mx, my, mx + ix * depth, my + iy * depth);
+				grad.addColorStop(0, `rgba(8, 8, 12, ${edgeAlpha})`);
+				grad.addColorStop(1, "rgba(8, 8, 12, 0)");
+				ctx.fillStyle = grad;
+				ctx.beginPath();
+				ctx.moveTo(p.x, p.y);
+				ctx.lineTo(q.x, q.y);
+				ctx.lineTo(q.x + ix * depth, q.y + iy * depth);
+				ctx.lineTo(p.x + ix * depth, p.y + iy * depth);
+				ctx.closePath();
+				ctx.fill();
+			}
+		}
 	}
 	ctx.restore();
 }
