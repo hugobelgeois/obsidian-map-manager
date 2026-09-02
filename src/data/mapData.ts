@@ -1,4 +1,4 @@
-import { ABS_MAX_ZOOM, ABS_MIN_ZOOM } from "../grid/gridMath";
+import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp } from "../grid/gridMath";
 
 export type GridType = "square" | "hex-pointy" | "hex-flat" | "none";
 
@@ -152,9 +152,9 @@ export interface TokenTemplate {
  * "light" is a pure light fixture, not a character: it never renders on the player-facing mirror
  * canvas at all (see `MapCanvas.isLightTokenHiddenFromMirror`) — only its `lightRadius` effect
  * (hiding fog, revealing nearby entities) is ever felt there — and it has nothing to configure
- * beyond `lightRadius` itself (no icon/image/name/rotation/size/color/template/tabs/vision — see
- * `InfoPanel.renderTokenPanel`, which skips straight from the category picker to the light-radius
- * field for this category).
+ * beyond its light (radius + life/drain, same fields as a "player" token — see `lightLife`) (no
+ * icon/image/name/rotation/size/color/template/tabs/vision — see `InfoPanel.renderTokenPanel`, which
+ * skips straight from the category picker to the light fields for this category).
  */
 export type TokenCategory = "player" | "entity" | "light";
 
@@ -247,25 +247,34 @@ export interface Token {
 	 */
 	lightRadius?: number;
 	/**
-	 * Whether this token's light is currently switched on — defaults to `true` (on) when unset, so
-	 * existing `lightRadius` values keep behaving exactly as they did before this field existed.
-	 * Deliberately separate from `lightRadius` itself so flipping it off/on (e.g. a torch being
-	 * doused/relit mid-session, editable in "Vue" mode too — see `InfoPanel.renderLightRadiusField`)
-	 * never loses the configured radius the way setting `lightRadius` back to `0` would. See
-	 * `resolveLightRadius`, the one place that actually gates `configuredLightRadius` on this flag
-	 * into the effective reach everything else reads.
+	 * "player"/"light" tokens only — the "life" (or fuel) left in this light, `0..100`, doubling as
+	 * the *fraction* of `lightRadius` currently actually lit: the effective reach is
+	 * `configuredLightRadius(token) * lightLife / 100` (see `resolveLightRadius`). `100`/unset (see
+	 * `DEFAULT_LIGHT_LIFE`) is a full-strength light; `0` is fully spent — reach `0`, but the
+	 * configured `lightRadius` and the drain settings below are kept, so it can be "refilled" by
+	 * editing this back up (`InfoPanel.renderLightRadiusField`) or the gamepad's R1 (see
+	 * `MapCanvas.handleGamepadLightRefill`). Replaces the old `lightEnabled` on/off flag entirely —
+	 * `lightLife === 0` *is* "off" now. Entities ignore this (always full radius).
 	 */
-	lightEnabled?: boolean;
+	lightLife?: number;
 	/**
-	 * How many cells the gamepad's L1/R1 buttons ("dim"/"brighten" — see `MapCanvas.handleGamepadLightStep`)
-	 * have currently reduced this token's light below its own `lightRadius` (the InfoPanel menu's
-	 * authored *maximum*, never itself touched by the gamepad). L1 increments this, R1 decrements it,
-	 * both clamped so the effective radius (`resolveLightRadius`) never goes below `0` or back above
-	 * that configured maximum. `0`/unset (the default) means at full configured brightness. Deliberately
-	 * separate from `lightRadius` itself for the same reason `lightEnabled` is: a live, in-session
-	 * adjustment shouldn't overwrite what the GM actually authored for this token.
+	 * "player"/"light" tokens only — when on, this light loses `lightMoveDrain` percent of `lightLife`
+	 * every time its own token steps one cell (players), or, for a "light" fixture, on a
+	 * `LIGHT_TOKEN_DRAIN_CHANCE` roll each time *any* player token steps (see
+	 * `MapController.drainLightForEvent`). **Unset means on** (only an explicit `false` disables it) —
+	 * a torch burns down by default.
 	 */
-	lightRadiusReduction?: number;
+	lightDrainOnMove?: boolean;
+	/** Percent of `lightLife` removed per move when `lightDrainOnMove` is on — see `DEFAULT_LIGHT_MOVE_DRAIN`. */
+	lightMoveDrain?: number;
+	/**
+	 * "player"/"light" tokens only — same as `lightDrainOnMove` but per "action" (a press of the
+	 * gamepad's triangle/Y button for the token's assigned player — see
+	 * `MapCanvas.handleGamepadAction`). **Unset means on** (only an explicit `false` disables it).
+	 */
+	lightDrainOnAction?: boolean;
+	/** Percent of `lightLife` removed per action when `lightDrainOnAction` is on — see `DEFAULT_LIGHT_ACTION_DRAIN`. */
+	lightActionDrain?: number;
 	/**
 	 * Legacy: used to link a player token's effective light radius to its own `visionRadius`. No
 	 * longer read anywhere — `lightRadius` is now the single, direct source of a player's light
@@ -309,6 +318,13 @@ export const DEFAULT_TOKEN_ROTATION = 0;
 
 /** Default `Token.lightRadius`, in cells — light is now the primary omnidirectional reveal for every category (see `resolveLightRadius`/`castLightRays`), so this defaults to a usable radius rather than "no light". */
 export const DEFAULT_LIGHT_RADIUS = 5;
+
+/** Default `Token.lightLife` (percent, `0..100`) — a fresh light is at full strength (full radius). */
+export const DEFAULT_LIGHT_LIFE = 100;
+/** Default `Token.lightMoveDrain` — percent of `lightLife` a light loses per cell moved when `lightDrainOnMove` is on. */
+export const DEFAULT_LIGHT_MOVE_DRAIN = 1;
+/** Default `Token.lightActionDrain` — percent of `lightLife` a light loses per action when `lightDrainOnAction` is on. */
+export const DEFAULT_LIGHT_ACTION_DRAIN = 5;
 
 /** Default `Token.sideEyeAngle` — how far each of an entity's two eye cones sits from its facing, in degrees. `0` collapses them onto a single forward direction. See `resolveEyeCones`. */
 export const DEFAULT_SIDE_EYE_ANGLE = 0;
@@ -357,27 +373,35 @@ export function resolveEyeCones(token: Token): EntityEyeCone[] {
 }
 
 /**
- * The radius `token`'s light is *configured* to use whenever it's switched on — `lightRadius`
- * itself, defaulting to `DEFAULT_LIGHT_RADIUS`. Deliberately ignores `lightEnabled` — see
- * `resolveLightRadius`, which layers that gate on top — so a temporarily switched-off light still
- * reports the number it'll come back on at (`InfoPanel.renderLightRadiusField`'s radius input reads
- * this, not `resolveLightRadius`, so toggling the light off never makes that field flash to `0`).
+ * The radius `token`'s light is *configured* to use at full strength — `lightRadius` itself,
+ * defaulting to `DEFAULT_LIGHT_RADIUS`. Deliberately ignores `lightLife` — see `resolveLightRadius`,
+ * which scales this down by the current life — so a spent light still reports the number it'll come
+ * back to once refilled (`InfoPanel.renderLightRadiusField`'s radius input reads this, not
+ * `resolveLightRadius`, so a drained light never makes that field flash to `0`).
  */
 export function configuredLightRadius(token: Token): number {
 	return token.lightRadius ?? DEFAULT_LIGHT_RADIUS;
 }
 
+/** `token.lightLife` clamped to `0..100`, defaulting to `DEFAULT_LIGHT_LIFE` — only meaningful for "player"/"light" tokens. */
+export function resolveLightLife(token: Token): number {
+	return clamp(token.lightLife ?? DEFAULT_LIGHT_LIFE, 0, 100);
+}
+
 /**
  * The light radius actually in effect for `token` right now (cells) — `configuredLightRadius`,
- * gated by `lightEnabled` and reduced by `lightRadiusReduction` (the gamepad's L1/R1 live dim/
- * brighten — see its own doc comment), clamped to never go negative. Every reader of a token's
- * *actual* light (`castLightRays`, `MapCanvas`'s `frameLightCache`/`drawTokenLightZones`) calls this
- * instead of reading `lightRadius` directly.
+ * scaled by `resolveLightLife` / 100 for "player" and "light" tokens (so a half-spent torch lights
+ * half its configured reach, and a fully-spent one lights nothing), full for every other category.
+ * Every reader of a token's *actual* light (`castLightRays`, `MapCanvas`'s `frameLightCache`/
+ * `drawTokenLightZones`) calls this instead of reading `lightRadius` directly.
  */
 export function resolveLightRadius(token: Token): number {
-	if (token.lightEnabled === false) return 0;
-	const reduction = Math.max(0, token.lightRadiusReduction ?? 0);
-	return Math.max(0, configuredLightRadius(token) - reduction);
+	const configured = configuredLightRadius(token);
+	const category = token.category ?? "entity";
+	if (category === "player" || category === "light") {
+		return Math.max(0, (configured * resolveLightLife(token)) / 100);
+	}
+	return Math.max(0, configured);
 }
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
@@ -499,7 +523,7 @@ export function applyClockDelta(clock: Clock, delta: number): void {
 }
 
 export interface MapFileData {
-	version: 16;
+	version: 17;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -576,7 +600,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 16,
+		version: 17,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
@@ -703,6 +727,11 @@ function parseTokenTabArray(raw: unknown): TokenTab[] | undefined {
 /** Exported for `tokenClipboard.ts`'s system-clipboard paste (Ctrl+V): a Ctrl+C payload is a JSON array of tokens shaped exactly like a `.map` file's own `tokens`, so validating a pasted one reuses this rather than a second parallel parser. */
 export function parseToken(value: unknown): Token | null {
 	if (!isRecord(value) || !isString(value.id) || !isString(value.icon)) return null;
+	const rawLightRadius = typeof value.lightRadius === "number" && value.lightRadius >= 0 ? value.lightRadius : undefined;
+	// Pre-v17 files had a `lightEnabled` on/off flag instead of `lightLife`. It's gone now (life === 0
+	// *is* "off"); a light explicitly switched off in an old file reopens with radius 0 (the GM re-sets
+	// the radius if they want it back), rather than silently coming back on at its stored radius.
+	const lightRadius = value.lightEnabled === false ? 0 : rawLightRadius;
 	return {
 		id: value.id,
 		cellKey: isString(value.cellKey) ? value.cellKey : undefined,
@@ -719,9 +748,12 @@ export function parseToken(value: unknown): Token | null {
 		visionAngle: typeof value.visionAngle === "number" ? value.visionAngle : undefined,
 		visionRange: typeof value.visionRange === "number" ? value.visionRange : undefined,
 		visionRadius: typeof value.visionRadius === "number" && value.visionRadius >= 0 ? value.visionRadius : undefined,
-		lightRadius: typeof value.lightRadius === "number" && value.lightRadius >= 0 ? value.lightRadius : undefined,
-		lightEnabled: typeof value.lightEnabled === "boolean" ? value.lightEnabled : undefined,
-		lightRadiusReduction: typeof value.lightRadiusReduction === "number" && value.lightRadiusReduction >= 0 ? value.lightRadiusReduction : undefined,
+		lightRadius,
+		lightLife: typeof value.lightLife === "number" ? clamp(value.lightLife, 0, 100) : undefined,
+		lightDrainOnMove: typeof value.lightDrainOnMove === "boolean" ? value.lightDrainOnMove : undefined,
+		lightMoveDrain: typeof value.lightMoveDrain === "number" && value.lightMoveDrain >= 0 ? value.lightMoveDrain : undefined,
+		lightDrainOnAction: typeof value.lightDrainOnAction === "boolean" ? value.lightDrainOnAction : undefined,
+		lightActionDrain: typeof value.lightActionDrain === "number" && value.lightActionDrain >= 0 ? value.lightActionDrain : undefined,
 		lightRadiusLinkedToVision: typeof value.lightRadiusLinkedToVision === "boolean" ? value.lightRadiusLinkedToVision : undefined,
 		sideEyeAngle: typeof value.sideEyeAngle === "number" ? value.sideEyeAngle : undefined,
 		detectionAngle: typeof value.detectionAngle === "number" ? value.detectionAngle : undefined,
@@ -913,6 +945,9 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 
 	// Clocks are new in v16; pre-v16 files simply have none yet.
 	const clocks = version >= 16 ? parseClockArray(p.clocks) : [];
+	// v17: token light gained a `lightLife` (0-100, doubling as the lit fraction of `lightRadius`) plus
+	// per-move/per-action drain settings, replacing the old boolean `lightEnabled` on/off flag — see
+	// `parseToken` (which folds a pre-v17 `lightEnabled: false` onto `lightRadius: 0`).
 
 	const activeLayerId = isString(p.activeLayerId) && layers.some((l) => l.id === p.activeLayerId) ? p.activeLayerId : (layers[0]?.id ?? "");
 
@@ -926,7 +961,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 16, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
+	return { version: 17, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

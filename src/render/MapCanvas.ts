@@ -2,7 +2,7 @@ import { App, Menu, Notice } from "obsidian";
 import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
-import { DEFAULT_TOKEN_COLOR, Layer, Token, configuredLightRadius, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
+import { DEFAULT_LIGHT_LIFE, DEFAULT_TOKEN_COLOR, Layer, Token, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { rgbToHex } from "../platform/detectMagicWalls";
@@ -47,6 +47,8 @@ const MIN_CELL_PIXELS = 12;
 const CELL_HOP_DURATION_MS = 180;
 /** How high (as a fraction of a cell's width) a "jump" hop arcs upward at its midpoint — see `currentHopPose`. */
 const CELL_HOP_HEIGHT_RATIO = 0.35;
+/** Percent of `Token.lightLife` one R1 press restores (see `handleGamepadLightRefill`). */
+const LIGHT_REFILL_PERCENT = 50;
 /** "Centrer" player-mirror camera mode (see `computeFitCamera`/`MapPlayerMirrorView`): the tightest player-token bounding box is padded by this factor so tokens don't sit flush against the viewport edges. */
 const CENTER_CAMERA_PADDING_RATIO = 1.4;
 /** "Centrer" player-mirror camera mode: minimum framed extent, in cells, so a single token (or a tight cluster) doesn't zoom in absurdly close. */
@@ -1315,8 +1317,9 @@ export class MapCanvas {
 
 			this.gamepadPoller = new GamepadInputPoller({
 				onMove: (gamepadIndex, angleDeg, interactHeld) => this.handleGamepadMove(gamepadIndex, angleDeg, interactHeld),
-				onInteract: (gamepadIndex) => this.handleGamepadInteract(gamepadIndex),
-				onLightStep: (gamepadIndex, delta) => this.handleGamepadLightStep(gamepadIndex, delta),
+				onAction: (gamepadIndex) => this.handleGamepadAction(gamepadIndex),
+				onLightRefill: (gamepadIndex) => this.handleGamepadLightRefill(gamepadIndex),
+				onLightExtinguish: (gamepadIndex) => this.handleGamepadLightExtinguish(gamepadIndex),
 				onAim: (gamepadIndex, angleDeg) => this.handleGamepadAim(gamepadIndex, angleDeg),
 			});
 			this.gamepadPoller.start();
@@ -1736,50 +1739,60 @@ export class MapCanvas {
 			const result = this.controller.triggerWallClock(segmentId);
 			if (result?.fired) new Notice("Une horloge a été déclenchée.");
 		}
+		// A completed step burns down carried/ambient light (see `MapController.drainLightForEvent`).
+		// Only the source canvas has a gamepad poller — the mirror never reaches here, so no double drain.
+		this.controller.drainLightForEvent("move", tokenId);
+	}
+
+	/** Whichever "light" token shares `token`'s own cell (a co-located torch — see `MapController.moveToken`'s light-passthrough), if any. */
+	private colocatedLight(token: Token): Token | undefined {
+		if (!token.cellKey) return undefined;
+		return this.controller.getData().tokens.find((t) => t.id !== token.id && t.cellKey === token.cellKey && (t.category ?? "entity") === "light");
 	}
 
 	/**
-	 * `GamepadInputPoller`'s `onInteract` callback (see the constructor): one gamepad's interact button
-	 * was just held for `INTERACT_HOLD_MS` (1.5s long-press, fires once per press-and-hold — see the
-	 * poller) — if `gamepadIndex` is assigned to a player token, toggles a
-	 * light: whichever "light" category token shares the player's own cell, if any (a co-located light —
-	 * see `MapController.moveToken`'s light-passthrough exception), else the player token's own light.
-	 * The "!" indicator itself isn't triggered from here at all — see `tokenCanInteract`/`drawTokens`,
-	 * which show it live off the token's actual position, independent of whether this button has ever
-	 * been pressed. A no-op outside view mode, on a mirror canvas, or for an unassigned gamepad — same
+	 * `GamepadInputPoller`'s `onAction` callback (see the constructor): the interact button (triangle/Y)
+	 * was just pressed — if `gamepadIndex` is assigned to a player token, that's a token "action":
+	 * burns down light life (see `MapController.drainLightForEvent`). A no-op outside view mode, on a
+	 * mirror canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
+	 */
+	private handleGamepadAction(gamepadIndex: number): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		if (!this.controller.findToken(tokenId)) return;
+		this.controller.drainLightForEvent("action", tokenId);
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onLightRefill` callback: R1 was just pressed — refills the light life
+	 * (`Token.lightLife`) of the co-located "light" fixture if there is one, else the player token's
+	 * own, by `LIGHT_REFILL_PERCENT`, clamped to 100. Same gating as `handleGamepadMove`.
+	 */
+	private handleGamepadLightRefill(gamepadIndex: number): void {
+		if (this.controller.mode !== "view") return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const targetId = this.colocatedLight(token)?.id ?? token.id;
+		this.controller.updateToken(targetId, (t) => (t.lightLife = clamp((t.lightLife ?? DEFAULT_LIGHT_LIFE) + LIGHT_REFILL_PERCENT, 0, 100)));
+	}
+
+	/**
+	 * `GamepadInputPoller`'s `onLightExtinguish` callback: L1 was held for `LIGHT_EXTINGUISH_HOLD_MS` —
+	 * snuffs the co-located "light" fixture if there is one, else the player token's own, by setting
+	 * `Token.lightLife` to 0 (the configured `lightRadius` is kept, so R1 can bring it back). Same
 	 * gating as `handleGamepadMove`.
 	 */
-	private handleGamepadInteract(gamepadIndex: number): void {
+	private handleGamepadLightExtinguish(gamepadIndex: number): void {
 		if (this.controller.mode !== "view") return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 		const token = this.controller.findToken(tokenId);
 		if (!token) return;
-		const data = this.controller.getData();
-		const lightHere = token.cellKey ? data.tokens.find((t) => t.id !== token.id && t.cellKey === token.cellKey && (t.category ?? "entity") === "light") : undefined;
-		const targetId = lightHere?.id ?? token.id;
-		this.controller.updateToken(targetId, (t) => (t.lightEnabled = !(t.lightEnabled ?? true)));
-	}
-
-	/**
-	 * `GamepadInputPoller`'s `onLightStep` callback (see the constructor): L1/R1 was just pressed
-	 * (edge-triggered) — if `gamepadIndex` is assigned to a player token, steps `token.lightRadiusReduction`
-	 * by `-delta` (L1's `delta` of `-1` *increases* the reduction, i.e. dims; R1's `1` decreases it, i.e.
-	 * brightens), clamped so the effective radius (`resolveLightRadius`) stays within
-	 * `[0, configuredLightRadius(token)]` — the InfoPanel menu's own authored value is the ceiling this
-	 * can brighten back up to, never exceeded, and never itself touched by the gamepad. A no-op outside
-	 * view mode, on a mirror canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
-	 */
-	private handleGamepadLightStep(gamepadIndex: number, delta: -1 | 1): void {
-		if (this.controller.mode !== "view") return;
-		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
-		if (!tokenId) return;
-		const token = this.controller.findToken(tokenId);
-		if (!token) return;
-		const max = configuredLightRadius(token);
-		const currentReduction = Math.max(0, token.lightRadiusReduction ?? 0);
-		const nextReduction = clamp(currentReduction - delta, 0, max);
-		this.controller.updateToken(tokenId, (t) => (t.lightRadiusReduction = nextReduction));
+		const targetId = this.colocatedLight(token)?.id ?? token.id;
+		this.controller.updateToken(targetId, (t) => (t.lightLife = 0));
 	}
 
 	/**
@@ -2499,7 +2512,7 @@ export class MapCanvas {
 		// Gamepad interact button's "!" indicator — live (`tokenCanInteract`), not tied to the button
 		// ever having been pressed: shown above any gamepad-assigned token for as long as it actually
 		// has something to interact with right now, view mode only (the only mode the button does
-		// anything in — see `handleGamepadMove`/`handleGamepadInteract`), drawn above whatever position
+		// anything in — see `handleGamepadMove`/`handleGamepadAction`), drawn above whatever position
 		// the token is actually at (mid-hop or not, see `currentHopPose`'s footprint-center fallback).
 		if (this.effectiveMode() === "view" && this.controller.gamepadAssignments.size > 0) {
 			const wallSegments = this.resolveWallSegments();

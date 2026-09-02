@@ -8,10 +8,13 @@ import {
 	WallSegment,
 	applyClockDelta,
 	createLayer,
+	DEFAULT_LIGHT_ACTION_DRAIN,
+	DEFAULT_LIGHT_MOVE_DRAIN,
 	generateLocalId,
 	getActiveLayer,
 	Layer,
 	MapFileData,
+	resolveLightLife,
 	Token,
 } from "../data/mapData";
 import { footprintCellKeys, footprintCenter, occupiedFootprintCells, worldPointToCellKey } from "../grid/fog";
@@ -56,6 +59,9 @@ export const PLAYER_MIRROR_CAMERA_MODE_LABELS: Record<PlayerMirrorCameraMode, st
 };
 
 const MAX_HISTORY = 100;
+
+/** Per-event chance that a standalone "light" fixture loses life when any player token moves/acts — see `drainLightForEvent`. */
+const LIGHT_TOKEN_DRAIN_CHANCE = 1 / 4;
 
 /**
  * Owns the in-memory MapFileData for one open map (full view or embed) and
@@ -1248,6 +1254,46 @@ export class MapController {
 		this.update((data) => {
 			const token = data.tokens.find((t) => t.id === tokenId);
 			if (token) mutator(token);
+		});
+	}
+
+	/**
+	 * Burns light "life" (`Token.lightLife`) down in response to a player token acting, `trigger` being
+	 * which kind of act (`"move"` = one cell step, `"action"` = a triangle/Y press — see
+	 * `MapCanvas.handleGamepadMove`/`handleGamepadAction`):
+	 * - the acting token itself (`actingTokenId`), if it's a "player" with the matching drain toggle on,
+	 *   loses its own `lightMoveDrain`/`lightActionDrain` percent, every time — a torch the party carries
+	 *   burns down as they travel.
+	 * - every *other* "light" fixture with the matching toggle on has a `LIGHT_TOKEN_DRAIN_CHANCE`
+	 *   chance of losing its own drain percent — so a stationary ambient light burns down gradually as
+	 *   the party moves around it, independent of which player moved.
+	 * Both drain toggles default to on (only an explicit `false` disables them). All folded into one
+	 * `update()` (one undo step, one save). A no-op if nothing actually drained.
+	 */
+	drainLightForEvent(trigger: "move" | "action", actingTokenId: string): void {
+		const toggleOn = (token: Token): boolean => (trigger === "move" ? token.lightDrainOnMove !== false : token.lightDrainOnAction !== false);
+		const drainOf = (token: Token): number =>
+			trigger === "move" ? (token.lightMoveDrain ?? DEFAULT_LIGHT_MOVE_DRAIN) : (token.lightActionDrain ?? DEFAULT_LIGHT_ACTION_DRAIN);
+
+		// Decide (rolling the per-light chance now) which tokens drain, before touching `data` — so an
+		// event that drains nothing never creates an undo step or a save.
+		const toDrain = new Set<string>();
+		for (const token of this.data.tokens) {
+			const category = token.category ?? "entity";
+			if (category !== "player" && category !== "light") continue;
+			if (!toggleOn(token)) continue;
+			if (category === "player") {
+				if (token.id === actingTokenId) toDrain.add(token.id);
+			} else if (token.id !== actingTokenId) {
+				if (Math.random() < LIGHT_TOKEN_DRAIN_CHANCE) toDrain.add(token.id);
+			}
+		}
+		if (toDrain.size === 0) return;
+
+		this.update((data) => {
+			for (const token of data.tokens) {
+				if (toDrain.has(token.id)) token.lightLife = clamp(resolveLightLife(token) - drainOf(token), 0, 100);
+			}
 		});
 	}
 

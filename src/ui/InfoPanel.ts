@@ -6,6 +6,9 @@ import {
 	Clock,
 	configuredLightRadius,
 	DEFAULT_EYE_TIER_ANGLES,
+	DEFAULT_LIGHT_ACTION_DRAIN,
+	DEFAULT_LIGHT_LIFE,
+	DEFAULT_LIGHT_MOVE_DRAIN,
 	DEFAULT_SIDE_EYE_ANGLE,
 	DEFAULT_TOKEN_COLOR,
 	DEFAULT_TOKEN_ROTATION,
@@ -393,8 +396,9 @@ export class InfoPanel {
 		};
 
 		const seed = tokens[0];
+		const lightEditable = this.controller.mode === "edit";
 		if (allLight) {
-			if (seed) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
+			if (seed && lightEditable) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
 			const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 			const deleteBtn = footer.createEl("button", {
 				text: tokens.length > 1 ? "Supprimer les pions" : "Supprimer le pion",
@@ -435,8 +439,9 @@ export class InfoPanel {
 		colorInput.onchange = () => this.controller.massUpdateTokens((t) => (t.color = colorInput.value));
 
 		// Light means the same thing for every category, so it's shown here regardless of whether the
-		// selection mixes categories.
-		if (seed) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
+		// selection mixes categories — but edit mode only, like the single-token panel (during play a
+		// light is gamepad-driven, not menu-edited).
+		if (seed && lightEditable) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
 
 		// Vision (entity-only — see `renderMassVisionFields`). Nothing shown at all for a selection
 		// that's entirely players — there's no vision concept left to edit for them.
@@ -522,18 +527,19 @@ export class InfoPanel {
 	}
 
 	/**
-	 * `token.lightRadius` editor (see `Token.lightRadius`/`resolveLightRadius`/`castLightRays`), any
-	 * category — a radius (in cells) within which this token's own light reveals every entity token
-	 * around it and hides the fog, blocked by walls. For "player" tokens this is now also the *only*
-	 * source of their fog reveal (no more directional vision cone), including what permanently marks
-	 * `exploredCells` — see `FogRenderer.recomputeFrame`. Shown (and fully editable) in both edit and
-	 * "Vue" mode — a light is something a GM plausibly wants to flip mid-session (a torch lighting/
-	 * going out), not just set up ahead of time — see the callers in `renderTokenPanel`/`renderTokenViewPanel`.
+	 * Light editor (see `Token.lightRadius`/`lightLife`/`resolveLightRadius`/`castLightRays`) — a
+	 * radius (in cells) within which this token's own light reveals every entity token around it and
+	 * hides the fog, blocked by walls. For "player" tokens this is also the *only* source of their fog
+	 * reveal (no directional vision cone), including what permanently marks `exploredCells` — see
+	 * `FogRenderer.recomputeFrame`. Edit mode only (see `renderTokenPanel`) — during play a light is
+	 * driven by the gamepad (drain on move/action, L1/R1), so "Vue" mode shows none of this.
 	 *
-	 * Two controls: an on/off checkbox (`lightEnabled`, defaults to on) — switches the light off
-	 * without losing the configured radius, unlike setting the radius itself to `0` would (reads
-	 * `configuredLightRadius`, not `resolveLightRadius`, so this stays showing that configured number
-	 * even while off) — and the radius number input (`lightRadius`) itself.
+	 * Every category gets the radius input (`lightRadius`). "player"/"light" tokens additionally get a
+	 * "life" slider (`lightLife`, 0-100, doubling as the lit fraction of the radius — `0` means the
+	 * light is out but the radius is kept) plus two drain toggles (`lightDrainOnMove`/`lightMoveDrain`,
+	 * `lightDrainOnAction`/`lightActionDrain`) that burn the life down as the token moves/acts (see
+	 * `MapController.drainLightForEvent`). The old `lightEnabled` on/off checkbox is gone — `lightLife`
+	 * covers it.
 	 *
 	 * `seed` supplies the displayed starting values (only, same convention as `renderMassVisionFields`
 	 * — nothing is written until a control is actually touched); `update` is either a single-token
@@ -545,13 +551,6 @@ export class InfoPanel {
 		wrap.createEl("label", { text: "Lumière (cache le brouillard, bloquée par les murs)" });
 		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
 
-		const enabledField = row.createDiv({ cls: "map-manager-field-inline" });
-		const enabledLabel = enabledField.createEl("label");
-		const enabledCheckbox = enabledLabel.createEl("input", { type: "checkbox" });
-		enabledCheckbox.checked = seed.lightEnabled !== false;
-		enabledLabel.appendText(" Activée");
-		enabledCheckbox.onchange = () => update((t) => (t.lightEnabled = enabledCheckbox.checked));
-
 		const radiusField = row.createDiv({ cls: "map-manager-field-inline" });
 		radiusField.createEl("label", { text: "Rayon (cases)" });
 		const input = radiusField.createEl("input", { type: "number" });
@@ -560,6 +559,55 @@ export class InfoPanel {
 			const v = parseFloat(input.value);
 			if (Number.isNaN(v)) return;
 			update((t) => (t.lightRadius = Math.max(0, v)));
+		};
+
+		const category = seed.category ?? "entity";
+		if (category !== "player" && category !== "light") return;
+
+		this.makeSliderField(row, "Vie (%)", seed.lightLife ?? DEFAULT_LIGHT_LIFE, 0, 100, (v) => update((t) => (t.lightLife = clamp(v, 0, 100))), 5);
+
+		this.renderLightDrainRow(
+			row,
+			"Perte au mouvement",
+			seed.lightDrainOnMove !== false,
+			seed.lightMoveDrain ?? DEFAULT_LIGHT_MOVE_DRAIN,
+			(on) => update((t) => (t.lightDrainOnMove = on)),
+			(v) => update((t) => (t.lightMoveDrain = Math.max(0, v)))
+		);
+		this.renderLightDrainRow(
+			row,
+			"Perte à l'action",
+			seed.lightDrainOnAction !== false,
+			seed.lightActionDrain ?? DEFAULT_LIGHT_ACTION_DRAIN,
+			(on) => update((t) => (t.lightDrainOnAction = on)),
+			(v) => update((t) => (t.lightActionDrain = Math.max(0, v)))
+		);
+	}
+
+	/** One drain toggle for `renderLightRadiusField`: a checkbox (`onToggle`) plus a "% of life per event" number input (`onValue`). */
+	private renderLightDrainRow(
+		row: HTMLElement,
+		label: string,
+		checked: boolean,
+		drainValue: number,
+		onToggle: (on: boolean) => void,
+		onValue: (percent: number) => void
+	): void {
+		const field = row.createDiv({ cls: "map-manager-field-inline" });
+		const checkLabel = field.createEl("label");
+		const checkbox = checkLabel.createEl("input", { type: "checkbox" });
+		checkbox.checked = checked;
+		checkLabel.appendText(` ${label}`);
+		checkbox.onchange = () => onToggle(checkbox.checked);
+
+		const number = field.createEl("input", { type: "number" });
+		number.min = "0";
+		number.max = "100";
+		number.value = String(drainValue);
+		number.title = "% de vie retirés à chaque événement";
+		number.onchange = () => {
+			const v = parseFloat(number.value);
+			if (!Number.isNaN(v)) onValue(v);
 		};
 	}
 
@@ -1110,25 +1158,23 @@ export class InfoPanel {
 	 * header (`renderTokenLogoAndName`), rotation (entity-only — its own GM-only vision zone points
 	 * wherever this faces, drawn continuously here instead of only-while-selected like edit mode; a
 	 * player's fog reveal is their light, omnidirectional, with no facing to show), a gamepad picker
-	 * (player-only — `renderGamepadField`, see its own doc comment), light (`renderLightRadiusField`,
-	 * any category — a torch is exactly the kind of thing a GM plausibly wants to flip mid-session,
-	 * unlike the rest of a token's setup), and tabs' read-only content (stats/inventory/story/... — see
-	 * `renderTokenTabsReadOnly`, which applies to both categories). Everything else (icon/image/
-	 * category/size/color/template picker/vision shape/delete) is edit-only. A "light" token has
-	 * neither a facing, a gamepad, nor tabs to begin with (see `TokenCategory`'s own doc comment), so
-	 * it gets none of those — just its light field and a short note.
+	 * (player-only — `renderGamepadField`, see its own doc comment), and tabs' read-only content
+	 * (stats/inventory/story/... — see `renderTokenTabsReadOnly`, which applies to both categories).
+	 * Everything else (icon/image/category/size/color/template picker/vision shape/delete) is
+	 * edit-only, and so is the whole light setup (radius/life/drain) — during play a light is driven
+	 * by the gamepad (drain on move/action, L1/R1), not this menu. A "light" token has neither a
+	 * facing, a gamepad, nor tabs to begin with (see `TokenCategory`'s own doc comment), so it just
+	 * gets a short note here.
 	 */
 	private renderTokenViewPanel(token: Token): void {
 		const category = token.category ?? "entity";
 		if (category === "light") {
 			this.el.createDiv({ cls: "map-manager-view-empty", text: "Source de lumière — invisible pour les joueurs." });
-			this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 			return;
 		}
 		this.renderTokenLogoAndName(token);
 		if (category === "entity") this.renderRotationField(token);
 		if (category === "player") this.renderGamepadField(token);
-		this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
 		this.renderTokenTabsReadOnly(token);
 	}
 

@@ -38,16 +38,17 @@ const DPAD_BUTTONS: { index: number; angleDeg: number }[] = [
 
 /**
  * "Triangle"/"Y" — the standard Gamepad API mapping's button index 3 (top face button, whichever
- * label the physical pad uses for it) — the interact button (see `MapCanvas.handleGamepadInteract`):
- * toggles a light on a long press (`INTERACT_HOLD_MS`), or forces a step through a `"pass-through"`
- * wall when held (any duration) alongside a direction.
+ * label the physical pad uses for it) — the interact button: every press fires `onAction` (a token
+ * "action", which burns light life — see `MapCanvas.handleGamepadAction`), and holding it alongside a
+ * direction forces a step through a `"pass-through"` wall (see `handleGamepadMove`). Holding it on its
+ * own does nothing.
  */
 const INTERACT_BUTTON_INDEX = 3;
-/** How long the interact button must be held before `onInteract` fires (toggling a light), ms — long enough that a quick tap (e.g. one that only meant to force a step through a `"pass-through"` wall) doesn't also toggle a light. */
-const INTERACT_HOLD_MS = 1500;
-/** L1/LB — standard mapping index 4 — dims a player token's light by one cell (see `MapCanvas.handleGamepadLightStep`). */
+/** How long L1 must be held before `onLightExtinguish` fires (life → 0), ms — long enough that a stray tap doesn't snuff a torch. */
+const LIGHT_EXTINGUISH_HOLD_MS = 1500;
+/** L1/LB — standard mapping index 4 — held for `LIGHT_EXTINGUISH_HOLD_MS` snuffs a player's light (`onLightExtinguish`). */
 const L1_BUTTON_INDEX = 4;
-/** R1/RB — standard mapping index 5 — brightens a player token's light by one cell (see `MapCanvas.handleGamepadLightStep`). */
+/** R1/RB — standard mapping index 5 — each press refills a player's light life (`onLightRefill`). */
 const R1_BUTTON_INDEX = 5;
 
 /**
@@ -95,13 +96,13 @@ interface GamepadPollState {
 	/** Whether the last poll saw the left stick/d-pad pushed past the deadzone — a direction only ever fires on the poll it first becomes true (then again per the repeat timer), never continuously, so tapping the stick yields exactly one step. */
 	moveActive: boolean;
 	moveNextFireAt: number;
-	/** Last-seen pressed state of each edge-triggered button, for edge-detecting `onLightStep`. */
+	/** Last-seen pressed state of the interact button, for edge-detecting `onAction`. */
 	interactPressed: boolean;
-	/** When the interact button most recently went from released to held (`performance.now()`), or `null` while it's up — the basis for `onInteract`'s `INTERACT_HOLD_MS` long-press gate. */
-	interactPressedAt: number | null;
-	/** Whether `onInteract` has already fired for the interact button's current hold, so it fires exactly once per press-and-hold rather than on every poll past `INTERACT_HOLD_MS`. */
-	interactFired: boolean;
-	l1Pressed: boolean;
+	/** When L1 most recently went from released to held (`performance.now()`), or `null` while it's up — the basis for `onLightExtinguish`'s `LIGHT_EXTINGUISH_HOLD_MS` long-press gate. */
+	l1PressedAt: number | null;
+	/** Whether `onLightExtinguish` has already fired for L1's current hold, so it fires exactly once per press-and-hold. */
+	l1Fired: boolean;
+	/** Last-seen pressed state of R1, for edge-detecting `onLightRefill`. */
 	r1Pressed: boolean;
 }
 
@@ -116,13 +117,15 @@ export interface GamepadCallbacks {
 	 */
 	onMove: (gamepadIndex: number, inputAngleDeg: number, interactHeld: boolean) => void;
 	/**
-	 * The interact button held continuously for `INTERACT_HOLD_MS`, firing once per press-and-hold (not
-	 * on release, and not again while still held past the threshold) — independent of whatever direction
-	 * (if any) is also held. A quick tap (below the threshold) never fires this at all.
+	 * The interact button (triangle/Y) pressed, edge-triggered (fires once the instant it goes down,
+	 * whatever else is held) — a token "action". Fires on every press, including ones that also force a
+	 * wall crossing.
 	 */
-	onInteract: (gamepadIndex: number) => void;
-	/** L1/R1's own press, edge-triggered — `delta` is `-1` for L1 ("dim"), `1` for R1 ("brighten"). */
-	onLightStep: (gamepadIndex: number, delta: -1 | 1) => void;
+	onAction: (gamepadIndex: number) => void;
+	/** R1 pressed, edge-triggered — refill the player's light life (see `MapCanvas.handleGamepadLightRefill`). */
+	onLightRefill: (gamepadIndex: number) => void;
+	/** L1 held continuously for `LIGHT_EXTINGUISH_HOLD_MS`, once per press-and-hold — snuff the player's light (life → 0). */
+	onLightExtinguish: (gamepadIndex: number) => void;
 	/**
 	 * The right stick's current angle, reported on *every* poll tick — `null` every tick it sits
 	 * within the deadzone of center, a real angle every tick it doesn't. Continuous rather than
@@ -169,30 +172,29 @@ export class GamepadInputPoller {
 			seen.add(pad.index);
 			let entry = this.state.get(pad.index);
 			if (!entry) {
-				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, interactPressedAt: null, interactFired: false, l1Pressed: false, r1Pressed: false };
+				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, l1PressedAt: null, l1Fired: false, r1Pressed: false };
 				this.state.set(pad.index, entry);
 			}
 
 			const interactHeld = pad.buttons[INTERACT_BUTTON_INDEX]?.pressed ?? false;
-			if (interactHeld && !entry.interactPressed) {
-				entry.interactPressedAt = now;
-				entry.interactFired = false;
-			}
-			if (!interactHeld) {
-				entry.interactPressedAt = null;
-				entry.interactFired = false;
-			} else if (!entry.interactFired && entry.interactPressedAt !== null && now - entry.interactPressedAt >= INTERACT_HOLD_MS) {
-				this.callbacks.onInteract(pad.index);
-				entry.interactFired = true;
-			}
+			if (interactHeld && !entry.interactPressed) this.callbacks.onAction(pad.index);
 			entry.interactPressed = interactHeld;
 
 			const l1Held = pad.buttons[L1_BUTTON_INDEX]?.pressed ?? false;
-			if (l1Held && !entry.l1Pressed) this.callbacks.onLightStep(pad.index, -1);
-			entry.l1Pressed = l1Held;
+			if (l1Held && entry.l1PressedAt === null) {
+				entry.l1PressedAt = now;
+				entry.l1Fired = false;
+			}
+			if (!l1Held) {
+				entry.l1PressedAt = null;
+				entry.l1Fired = false;
+			} else if (!entry.l1Fired && entry.l1PressedAt !== null && now - entry.l1PressedAt >= LIGHT_EXTINGUISH_HOLD_MS) {
+				this.callbacks.onLightExtinguish(pad.index);
+				entry.l1Fired = true;
+			}
 
 			const r1Held = pad.buttons[R1_BUTTON_INDEX]?.pressed ?? false;
-			if (r1Held && !entry.r1Pressed) this.callbacks.onLightStep(pad.index, 1);
+			if (r1Held && !entry.r1Pressed) this.callbacks.onLightRefill(pad.index);
 			entry.r1Pressed = r1Held;
 
 			this.callbacks.onAim(pad.index, readRightStickDirection(pad));

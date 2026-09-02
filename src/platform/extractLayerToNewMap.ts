@@ -23,7 +23,7 @@ export async function extractLayerToNewMap(app: App, sourceFile: TFile, data: Ma
 
 	const clonedLayer: Layer = { ...structuredClone(layer), id: generateLocalId("layer") };
 	const newData: MapFileData = {
-		version: 16,
+		version: 17,
 		gridType: data.gridType,
 		cellSize: data.cellSize,
 		layers: [clonedLayer],
