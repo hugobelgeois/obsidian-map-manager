@@ -193,7 +193,7 @@ export async function renderNoteSnapshot(
 	redactedMap: MapFileData,
 	zoneTypes: ZoneType[],
 	tokenTemplates: TokenTemplate[],
-	fogSoftening: boolean
+	fogSoftening: number
 ): Promise<PublicMapSnapshot> {
 	const map = materializeTokenTabs(redactedMap, tokenTemplates);
 	const notes: PublicMapSnapshot["notes"] = {};

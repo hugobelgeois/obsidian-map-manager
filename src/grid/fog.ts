@@ -454,50 +454,196 @@ export function isCellFullyLit(
 	return true;
 }
 
-/** Coarse safety ring of ray angles in `traceVisibilityPolygon`, on top of the rays aimed at wall corners — just enough that a wall-less direction still produces a far-field vertex. */
-const VISIBILITY_RING = 24;
+/**
+ * `traceVisibilityPolygon` splits the full circle into this many seed arcs before adaptive
+ * subdivision takes over. Each seed arc is < 180° (so the "one continuous straight wall spans the
+ * whole arc" short-circuit stays valid) and small enough that the mid-arc guard rays land where they
+ * should. Offset by `VIS_SEED_OFFSET` so a seed boundary never falls exactly on a wall corner.
+ */
+const VIS_SEED_ARCS = 6;
+const VIS_SEED_OFFSET = 0.123;
+/** Largest angular step `traceVisibilityPolygon` leaves un-subdivided in an *open* direction (no wall corner to aim at) — keeps the far-field polygon edge from bowing inside the light circle when zoomed out. ~12°. */
+const VIS_MAX_STEP = (12 * Math.PI) / 180;
+/** Hard recursion / vertex ceilings for `traceVisibilityPolygon` — a runaway on pathological wall geometry degrades to a coarser polygon instead of hanging. */
+const VIS_MAX_DEPTH = 40;
+const VIS_MAX_VERTS = 6000;
+
+/** Whether wall `b` is collinear with wall `a` *and* their spans touch or overlap along that line with no gap — i.e. the two segments form one continuous straight occluder (a straight run split into pieces, or a shared corner that doesn't actually turn). A doorway-sized gap between two collinear walls returns `false`. */
+function straightContinuousRun(a: ResolvedWallSegment, b: ResolvedWallSegment): boolean {
+	const dx = a.b.x - a.a.x;
+	const dy = a.b.y - a.a.y;
+	const len = Math.hypot(dx, dy);
+	if (len === 0) return false;
+	const ux = dx / len;
+	const uy = dy / len;
+	const tol = Math.max(0.5, len * 1e-3);
+	const perp = (p: Point) => Math.abs((p.x - a.a.x) * uy - (p.y - a.a.y) * ux);
+	if (perp(b.a) > tol || perp(b.b) > tol) return false;
+	const proj = (p: Point) => (p.x - a.a.x) * ux + (p.y - a.a.y) * uy;
+	let bLo = proj(b.a);
+	let bHi = proj(b.b);
+	if (bLo > bHi) [bLo, bHi] = [bHi, bLo];
+	// Gap between [0, len] (segment a) and [bLo, bHi] (segment b) along the shared line.
+	return Math.max(0, bLo) - Math.min(len, bHi) <= tol;
+}
 
 /**
  * The player's line of sight as a polygon, in angular order — the classic 2D visibility polygon,
  * traced `far` world units outward ("jusqu'au prochain mur / à l'infini" — the caller passes a
- * distance well past anything on screen). Rays are cast at every vision-blocking wall corner (± a
- * hair, so a shadow edge comes out as one straight line running from the token past the corner, not
- * a per-step staircase), plus a coarse ring for wall-less directions. `FogRenderer.renderCellFog`
- * clips its fog punch to this polygon and then punches the actual *light* inside it (the token's own
- * radius circle as a true `ctx.arc`; every other light source's own reach) — so what the player sees
- * is exactly "line of sight ∩ light": a smooth circle edge where the light just runs out, a straight
- * edge where a wall cuts it, other lit rooms revealed only where this same line of sight reaches
- * them.
+ * distance well past anything on screen). `FogRenderer.renderCellFog` clips its fog punch to this
+ * polygon and then punches the actual *light* inside it (the token's own radius circle as a true
+ * `ctx.arc`; every other light source's own reach) — so what the player sees is exactly
+ * "line of sight ∩ light": a smooth circle edge where the light just runs out, a straight edge where
+ * a wall cuts it, other lit rooms revealed only where this same line of sight reaches them.
+ *
+ * **Adaptive subdivision**, rather than a fixed fan: the circle is cut into `VIS_SEED_ARCS` seed
+ * arcs, and each arc is refined only where the geometry actually changes —
+ *
+ * - if the arc's two bounding rays land on one continuous straight occluder (same wall segment, or
+ *   collinear touching segments — `straightContinuousRun`) with nothing poking in front, the
+ *   boundary between them is a single straight edge and no ray is cast between them ("si 2 points
+ *   sont reliés par un mur droit continu, on ne raycast pas entre eux");
+ * - otherwise the nearest vision-blocking wall corner whose angle falls strictly inside the arc and
+ *   that sits in front of the arc's bounds is picked, a ray is cast just each side of it (± a hair,
+ *   so a shadow edge is one straight line past the corner, not a staircase), and the two sub-arcs
+ *   recurse ("on détecte les coins les plus proches entre ces 2 points et on recommence");
+ * - a wall-less arc wider than `VIS_MAX_STEP` is just bisected so its far-field edge stays put.
+ *
+ * Corners fully hidden behind a nearer continuous wall are never aimed at (the arc covering them
+ * short-circuits first), and there is no always-on safety ring — so closed interiors and
+ * heavily-occluded views cost a fraction of the old fixed fan.
  */
 export function traceVisibilityPolygon(center: Point, far: number, wallSegments: ResolvedWallSegment[]): Point[] {
 	const blockers = wallSegments.filter((seg) => wallBlocksVision(seg.type));
 	const TWO_PI = 2 * Math.PI;
-	const norm = (a: number) => ((a % TWO_PI) + TWO_PI) % TWO_PI;
-	const angles: number[] = [];
-	for (let i = 0; i < VISIBILITY_RING; i++) angles.push((TWO_PI * i) / VISIBILITY_RING);
 	const eps = 1e-4;
+
+	if (blockers.length === 0) {
+		// Nothing to occlude — a plain far-field ring at the open-arc resolution.
+		const ring: Point[] = [];
+		const steps = Math.ceil(TWO_PI / VIS_MAX_STEP);
+		for (let i = 0; i < steps; i++) {
+			const a = VIS_SEED_OFFSET + (TWO_PI * i) / steps;
+			ring.push({ x: center.x + Math.cos(a) * far, y: center.y + Math.sin(a) * far });
+		}
+		return ring;
+	}
+
+	const blockerById = new Map(blockers.map((seg) => [seg.id, seg]));
+	const corners: { angle: number; dist: number }[] = [];
 	for (const seg of blockers) {
 		for (const p of [seg.a, seg.b]) {
-			const base = Math.atan2(p.y - center.y, p.x - center.x);
-			angles.push(norm(base - eps), norm(base), norm(base + eps));
+			corners.push({
+				angle: Math.atan2(p.y - center.y, p.x - center.x),
+				dist: Math.hypot(p.x - center.x, p.y - center.y),
+			});
 		}
 	}
-	angles.sort((a, b) => a - b);
 
-	const out: Point[] = [];
-	let prevAngle = Number.NaN;
-	for (const angle of angles) {
-		if (angle === prevAngle) continue;
-		prevAngle = angle;
+	interface Hit {
+		point: Point;
+		dist: number;
+		segId: string | null;
+	}
+	const hitCache = new Map<number, Hit>();
+	const castHit = (angle: number): Hit => {
+		const key = Math.round(angle / eps);
+		const cached = hitCache.get(key);
+		if (cached) return cached;
 		const dx = Math.cos(angle);
 		const dy = Math.sin(angle);
 		let end = far;
+		let segId: string | null = null;
 		for (const seg of blockers) {
 			const t = raySegmentDistance(center, dx, dy, end, seg.a, seg.b);
-			if (t !== null && t < end) end = t;
+			if (t !== null && t < end) {
+				end = t;
+				segId = seg.id;
+			}
 		}
-		out.push({ x: center.x + dx * end, y: center.y + dy * end });
+		const hit: Hit = { point: { x: center.x + dx * end, y: center.y + dy * end }, dist: end, segId };
+		hitCache.set(key, hit);
+		return hit;
+	};
+
+	// Whether the visibility boundary across the whole arc [lo, hi] is a single straight edge: both
+	// bounding rays hit real wall on one continuous straight occluder, and a mid-arc guard ray isn't
+	// stopped short by something closer poking in front.
+	const isStraightSpan = (lo: number, hi: number, hLo: Hit, hHi: Hit): boolean => {
+		if (hLo.segId === null || hHi.segId === null) return false;
+		if (hLo.segId !== hHi.segId) {
+			const segA = blockerById.get(hLo.segId);
+			const segB = blockerById.get(hHi.segId);
+			if (!segA || !segB || !straightContinuousRun(segA, segB)) return false;
+		}
+		const mid = (lo + hi) / 2;
+		const dx = Math.cos(mid);
+		const dy = Math.sin(mid);
+		const expected = raySegmentDistance(center, dx, dy, far, hLo.point, hHi.point);
+		if (expected === null) return false;
+		const actual = castHit(mid).dist;
+		return actual >= expected - Math.max(0.5, expected * 0.02);
+	};
+
+	const out: Point[] = [];
+	const push = (angle: number) => {
+		if (out.length < VIS_MAX_VERTS) out.push(castHit(angle).point);
+	};
+
+	// Emits the polygon vertices for the half-open arc (lo, hi] — the caller has already pushed lo's
+	// vertex. lo/hi are unwrapped (may exceed 2π); each seed arc spans < 180°.
+	const emitArc = (lo: number, hi: number, depth: number): void => {
+		if (hi - lo <= eps) return;
+		const hLo = castHit(lo);
+		const hHi = castHit(hi);
+
+		if (depth < VIS_MAX_DEPTH && out.length < VIS_MAX_VERTS) {
+			// Nearest wall corner strictly inside the arc that sits in front of the arc's far bound —
+			// the next silhouette to resolve. Corners behind what we already see are left alone.
+			const farBound = Math.max(hLo.dist, hHi.dist);
+			const slack = Math.max(0.5, farBound * 1e-3);
+			let best: number | null = null;
+			let bestDist = Infinity;
+			for (const c of corners) {
+				for (const cand of [c.angle, c.angle + TWO_PI, c.angle - TWO_PI]) {
+					if (cand > lo + 2 * eps && cand < hi - 2 * eps && c.dist < farBound - slack && c.dist < bestDist) {
+						best = cand;
+						bestDist = c.dist;
+					}
+				}
+			}
+			if (best !== null) {
+				const aMinus = best - eps;
+				const aPlus = best + eps;
+				// emitArc(lo, aMinus) ends by pushing the aMinus vertex itself; we only add the
+				// far side of the corner before recursing on.
+				emitArc(lo, aMinus, depth + 1);
+				push(aPlus);
+				emitArc(aPlus, hi, depth + 1);
+				return;
+			}
+		}
+
+		if (!isStraightSpan(lo, hi, hLo, hHi) && hi - lo > VIS_MAX_STEP && depth < VIS_MAX_DEPTH && out.length < VIS_MAX_VERTS) {
+			const mid = (lo + hi) / 2;
+			// emitArc(lo, mid) pushes the mid vertex; emitArc(mid, hi) pushes hi.
+			emitArc(lo, mid, depth + 1);
+			emitArc(mid, hi, depth + 1);
+			return;
+		}
+
+		push(hi);
+	};
+
+	const seed0 = VIS_SEED_OFFSET;
+	push(seed0);
+	for (let k = 0; k < VIS_SEED_ARCS; k++) {
+		const lo = seed0 + (TWO_PI * k) / VIS_SEED_ARCS;
+		const hi = seed0 + (TWO_PI * (k + 1)) / VIS_SEED_ARCS;
+		emitArc(lo, hi, 0);
 	}
+	// The last seed arc closed back onto seed0's vertex — drop the duplicate.
+	out.pop();
 	return out;
 }
 

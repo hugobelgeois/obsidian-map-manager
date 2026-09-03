@@ -30,8 +30,8 @@ import {
 	isPointLit,
 	isWorldPointExplored,
 	traceVisibilityPolygon,
-	worldPointToCellKey,
 } from "../grid/fog";
+import { drawFogSofteningRamp } from "./drawing";
 import { ImageBounds, WorldRect } from "./canvasTypes";
 
 /** Fog opacity for ground that has never been in a player's vision. */
@@ -69,21 +69,35 @@ const FOG_LEAK_INSET_PX = FOG_BLUR_SCREEN_PX * 2.5;
 /** Fog animation (the tremble/fade, and the render loop driving it) is force-disabled below this zoom — see `fogAnimationActive`. */
 const FOG_ANIMATION_MIN_ZOOM = 0.5;
 
-/** Depth of the "adoucir le brouillard" fade band, as a fraction of a cell width — see `drawCellFogSoftening`. */
-const FOG_SOFTEN_DEPTH_RATIO = 0.4;
+/**
+ * Inner fraction of a light's (life-scaled) reach that stays fully clear before the vignette's
+ * falloff begins — see `lightClearnessGradient`. The light-source flicker (`lightCoreRatio`) is the
+ * *only* thing that animates: this plateau breathes between `0` and this value, nothing else moves.
+ */
+const LIGHT_CLEAR_CORE_RATIO = 0.2;
+/**
+ * Fixed screen-px band the vignette tint is stroked past every lit shape's own edge (`renderCellFog`),
+ * so the tint fully covers the anti-aliased seam between the solid fog-clear and the vignette blit —
+ * otherwise a faint 1px ring shows at the light's rim against dark unexplored fog.
+ */
+const LIGHT_EDGE_SEAL_PX = 2;
 
-/** Stable per-token phase offset (radians) so several tokens' fog tremble doesn't move in lockstep. */
+/**
+ * Stable per-token phase seed in `[0, 1)` so several tokens' fog tremble / light flicker don't move
+ * in lockstep. FNV-1a plus an avalanche mix at the end — a plain rolling hash mod N barely changes
+ * between near-identical ids (sequential or timestamp-based), which left the flicker looking
+ * synchronised; the final mix makes one-character-apart ids land far apart.
+ */
 function tremblePhase(tokenId: string): number {
-	let hash = 0;
-	for (let i = 0; i < tokenId.length; i++) hash = (hash * 31 + tokenId.charCodeAt(i)) | 0;
-	return (hash % 1000) / 1000;
-}
-
-/** Stable pseudo-random phase in `[0, 2π)` from an arbitrary string key — for de-syncing the soft fade band per cell edge. */
-function hashPhase(key: string): number {
-	let hash = 0;
-	for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
-	return (((hash >>> 0) % 1000) / 1000) * Math.PI * 2;
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < tokenId.length; i++) {
+		hash ^= tokenId.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	hash ^= hash >>> 15;
+	hash = Math.imul(hash, 0x2c1b3c6d);
+	hash ^= hash >>> 13;
+	return (hash >>> 0) / 4294967296;
 }
 
 /** Appends `poly` as one closed subpath of `path`. */
@@ -173,6 +187,14 @@ export class FogRenderer {
 	/** Second pass: `fogCanvas`'s crisp content, blurred under a plain (unscaled) transform — see `renderFogLayer`. */
 	private fogBlurCanvas: HTMLCanvasElement = document.createElement("canvas");
 	private fogBlurCtx: CanvasRenderingContext2D;
+	/**
+	 * Scratch buffer where `renderCellFog` accumulates every light's cosmetic vignette *before*
+	 * blitting it onto `fogCanvas` in one pass — so overlapping lights' vignettes combine (each light
+	 * only ever makes its overlap brighter, never darker) instead of stacking their dark tint the way
+	 * painting them straight onto `fogCanvas` one-by-one would.
+	 */
+	private vignetteCanvas: HTMLCanvasElement = document.createElement("canvas");
+	private vignetteCtx: CanvasRenderingContext2D;
 	/** Non-null while the fog-tremble animation loop (settings.fogAnimationMode) is actively re-rendering every frame. */
 	private animationFrameId: number | null = null;
 
@@ -211,6 +233,9 @@ export class FogRenderer {
 		const fogBlurCtx = this.fogBlurCanvas.getContext("2d");
 		if (!fogBlurCtx) throw new Error("Canvas 2D context unavailable");
 		this.fogBlurCtx = fogBlurCtx;
+		const vignetteCtx = this.vignetteCanvas.getContext("2d");
+		if (!vignetteCtx) throw new Error("Canvas 2D context unavailable");
+		this.vignetteCtx = vignetteCtx;
 	}
 
 	private get transform(): ViewTransform {
@@ -256,15 +281,27 @@ export class FogRenderer {
 	}
 
 	/**
-	 * Whether the fog should animate right now: "Adoucir le brouillard" (`settings.fogSoftening`) has
-	 * to be on, and zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a
+	 * Whether the fog should animate right now: "Adoucir le brouillard" (`settings.fogSoftening`, a
+	 * 0-10 level) has to be above 0, and zoom can't be out past `FOG_ANIMATION_MIN_ZOOM` — the animation loop forcing a
 	 * render every frame while zoomed out that far is the one combination that's shown fog visibly
 	 * breaking near the edges, so it's disabled there as a hard safety net regardless of the cause.
 	 * Drives both the celled-grid fade band (`drawCellFogSoftening`) and the legacy grid-"none" edge
 	 * tremble (`drawFog`/`appendVisionFan`).
 	 */
 	private fogAnimationActive(): boolean {
-		return this.settings.fogSoftening && this.transform.zoom >= FOG_ANIMATION_MIN_ZOOM;
+		return this.settings.fogSoftening > 0 && this.transform.zoom >= FOG_ANIMATION_MIN_ZOOM;
+	}
+
+	/**
+	 * Whether the light-source flicker (`lightCoreRatio`, breathing every light's clear-core plateau
+	 * in `renderCellFog`) should run this frame: at least one light source in view and zoom
+	 * not out past `FOG_ANIMATION_MIN_ZOOM`. Independent of "Adoucir le brouillard" — a torch gutters
+	 * whether or not the fog edge is softened. Reads the per-frame caches, so call after
+	 * `recomputeFrame`.
+	 */
+	private lightFlickerActive(): boolean {
+		if (this.transform.zoom < FOG_ANIMATION_MIN_ZOOM) return false;
+		return this.frameVisionCache.some((v) => v.radius > 0) || this.frameLightRawCache.some((l) => l.radius > 0);
 	}
 
 	/**
@@ -322,13 +359,14 @@ export class FogRenderer {
 	}
 
 	/**
-	 * Keeps a `requestAnimationFrame` loop running for as long as (and only while) fog is visible
-	 * and animation is active (see `fogAnimationActive`), so the soft fade band / vision-edge tremble
-	 * keeps redrawing; otherwise fog is fully static and this never fires, costing nothing when
-	 * "Adoucir le brouillard" is off or the view is zoomed out too far.
+	 * Keeps a `requestAnimationFrame` loop running for as long as (and only while) fog is visible and
+	 * either the fog animation (`fogAnimationActive` — soft fade band / vision-edge tremble) or the
+	 * light-source flicker (`lightFlickerActive`) is running; otherwise fog is fully static and this
+	 * never fires, costing nothing when "Adoucir le brouillard" is off, no light is in view, or the
+	 * view is zoomed out too far.
 	 */
 	syncAnimationLoop(): void {
-		const shouldAnimate = this.fogAnimationActive() && this.isCurrentlyVisible();
+		const shouldAnimate = this.isCurrentlyVisible() && (this.fogAnimationActive() || this.lightFlickerActive());
 		if (shouldAnimate && this.animationFrameId === null) {
 			const tick = () => {
 				this.animationFrameId = requestAnimationFrame(tick);
@@ -421,6 +459,77 @@ export class FogRenderer {
 			}
 		}
 		if (started) path.closePath();
+	}
+
+	/**
+	 * Builds a `Path2D` around `verts` — a light's own visibility polygon from
+	 * `traceVisibilityPolygon(center, radius, …)` — but any edge whose *both* endpoints sit on the
+	 * light's rim (within a hair of `radius` from `center`, i.e. an unobstructed direction) is drawn
+	 * as the true circular arc between those two angles instead of a straight chord. Edges with an
+	 * endpoint pulled inward by a wall stay straight, so a wall keeps its hard shadow edge while the
+	 * open part of the light reads as one clean circle rather than a `VIS_MAX_STEP` fan of facets.
+	 */
+	private lightCirclePath(center: Point, radius: number, verts: Point[]): Path2D {
+		const path = new Path2D();
+		const rimDist = radius - Math.max(0.5, radius * 0.02);
+		const onRim = (p: Point) => Math.hypot(p.x - center.x, p.y - center.y) >= rimDist;
+		const first = verts[0];
+		if (!first) return path;
+		path.moveTo(first.x, first.y);
+		for (let i = 0; i < verts.length; i++) {
+			const a = verts[i];
+			const b = verts[(i + 1) % verts.length];
+			if (!a || !b) continue;
+			if (onRim(a) && onRim(b)) {
+				const a0 = Math.atan2(a.y - center.y, a.x - center.x);
+				let a1 = Math.atan2(b.y - center.y, b.x - center.x);
+				while (a1 - a0 > Math.PI) a1 -= 2 * Math.PI;
+				while (a1 - a0 < -Math.PI) a1 += 2 * Math.PI;
+				path.arc(center.x, center.y, radius, a0, a1, a1 < a0);
+			} else {
+				path.lineTo(b.x, b.y);
+			}
+		}
+		path.closePath();
+		return path;
+	}
+
+	/**
+	 * Radial "clearness" gradient for a light of reach `radius` at `center` — black, alpha `1` from the
+	 * source through the `coreRatio` clear-core plateau, then a **linear** ramp down to `0` at the rim.
+	 * Filled `destination-out` onto `vignetteCanvas` (which starts solid with the fog's own tint over
+	 * every lit shape): it erases that tint fully within the core and not at all at the edge, so the
+	 * vignette reads full-bright out to `coreRatio` then dims linearly to full fog tint at the rim.
+	 * Because every light erases the *same* pre-filled tint, two overlapping lights only ever make
+	 * their overlap brighter (each erases a bit more), never darker — the vignettes don't stack.
+	 * Purely cosmetic: the real fog was already cleared straight on `fogCanvas`, and exploration/entity
+	 * visibility use exact geometry, not this.
+	 */
+	private lightClearnessGradient(ctx: CanvasRenderingContext2D, center: Point, radius: number, coreRatio: number): CanvasGradient {
+		const g = ctx.createRadialGradient(center.x, center.y, 0, center.x, center.y, Math.max(radius, 1));
+		const core = Math.max(0, Math.min(LIGHT_CLEAR_CORE_RATIO, coreRatio));
+		g.addColorStop(0, "rgba(0, 0, 0, 1)");
+		if (core > 0) g.addColorStop(core, "rgba(0, 0, 0, 1)");
+		g.addColorStop(1, "rgba(0, 0, 0, 0)");
+		return g;
+	}
+
+	/**
+	 * The light-source flicker — the *only* animated part of a light. Returns the fraction of the
+	 * reach that stays fully clear before the vignette falloff (fed to `lightClearnessGradient` as
+	 * `coreRatio`): it breathes between `0` and `LIGHT_CLEAR_CORE_RATIO` (20%) on a gentle two-sine
+	 * guttering. Each source gets both its own phase *and* its own rate (`phase01`, a well-mixed
+	 * `tremblePhase` seed in `[0, 1)`), so sources genuinely drift apart instead of running as
+	 * phase-shifted copies of one wave. Nothing else moves — the falloff shape, the reach, the
+	 * fog-clearing circle and `isCellFullyLit` all stay rock-steady. `time` in seconds, or `0` when
+	 * the loop isn't running (returns the steady full 20%).
+	 */
+	private lightCoreRatio(phase01: number, time: number): number {
+		if (time === 0) return LIGHT_CLEAR_CORE_RATIO;
+		const ph = phase01 * Math.PI * 2;
+		const rate = 3.4 + phase01 * 2.8; // per-source rad/s, ~[3.4, 6.2]
+		const n = Math.sin(time * rate + ph) * 0.6 + Math.sin(time * rate * 2.17 + ph * 3.1) * 0.4; // ~[-1, 1]
+		return LIGHT_CLEAR_CORE_RATIO * (0.5 + 0.5 * n);
 	}
 
 	/** Whether `worldX,worldY` falls within any cached token's traced reach (dim reach if `useDim`, else clear-only). */
@@ -825,11 +934,16 @@ export class FogRenderer {
 	 * - a concave corner of an explored cell (two orthogonally-adjacent fog neighbours, wall-separated
 	 *   ones excluded) is cut on the diagonal, the half toward the corner going full black
 	 *   (`concaveCornerBlackTriangles`);
-	 * - each player token sees exactly "line of sight ∩ light": the fog punch is clipped to that
-	 *   token's line-of-sight polygon (`traceVisibilityPolygon`, traced well past the screen so a wall
-	 *   shadow edge is one straight line from the token past the corner), then, inside that clip, its
-	 *   own light circle is punched as a real `ctx.arc` (round edge where the light just runs out) plus
-	 *   every other light source's own wall-clipped reach (`frameLightRawCache`) — so a distant lit
+	 * - each player token sees exactly "line of sight ∩ light": the real fog is cleared **solid** away
+	 *   within every lit shape (the light fully wins over the fog out to its rim), then a cosmetic
+	 *   radial vignette (bright at each source, full fog-tint at each rim) is accumulated on
+	 *   `vignetteCanvas` and blitted back once — accumulated separately precisely so two overlapping
+	 *   lights only ever brighten their overlap, never stack their dark tint (`lightClearnessGradient`).
+	 *   A token's own light shape is `traceVisibilityPolygon` traced to exactly its `lightRadius` with
+	 *   every unobstructed span snapped back onto the true circle arc (`lightCirclePath`) — a perfect
+	 *   round rim where the light runs out, a straight edge only where a wall cuts it; every other
+	 *   light source's own wall-clipped reach (`frameLightRawCache`) is clipped to the token's full
+	 *   line-of-sight polygon (`traceVisibilityPolygon` traced well past the screen), so a distant lit
 	 *   room shows only exactly where this player's line of sight reaches it;
 	 * - when "Adoucir le brouillard" is on, a soft (animated, when zoom allows) fade on the explored
 	 *   side of every explored/fog border, never spilling onto the fog cells;
@@ -861,7 +975,8 @@ export class FogRenderer {
 		fctx.scale(this.transform.zoom, this.transform.zoom);
 
 		const exploredSet = this.controller.getExploredSet();
-		const margin = effectiveCellSize(data) * 2;
+		const cellSize = effectiveCellSize(data);
+		const margin = cellSize * 2;
 		const exploredKeys = exploredCellsInRect(data, exploredSet, rect, margin);
 
 		const exploredPath = new Path2D();
@@ -892,35 +1007,123 @@ export class FogRenderer {
 
 		// Soft fade on the explored side of explored/fog borders (static shape when zoomed out, else
 		// animated) — drawn before the light punch so a currently-lit border isn't darkened.
-		if (this.settings.fogSoftening) this.drawCellFogSoftening(fctx, data, exploredSet, exploredKeys, this.fogAnimationActive());
+		if (this.settings.fogSoftening > 0) {
+			drawFogSofteningRamp(fctx, data, exploredSet, exploredKeys, rect, this.settings.fogSoftening, this.fogAnimationActive() ? performance.now() / 1000 : 0);
+		}
 
-		// What the player sees = "line of sight ∩ light". For each player token: clip the punch to that
-		// token's line-of-sight polygon (`traceVisibilityPolygon`, traced well past the screen so a
-		// wall shadow edge is one straight line from the token past the corner — and so a distant lit
-		// room is reachable by this same line of sight), then, inside that clip, punch its own light
-		// circle as a real `ctx.arc` AND every other light source's own wall-clipped reach
-		// (`frameLightRawCache`). So another lit room shows only where this player can actually see it,
-		// exactly — no loose ray-sample approximation, no light bleeding past a wall.
+		// What the player sees = "line of sight ∩ light":
+		//
+		//  - own light — a *perfect circle* around the token, cut only where a wall physically blocks
+		//    it (`traceVisibilityPolygon` traced to exactly `vision.radius`, every open span snapped
+		//    back onto the true circle arc by `lightCirclePath` — a clean round rim, not a fan of
+		//    facets angled against the explored/fog frontier);
+		//  - every other light source (`frameLightRawCache`) — only where this token's own line of
+		//    sight actually reaches it (`traceVisibilityPolygon` traced well past the screen), so a
+		//    distant lit room shows through a doorway but nothing bleeds past a wall.
+		//
+		// Two steps: (1) clear the real fog fully away within every lit shape, straight on the fog
+		// buffer; (2) accumulate every light's cosmetic vignette on its own `vignetteCanvas` (bright at
+		// each source, fog-tint at each rim) and blit that back in one pass — so two overlapping lights
+		// only ever brighten their overlap, never stack their dark tint.
 		const losFar = Math.hypot(rect.maxX - rect.minX, rect.maxY - rect.minY) * 1.5 + 1;
-		for (const vision of this.frameVisionCache) {
-			if (vision.radius <= 0) continue;
-			const verts = traceVisibilityPolygon(vision.center, losFar, wallSegments);
-			if (verts.length < 3) continue;
-			fctx.save();
-			fctx.beginPath();
-			verts.forEach((p, i) => (i === 0 ? fctx.moveTo(p.x, p.y) : fctx.lineTo(p.x, p.y)));
-			fctx.closePath();
-			fctx.clip();
-			fctx.globalCompositeOperation = "destination-out";
-			fctx.fillStyle = "rgba(0, 0, 0, 1)";
-			fctx.beginPath();
-			fctx.arc(vision.center.x, vision.center.y, vision.radius, 0, Math.PI * 2);
-			fctx.fill();
-			for (const light of this.frameLightRawCache) {
+		const torchFans = this.frameLightRawCache
+			.filter((l) => l.radius > 0)
+			.map((light) => {
 				const fan = new Path2D();
 				this.appendVisionFan(fan, light, false, false, 0);
-				fctx.fill(fan);
+				return { light, fan };
+			});
+		const players = this.frameVisionCache
+			.filter((v) => v.radius > 0)
+			.map((v) => {
+				const lightPoly = traceVisibilityPolygon(v.center, v.radius, wallSegments);
+				const circle = lightPoly.length >= 3 ? this.lightCirclePath(v.center, v.radius, lightPoly) : null;
+				let los: Path2D | null = null;
+				if (torchFans.length > 0) {
+					const losPoly = traceVisibilityPolygon(v.center, losFar, wallSegments);
+					if (losPoly.length >= 3) {
+						los = new Path2D();
+						losPoly.forEach((p, i) => (i === 0 ? los!.moveTo(p.x, p.y) : los!.lineTo(p.x, p.y)));
+						los.closePath();
+					}
+				}
+				return { center: v.center, radius: v.radius, phase: v.phase, circle, los };
+			});
+		// Seconds, or 0 when the flicker loop isn't running (see `lightFlickerActive`/`syncAnimationLoop`).
+		const lightTime = this.lightFlickerActive() ? performance.now() / 1000 : 0;
+
+		const fillTorchesPerPlayer = (context: CanvasRenderingContext2D, perLight: (t: { light: PlayerVisionRays; fan: Path2D }) => void) => {
+			for (const p of players) {
+				if (!p.los || torchFans.length === 0) continue;
+				context.save();
+				context.clip(p.los);
+				for (const t of torchFans) perLight(t);
+				context.restore();
 			}
+		};
+
+		// (1) Clear the real fog fully within every lit shape.
+		fctx.save();
+		fctx.globalCompositeOperation = "destination-out";
+		fctx.fillStyle = "rgba(0, 0, 0, 1)";
+		for (const p of players) if (p.circle) fctx.fill(p.circle);
+		fillTorchesPerPlayer(fctx, ({ fan }) => fctx.fill(fan));
+		fctx.restore();
+
+		// (2) Accumulate the cosmetic vignette on its own buffer, then blit once.
+		const haveLight = players.some((p) => p.circle) || (torchFans.length > 0 && players.some((p) => p.los));
+		if (haveLight) {
+			if (this.vignetteCanvas.width !== w || this.vignetteCanvas.height !== h) {
+				this.vignetteCanvas.width = w;
+				this.vignetteCanvas.height = h;
+			}
+			const vctx = this.vignetteCtx;
+			vctx.save();
+			vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+			vctx.clearRect(0, 0, viewportW, viewportH);
+			vctx.translate(this.transform.panX, this.transform.panY);
+			vctx.scale(this.transform.zoom, this.transform.zoom);
+
+			// Solid fog tint over every lit shape — overlaps stay at alpha 1, they don't add up. Also
+			// stroked a couple of screen px past each edge (`LIGHT_EDGE_SEAL_PX`) so the tint fully
+			// covers the anti-aliased seam left by step (1)'s solid clear, which would otherwise read as
+			// a faint ring at the light's rim.
+			vctx.globalCompositeOperation = "source-over";
+			vctx.fillStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+			vctx.strokeStyle = `rgba(8, 8, 12, ${FOG_OPACITY_UNEXPLORED})`;
+			vctx.lineJoin = "round";
+			vctx.lineCap = "round";
+			vctx.lineWidth = LIGHT_EDGE_SEAL_PX / (this.transform.zoom * dpr);
+			for (const p of players)
+				if (p.circle) {
+					vctx.fill(p.circle);
+					vctx.stroke(p.circle);
+				}
+			fillTorchesPerPlayer(vctx, ({ fan }) => {
+				vctx.fill(fan);
+				vctx.stroke(fan);
+			});
+
+			// Erase that one tint per light: full through the clear core, none at the rim. Every light
+			// erases the *same* pre-filled tint, so overlapping lights only brighten their overlap. Only
+			// the core plateau flickers (`lightCoreRatio` — breathes 0..20% of the reach); the reach,
+			// the falloff shape and step (1)'s fog-clearing circle all stay steady.
+			vctx.globalCompositeOperation = "destination-out";
+			for (const p of players) {
+				if (!p.circle) continue;
+				vctx.fillStyle = this.lightClearnessGradient(vctx, p.center, p.radius, this.lightCoreRatio(p.phase, lightTime));
+				vctx.fill(p.circle);
+			}
+			fillTorchesPerPlayer(vctx, ({ light, fan }) => {
+				vctx.fillStyle = this.lightClearnessGradient(vctx, light.center, light.radius, this.lightCoreRatio(light.phase, lightTime));
+				vctx.fill(fan);
+			});
+			vctx.restore();
+
+			fctx.save();
+			fctx.setTransform(1, 0, 0, 1, 0, 0);
+			fctx.globalCompositeOperation = "source-over";
+			fctx.drawImage(this.vignetteCanvas, 0, 0);
 			fctx.restore();
 		}
 		fctx.globalCompositeOperation = "source-over";
@@ -1067,62 +1270,6 @@ export class FogRenderer {
 		return cells.map((c) => `${c.a},${c.b}`);
 	}
 
-	/**
-	 * The "Adoucir le brouillard" fade: for every explored cell edge that borders a fog cell, a
-	 * gradient band on the *explored* side only (edge → `FOG_SOFTEN_DEPTH_RATIO` of a cell inward,
-	 * `FOG_OPACITY_EXPLORED`-ish down to 0), so the fog cells across the border stay fully black. When
-	 * `animate`, the band depth/alpha breathe on a slow per-edge-desynced sine.
-	 */
-	private drawCellFogSoftening(ctx: CanvasRenderingContext2D, data: MapFileData, exploredSet: ReadonlySet<string>, exploredKeys: string[], animate: boolean): void {
-		const time = animate ? performance.now() / 1000 : 0;
-		const cell = effectiveCellSize(data);
-		const eps = cell * 0.1;
-		const maxDepth = cell * 0.45;
-		ctx.save();
-		ctx.globalCompositeOperation = "source-over";
-		for (const key of exploredKeys) {
-			const poly = cellPolygon(data, key);
-			let sx = 0;
-			let sy = 0;
-			for (const p of poly) {
-				sx += p.x;
-				sy += p.y;
-			}
-			const ccx = sx / poly.length;
-			const ccy = sy / poly.length;
-			for (let i = 0; i < poly.length; i++) {
-				const p = poly[i];
-				const q = poly[(i + 1) % poly.length];
-				if (!p || !q) continue;
-				const mx = (p.x + q.x) / 2;
-				const my = (p.y + q.y) / 2;
-				let nx = mx - ccx;
-				let ny = my - ccy;
-				const nl = Math.hypot(nx, ny) || 1;
-				nx /= nl;
-				ny /= nl;
-				if (exploredSet.has(worldPointToCellKey(data, mx + nx * eps, my + ny * eps))) continue;
-				const phase = hashPhase(`${key}|${i}`);
-				const wob = animate ? 0.8 + 0.3 * Math.sin(time * 1.4 + phase) : 1;
-				const depth = Math.min(FOG_SOFTEN_DEPTH_RATIO * cellVisualWidth(data) * wob, maxDepth);
-				const edgeAlpha = FOG_OPACITY_EXPLORED * 0.8 * (animate ? 0.85 + 0.15 * Math.sin(time * 1.1 + phase * 1.3) : 1);
-				const ix = -nx;
-				const iy = -ny;
-				const grad = ctx.createLinearGradient(mx, my, mx + ix * depth, my + iy * depth);
-				grad.addColorStop(0, `rgba(8, 8, 12, ${edgeAlpha})`);
-				grad.addColorStop(1, "rgba(8, 8, 12, 0)");
-				ctx.fillStyle = grad;
-				ctx.beginPath();
-				ctx.moveTo(p.x, p.y);
-				ctx.lineTo(q.x, q.y);
-				ctx.lineTo(q.x + ix * depth, q.y + iy * depth);
-				ctx.lineTo(p.x + ix * depth, p.y + iy * depth);
-				ctx.closePath();
-				ctx.fill();
-			}
-		}
-		ctx.restore();
-	}
 
 	/**
 	 * Scales a pair of insets eroding a tile's two *opposite* edges (e.g. west/east) down together,

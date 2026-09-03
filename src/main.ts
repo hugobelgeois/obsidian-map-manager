@@ -163,16 +163,18 @@ export default class MapManagerPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		const loaded = (await this.loadData()) as (Partial<MapManagerSettings> & { fogAnimations?: boolean; fogAnimationMode?: string }) | null;
+		const loaded = (await this.loadData()) as
+			| (Partial<MapManagerSettings> & { fogAnimations?: boolean; fogAnimationMode?: string; fogSoftening?: number | boolean })
+			| null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
-		// The old fog-edge tremble (`fogAnimations` boolean, then the `fogAnimationMode` 3-way) is
-		// superseded by `fogSoftening`. An install that had any animation on keeps a softened fog;
-		// one that had explicitly turned it off keeps it off. A fresh install (neither key) takes the
-		// `DEFAULT_SETTINGS.fogSoftening` default (on).
-		if (loaded && loaded.fogSoftening === undefined) {
-			if (loaded.fogAnimationMode !== undefined) this.settings.fogSoftening = loaded.fogAnimationMode !== "none";
-			else if (loaded.fogAnimations !== undefined) this.settings.fogSoftening = loaded.fogAnimations;
-		}
+		// "Adoucir le brouillard" went: `fogAnimations` boolean → `fogAnimationMode` 3-way →
+		// `fogSoftening` on/off boolean → today's `fogSoftening` 0-10 intensity level. Fold every older
+		// shape onto the level: any animation/softening that was on becomes a moderate level 3, an
+		// explicit off becomes 0, a fresh install (no key at all) takes `DEFAULT_SETTINGS.fogSoftening`.
+		const rawSoftening: number | boolean | string | undefined =
+			loaded?.fogSoftening ?? (loaded?.fogAnimationMode !== undefined ? loaded.fogAnimationMode !== "none" : loaded?.fogAnimations);
+		if (typeof rawSoftening === "boolean") this.settings.fogSoftening = rawSoftening ? 3 : 0;
+		else if (typeof rawSoftening === "number") this.settings.fogSoftening = Math.max(0, Math.min(10, Math.round(rawSoftening)));
 		// Pre-"Modèle de statistiques verrouillé" installs saved their own `defaultTokenTemplates`
 		// array without the reserved "Joueur" template — `Object.assign` above just keeps that old
 		// array as-is (no per-template merge), so it never gains the new entry on its own. Prepend it
@@ -187,6 +189,23 @@ export default class MapManagerPlugin extends Plugin {
 		// locked template" from the id at each of those call sites.
 		const playerTemplate = this.settings.defaultTokenTemplates.find((t) => t.id === PLAYER_TEMPLATE_ID);
 		if (playerTemplate) playerTemplate.reserved = true;
+
+		// Gamepad action effects that changed shape: "popup" (free Markdown) → "open-note" (a vault note
+		// link); the split "light-on"/"light-off" → one "toggle-light". Then drop any effect that no
+		// longer fits its contact (wall effects need a wall contact, "toggle-light" a "token lumière" one).
+		for (const action of this.settings.gamepadActions) {
+			const kind = (action.effect as { kind: string }).kind;
+			if (kind === "popup") action.effect = { kind: "open-note", link: "" };
+			else if (kind === "light-on" || kind === "light-off") action.effect = { kind: "toggle-light" };
+			const c = action.contact;
+			const fits =
+				action.effect.kind === "pass-through" || action.effect.kind === "change-wall-type"
+					? c.kind === "wall"
+					: action.effect.kind === "toggle-light"
+						? c.kind === "token" && c.category === "light"
+						: true;
+			if (!fits) action.effect = { kind: "open-note", link: "" };
+		}
 	}
 
 	async saveSettings(): Promise<void> {

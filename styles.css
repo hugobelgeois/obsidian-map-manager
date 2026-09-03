@@ -361,6 +361,77 @@
 	flex: 0 0 auto;
 }
 
+/* Gamepad action menu (Triangle/Y popup — see MapCanvas.syncActionMenuOverlay). Floats over the map
+   canvas, anchored above the driving token; purely a readout, positioned entirely from TypeScript. */
+.map-manager-action-menu {
+	position: absolute;
+	z-index: 6;
+	pointer-events: none;
+	transform: translate(-50%, -100%);
+	min-width: 140px;
+	max-width: 280px;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	box-shadow: var(--shadow-s, 0 2px 12px rgba(0, 0, 0, 0.4));
+	padding: 4px;
+	font-size: 0.85em;
+}
+
+.map-manager-action-menu.is-below {
+	transform: translate(-50%, 0);
+}
+
+.map-manager-action-menu-item {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 0.8em;
+	padding: 3px 8px;
+	border-radius: 4px;
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.map-manager-action-menu-item.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.map-manager-action-menu-cost {
+	font-family: var(--font-monospace, monospace);
+	opacity: 0.85;
+}
+
+/* "Actions manette" settings — every control of one action on a single Setting row. The info column
+   is unused (name/desc empty), so reclaim it and let the controls wrap. */
+.map-manager-gamepad-action .setting-item-info {
+	display: none;
+}
+
+.map-manager-gamepad-action .setting-item-control {
+	flex-wrap: wrap;
+	justify-content: flex-start;
+	gap: 6px;
+}
+
+.map-manager-gamepad-action .setting-item-control input[type="text"] {
+	width: 12ch;
+}
+
+.map-manager-gamepad-action .setting-item-control input[type="number"] {
+	width: 6ch;
+}
+
+.map-manager-gamepad-action .setting-item-control select {
+	max-width: 100%;
+}
+
+.map-manager-action-note-body {
+	max-height: 60vh;
+	overflow-y: auto;
+}
+
 
 .map-manager-infopanel {
 	flex: 0 0 0;

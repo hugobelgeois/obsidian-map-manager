@@ -2,7 +2,7 @@ import { ItemView, ViewStateResult, WorkspaceLeaf } from "obsidian";
 import type MapManagerPlugin from "../main";
 import { MapController, PlayerMirrorCameraMode } from "../controller/MapController";
 import { footprintCenter } from "../grid/fog";
-import { getMirrorSource, MirrorSource } from "../platform/mirrorRegistry";
+import { getMirrorSource, MirrorSource, onMirrorSourceChange } from "../platform/mirrorRegistry";
 import { MapCanvas } from "../render/MapCanvas";
 import { ClockBar } from "../ui/ClockBar";
 import { InfoPanel } from "../ui/InfoPanel";
@@ -47,6 +47,8 @@ export class MapPlayerMirrorView extends ItemView {
 	private unsubscribePathAnimation: (() => void) | null = null;
 	private unsubscribeCellHop: (() => void) | null = null;
 	private unsubscribeAim: (() => void) | null = null;
+	/** Watches the mirror registry so this view re-attaches by itself when the GM window reopens the same map (see `onMirrorSourceChange`). Keyed to `filePath`, kept alive across `mount()` calls, torn down only on close. */
+	private unsubscribeRegistry: (() => void) | null = null;
 	private rootEl: HTMLElement;
 	private bodyEl: HTMLElement | null = null;
 	/** The `playerMirrorCameraMode` last applied by `applyCameraForMode` — lets a switch *into* "center" force a fresh fit even when `dataVersion` hasn't changed since the last time that mode ran. */
@@ -78,8 +80,25 @@ export class MapPlayerMirrorView extends ItemView {
 
 	async setState(state: unknown, result: ViewStateResult): Promise<void> {
 		const file = (state as { file?: unknown } | null)?.file;
-		if (typeof file === "string") this.filePath = file;
+		if (typeof file === "string" && file !== this.filePath) {
+			this.filePath = file;
+			this.unsubscribeRegistry?.();
+			this.unsubscribeRegistry = onMirrorSourceChange(file, () => this.handleRegistryChange());
+		}
 		await super.setState(state, result);
+		this.mount();
+	}
+
+	/**
+	 * Re-attaches to a freshly-registered shared controller when the map's GM window (re)opens while
+	 * this view stays put. A source *disappearing* (GM window closed) is deliberately ignored: the
+	 * canvas keeps rendering the last frame it had — the shared `MapController` object stays alive in
+	 * memory as long as this view holds its reference — rather than collapsing to the "reopen this map
+	 * first" placeholder. `mount()` only runs again once a real source comes back.
+	 */
+	private handleRegistryChange(): void {
+		const next = this.filePath ? getMirrorSource(this.filePath) : undefined;
+		if (!next || next === this.source) return;
 		this.mount();
 	}
 
@@ -207,5 +226,7 @@ export class MapPlayerMirrorView extends ItemView {
 
 	async onClose(): Promise<void> {
 		this.destroyComponents();
+		this.unsubscribeRegistry?.();
+		this.unsubscribeRegistry = null;
 	}
 }

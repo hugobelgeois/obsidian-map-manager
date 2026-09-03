@@ -450,8 +450,8 @@ export class PublicMapCanvas {
 			} else {
 				// "Avec grillage" per-cell fog: crisp cells (+ optional soft fade), no light circles
 				// (the export carries no live vision) — drawn straight onto the main canvas.
-				const soft = this.controller.snapshot.fogSoftening;
-				drawCellFogMask(ctx, data, this.exploredSet, this.visibleWorldRect(), soft, soft ? performance.now() / 1000 : 0);
+				const soft = Number(this.controller.snapshot.fogSoftening) || 0;
+				drawCellFogMask(ctx, data, this.exploredSet, this.visibleWorldRect(), soft, soft > 0 ? performance.now() / 1000 : 0);
 			}
 		}
 
@@ -469,7 +469,7 @@ export class PublicMapCanvas {
 	 */
 	private syncFogAnimation(): void {
 		const map = this.controller.snapshot.map;
-		const shouldAnimate = map.fogEnabled && map.gridType !== "none" && this.controller.snapshot.fogSoftening;
+		const shouldAnimate = map.fogEnabled && map.gridType !== "none" && Number(this.controller.snapshot.fogSoftening) > 0;
 		if (shouldAnimate && this.fogAnimationFrameId === null) {
 			const tick = () => {
 				this.fogAnimationFrameId = requestAnimationFrame(tick);

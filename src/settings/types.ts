@@ -1,5 +1,6 @@
 import { DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM } from "../grid/gridMath";
 import { GridType, TokenTemplate, ZoneType } from "../data/mapData";
+import { DEFAULT_GAMEPAD_ACTIONS, GamepadAction, cloneGamepadActions } from "../data/gamepadActions";
 
 export interface MapManagerSettings {
 	defaultGridType: GridType;
@@ -13,13 +14,16 @@ export interface MapManagerSettings {
 	defaultMinZoom: number;
 	defaultMaxZoom: number;
 	/**
-	 * "Adoucir le brouillard" — when on (the default), the celled-grid fog (`FogRenderer.renderCellFog`)
-	 * draws a light animated fade on the explored side of every explored/fog cell border (fog cells stay
-	 * fully black), and grid type "none" keeps its legacy edge tremble; a continuous redraw loop runs
-	 * while a map with fog is open. When off, fog is crisp and fully static (no redraw loop). Replaces
-	 * the old 3-way `fogAnimationMode`.
+	 * "Adoucir le brouillard" — intensity of the fog/explored transition fade, a 0-10 slider. `0`
+	 * disables it: fog is crisp and fully static (no redraw loop). `1-10` has the celled-grid fog
+	 * (`FogRenderer.renderCellFog`) draw a light animated fade on the explored side of every
+	 * explored/fog cell border (fog cells stay fully black), and grid type "none" keep its legacy edge
+	 * tremble, with a continuous redraw loop while a map with fog is open; the higher the level, the
+	 * deeper and darker the band — `10` takes the explored side of a border almost to full black over
+	 * more than a cell width (see `fogSofteningParams`). Replaces the old 3-way `fogAnimationMode`, then
+	 * the on/off boolean.
 	 */
-	fogSoftening: boolean;
+	fogSoftening: number;
 	/** Debug overlay: strokes each player token's line-of-sight polygon, the rays to its vertices, and its light-radius circle over the celled-grid fog (view mode). Off by default. */
 	fogDebugVisionRays: boolean;
 	/** Seconds of inactivity after a map edit before `<map>.json` (see `publishPublicSnapshot`) is regenerated automatically — see `wireAutoPublish`. `0` disables auto-publishing entirely. */
@@ -28,6 +32,14 @@ export interface MapManagerSettings {
 	tokenRotationStep: number;
 	/** Side length (px) a vault image is downscaled/cropped to when picked as a pion "logo" — see `resizeImageToSquare`/`InfoPanel.pickVaultTokenImage`. */
 	tokenImageSize: number;
+	/**
+	 * "Actions manette" — the entries a player can pick from the Triangle/Y popup menu in view mode
+	 * (see `GamepadAction` and `MapCanvas.handleGamepadActionButton`). Shared globally like
+	 * `defaultZoneTypes` (not per-map). Empty by default.
+	 */
+	gamepadActions: GamepadAction[];
+	/** Points of `Token.lightLife` drained from the acting player token per cursor move inside the gamepad action menu. Default 1. */
+	actionMenuNavCost: number;
 }
 
 export const DEFAULT_ZONE_TYPES: ZoneType[] = [
@@ -64,9 +76,11 @@ export const DEFAULT_SETTINGS: MapManagerSettings = {
 	infoPanelWidth: 280,
 	defaultMinZoom: DEFAULT_MIN_ZOOM,
 	defaultMaxZoom: DEFAULT_MAX_ZOOM,
-	fogSoftening: true,
+	fogSoftening: 3,
 	fogDebugVisionRays: false,
 	autoPublishDelaySeconds: 10,
 	tokenRotationStep: 10,
 	tokenImageSize: 256,
+	gamepadActions: cloneGamepadActions(DEFAULT_GAMEPAD_ACTIONS),
+	actionMenuNavCost: 1,
 };

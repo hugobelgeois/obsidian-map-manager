@@ -28,15 +28,47 @@ export interface MirrorSource {
 }
 
 const sources = new Map<string, MirrorSource>();
+const listeners = new Map<string, Set<() => void>>();
+
+function notifyMirrorSourceChange(path: string): void {
+	const set = listeners.get(path);
+	if (!set) return;
+	for (const cb of [...set]) cb();
+}
 
 /** Registers `source` as the mirror target for `path`, replacing any previous one for the same file. Returns an unregister function to call on unmount (a no-op if a newer source has since replaced this one). */
 export function registerMirrorSource(path: string, source: MirrorSource): () => void {
 	sources.set(path, source);
+	notifyMirrorSourceChange(path);
 	return () => {
-		if (sources.get(path) === source) sources.delete(path);
+		if (sources.get(path) === source) {
+			sources.delete(path);
+			notifyMirrorSourceChange(path);
+		}
 	};
 }
 
 export function getMirrorSource(path: string): MirrorSource | undefined {
 	return sources.get(path);
+}
+
+/**
+ * Subscribes to registration changes for `path` — a source appearing, disappearing, or being
+ * replaced. Lets a `MapPlayerMirrorView` re-attach on its own when the GM window that owns the map
+ * is closed and reopened (Obsidian reload, tab switch, navigating away from an embedding note),
+ * instead of staying stuck on the "reopen this map first" message. Returns an unsubscribe function.
+ */
+export function onMirrorSourceChange(path: string, cb: () => void): () => void {
+	let set = listeners.get(path);
+	if (!set) {
+		set = new Set();
+		listeners.set(path, set);
+	}
+	set.add(cb);
+	return () => {
+		const current = listeners.get(path);
+		if (!current) return;
+		current.delete(cb);
+		if (current.size === 0) listeners.delete(path);
+	};
 }

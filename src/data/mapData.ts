@@ -247,9 +247,9 @@ export interface Token {
 	 */
 	lightRadius?: number;
 	/**
-	 * "player"/"light" tokens only — the "life" (or fuel) left in this light, `0..100`, doubling as
-	 * the *fraction* of `lightRadius` currently actually lit: the effective reach is
-	 * `configuredLightRadius(token) * lightLife / 100` (see `resolveLightRadius`). `100`/unset (see
+	 * "player"/"light" tokens only — the "life" (or fuel) left in this light, `0..100`, driving the
+	 * lit reach: it interpolates linearly between one cell (life just above `0`) and the full
+	 * configured `lightRadius` (life `100`) — see `resolveLightRadius`. `100`/unset (see
 	 * `DEFAULT_LIGHT_LIFE`) is a full-strength light; `0` is fully spent — reach `0`, but the
 	 * configured `lightRadius` and the drain settings below are kept, so it can be "refilled" by
 	 * editing this back up (`InfoPanel.renderLightRadiusField`) or the gamepad's R1 (see
@@ -389,19 +389,25 @@ export function resolveLightLife(token: Token): number {
 }
 
 /**
- * The light radius actually in effect for `token` right now (cells) — `configuredLightRadius`,
- * scaled by `resolveLightLife` / 100 for "player" and "light" tokens (so a half-spent torch lights
- * half its configured reach, and a fully-spent one lights nothing), full for every other category.
- * Every reader of a token's *actual* light (`castLightRays`, `MapCanvas`'s `frameLightCache`/
- * `drawTokenLightZones`) calls this instead of reading `lightRadius` directly.
+ * The light radius actually in effect for `token` right now (cells). For "player" and "light" tokens
+ * `resolveLightLife` interpolates the reach linearly between one cell (life just above `0`) and the
+ * full `configuredLightRadius` (life `100`) — e.g. a configured-11 light at 10% life reaches
+ * `1 + (11 - 1) * 0.10 = 2` cells. Life `0` is off (reach `0`); a light configured at one cell or
+ * less has no room to scale and stays at its configured size while lit. Every other category ignores
+ * life and always gets the full configured radius. Every reader of a token's *actual* light
+ * (`castLightRays`, `MapCanvas`'s `frameLightCache`/`drawTokenLightZones`) calls this instead of
+ * reading `lightRadius` directly.
  */
 export function resolveLightRadius(token: Token): number {
-	const configured = configuredLightRadius(token);
+	const configured = Math.max(0, configuredLightRadius(token));
 	const category = token.category ?? "entity";
 	if (category === "player" || category === "light") {
-		return Math.max(0, (configured * resolveLightLife(token)) / 100);
+		const life = resolveLightLife(token);
+		if (life <= 0) return 0;
+		if (configured <= 1) return configured;
+		return 1 + (configured - 1) * (life / 100);
 	}
-	return Math.max(0, configured);
+	return configured;
 }
 
 export type CellsByGridType = Record<CelledGridType, Record<string, CellData>>;
@@ -1072,8 +1078,9 @@ export interface PublicMapSnapshot {
 	zoneTypes: ZoneType[];
 	/**
 	 * Frozen-at-publish-time copy of `settings.fogSoftening` (not part of `MapFileData` — see
-	 * "Settings" in CLAUDE.md): whether the exported viewer draws the soft animated fade between
-	 * explored and fog cells (`drawCellFogMask`) or crisp cell edges.
+	 * "Settings" in CLAUDE.md): the 0-10 intensity of the soft animated fade the exported viewer draws
+	 * between explored and fog cells (`drawCellFogMask` / `fogSofteningParams`). `0` = crisp cell edges,
+	 * no animation. Older snapshots may carry a boolean here (treated as `0`/`3`).
 	 */
-	fogSoftening: boolean;
+	fogSoftening: number;
 }

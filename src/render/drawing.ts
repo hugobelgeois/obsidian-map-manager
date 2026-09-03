@@ -1,5 +1,5 @@
 import { DEFAULT_TOKEN_COLOR, MapFileData, Marker, Token, ZoneType } from "../data/mapData";
-import { FogWorldRect, cellPolygon, cellVisualWidth, concaveCornerBlackTriangles, effectiveCellSize, exploredCellsInRect, worldPointToCellKey } from "../grid/fog";
+import { FogWorldRect, cellPolygon, concaveCornerBlackTriangles, effectiveCellSize, exploredCellsInRect, worldPointToCellKey } from "../grid/fog";
 import { Point } from "../grid/gridMath";
 
 /** Below this on-screen font size (in px), a cell's label hides and its stamp grows to fill the space instead. */
@@ -9,6 +9,156 @@ export const MIN_LABEL_PIXELS = 9;
 export const FOG_OPACITY_UNEXPLORED = 1;
 /** Fog opacity for ground that has been seen before but isn't currently lit ("noir à 50 %"). */
 export const FOG_OPACITY_EXPLORED = 0.5;
+
+/**
+ * "Adoucir le brouillard" parameters at intensity `level` — a 0-10 slider: `0` disables the fade
+ * entirely (crisp explored/fog border), `10` puts full black right against every fog-bordering edge.
+ * The darkened band stays within the single explored cell that borders fog at every level — the
+ * slider changes how dark that one-cell gradient starts, not how far it reaches. Returns `null` when
+ * disabled. See `drawFogSofteningRamp` for how these are used.
+ *
+ * - `edgeAlpha` — opacity right against a fog-bordering edge; the per-cell gradient runs from there
+ *   down to fully transparent at the cell's far side.
+ * - `blurRatio` — blur radius as a fraction of a cell; only enough to connect adjacent cells'
+ *   gradients across shared corners so the frontier doesn't stair-step.
+ */
+export function fogSofteningParams(level: number): { edgeAlpha: number; blurRatio: number } | null {
+	if (!(level > 0)) return null;
+	const t = Math.min(1, level / 10);
+	return {
+		edgeAlpha: 0.4 + 0.6 * t,
+		blurRatio: 0.09 + 0.05 * t,
+	};
+}
+
+let fogSoftMaskCanvas: HTMLCanvasElement | null = null;
+let fogSoftBlurCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * Draws the "Adoucir le brouillard" fade. On an offscreen scratch, for every explored cell that
+ * borders fog: the fog region itself is filled solid at `edgeAlpha`, then each fog-bordering edge of
+ * that cell gets a linear gradient running *into* the cell — `edgeAlpha` hard against the edge,
+ * fading to fully transparent one cell width in — so the darkness starts black against the fog and
+ * clears completely by the cell's far (explored/explored) edges. A corner cell with two fog edges
+ * darkens in both directions, deepest in the corner. The scratch is then lightly blurred (just enough
+ * to connect neighbouring cells' gradients across their shared corners so a diagonal frontier reads
+ * continuous, not stair-stepped — `fogSofteningParams.blurRatio`) and composited back once.
+ *
+ * `ctx` must currently hold the world (pan/zoom) transform; its `getTransform()` scale is taken as
+ * the world→device pixel factor. Safe on both an offscreen fog buffer (`FogRenderer.renderCellFog`)
+ * and the shared main canvas mid-scene (public export `drawCellFogMask`): it only ever adds dark
+ * pixels, and saves/restores the transform it was handed. `time` (seconds, `0` = static) drives a
+ * slow breath on the darkness.
+ */
+export function drawFogSofteningRamp(
+	ctx: CanvasRenderingContext2D,
+	data: MapFileData,
+	exploredSet: ReadonlySet<string>,
+	exploredKeys: string[],
+	rect: FogWorldRect,
+	level: number,
+	time: number
+): void {
+	const soft = fogSofteningParams(level);
+	if (!soft || exploredKeys.length === 0) return;
+
+	const target = ctx.canvas;
+	const w = target.width;
+	const h = target.height;
+	if (w === 0 || h === 0) return;
+
+	const mask = (fogSoftMaskCanvas ??= document.createElement("canvas"));
+	const blur = (fogSoftBlurCanvas ??= document.createElement("canvas"));
+	if (mask.width !== w || mask.height !== h) {
+		mask.width = w;
+		mask.height = h;
+	}
+	if (blur.width !== w || blur.height !== h) {
+		blur.width = w;
+		blur.height = h;
+	}
+	const mctx = mask.getContext("2d");
+	const bctx = blur.getContext("2d");
+	if (!mctx || !bctx) return;
+
+	const xf = ctx.getTransform();
+	const cell = effectiveCellSize(data);
+	const eps = cell * 0.1;
+	const margin = cell * 2;
+	const breath = time > 0 ? 0.88 + 0.12 * Math.sin(time * 1.2) : 1;
+	const alpha = Math.min(1, soft.edgeAlpha * breath);
+
+	mctx.setTransform(1, 0, 0, 1, 0, 0);
+	mctx.clearRect(0, 0, w, h);
+	mctx.setTransform(xf.a, xf.b, xf.c, xf.d, xf.e, xf.f);
+
+	// Fog side: solid at `alpha` (so the blur below has matching material across the frontier and the
+	// gradient starts flush against it, not at half strength).
+	const fogRegion = new Path2D();
+	fogRegion.rect(rect.minX - margin, rect.minY - margin, rect.maxX - rect.minX + margin * 2, rect.maxY - rect.minY + margin * 2);
+	for (const key of exploredKeys) polyToPath(fogRegion, cellPolygon(data, key));
+	mctx.fillStyle = `rgba(8, 8, 12, ${alpha})`;
+	mctx.fill(fogRegion, "evenodd");
+
+	// Explored side: a per-cell, per-fog-edge gradient into the bordering cell.
+	let anyFrontier = false;
+	for (const key of exploredKeys) {
+		const poly = cellPolygon(data, key);
+		let cx = 0;
+		let cy = 0;
+		for (const p of poly) {
+			cx += p.x;
+			cy += p.y;
+		}
+		cx /= poly.length;
+		cy /= poly.length;
+
+		const cellPath = new Path2D();
+		polyToPath(cellPath, poly);
+		let clipped = false;
+		for (let i = 0; i < poly.length; i++) {
+			const a = poly[i];
+			const b = poly[(i + 1) % poly.length];
+			if (!a || !b) continue;
+			const mx = (a.x + b.x) / 2;
+			const my = (a.y + b.y) / 2;
+			let nx = mx - cx;
+			let ny = my - cy;
+			const nl = Math.hypot(nx, ny) || 1;
+			nx /= nl;
+			ny /= nl;
+			if (exploredSet.has(worldPointToCellKey(data, mx + nx * eps, my + ny * eps))) continue;
+			if (!clipped) {
+				mctx.save();
+				mctx.clip(cellPath);
+				clipped = true;
+				anyFrontier = true;
+			}
+			const grad = mctx.createLinearGradient(mx, my, mx - nx * cell, my - ny * cell);
+			grad.addColorStop(0, `rgba(8, 8, 12, ${alpha})`);
+			grad.addColorStop(1, "rgba(8, 8, 12, 0)");
+			mctx.fillStyle = grad;
+			mctx.fill(cellPath);
+		}
+		if (clipped) mctx.restore();
+	}
+	if (!anyFrontier) return;
+
+	// Light blur, world units → device px via the transform scale, so the connect-the-corners smoothing
+	// is a fixed fraction of a cell however far the view is zoomed.
+	const blurPx = Math.max(0.5, soft.blurRatio * cell * xf.a);
+	bctx.setTransform(1, 0, 0, 1, 0, 0);
+	bctx.clearRect(0, 0, w, h);
+	bctx.filter = `blur(${blurPx}px)`;
+	bctx.drawImage(mask, 0, 0);
+	bctx.filter = "none";
+
+	ctx.save();
+	ctx.setTransform(1, 0, 0, 1, 0, 0);
+	ctx.globalCompositeOperation = "source-over";
+	ctx.drawImage(blur, 0, 0);
+	ctx.restore();
+}
 
 /** Mixes a #rrggbb color toward white by `ratio` (0 = unchanged, 1 = white). Used for the selected-token border. */
 export function lightenColor(hex: string, ratio: number): string {
@@ -210,28 +360,22 @@ function polyToPath(path: Path2D, poly: Point[]): void {
 	path.closePath();
 }
 
-/** Stable pseudo-random phase in `[0, 2π)` from a string key — de-syncs the soft fade band per cell edge. */
-function edgePhase(key: string): number {
-	let hash = 0;
-	for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) | 0;
-	return (((hash >>> 0) % 1000) / 1000) * Math.PI * 2;
-}
-
 /**
  * "Avec grillage" fog for a celled grid type, the read-only export counterpart to
  * `FogRenderer.renderCellFog` — no light circles (the exported snapshot carries no live vision or
  * walls, just the explored-cell set): fog cells filled full black, explored cells half, concave
- * corners of explored cells cut on the diagonal (square grids), and, when `softening`, a soft fade
- * on the explored side of every explored/fog border (animated via `time`, seconds). Drawn crisp
- * under the caller's world transform, straight onto the given context with plain `source-over` fills
- * (no `destination-out`) so it's safe on a shared canvas that already has the map drawn under it.
+ * corners of explored cells cut on the diagonal (square grids), and, when `softeningLevel > 0`, the
+ * blur-connected softening ramp on the explored side of the whole frontier (`drawFogSofteningRamp` —
+ * depth/darkness scaled by the 0-10 level, breathing via `time`, seconds). Drawn crisp under the
+ * caller's world transform, straight onto the given context with plain `source-over` fills (no
+ * `destination-out`) so it's safe on a shared canvas that already has the map drawn under it.
  */
 export function drawCellFogMask(
 	ctx: CanvasRenderingContext2D,
 	data: MapFileData,
 	exploredSet: ReadonlySet<string>,
 	rect: FogWorldRect,
-	softening: boolean,
+	softeningLevel: number,
 	time: number
 ): void {
 	const margin = effectiveCellSize(data) * 2;
@@ -263,51 +407,6 @@ export function drawCellFogMask(
 		ctx.fill(fogBackPath);
 	}
 
-	if (softening) {
-		const cell = effectiveCellSize(data);
-		const eps = cell * 0.1;
-		const maxDepth = cell * 0.45;
-		for (const key of exploredKeys) {
-			const poly = cellPolygon(data, key);
-			let sx = 0;
-			let sy = 0;
-			for (const p of poly) {
-				sx += p.x;
-				sy += p.y;
-			}
-			const ccx = sx / poly.length;
-			const ccy = sy / poly.length;
-			for (let i = 0; i < poly.length; i++) {
-				const p = poly[i];
-				const q = poly[(i + 1) % poly.length];
-				if (!p || !q) continue;
-				const mx = (p.x + q.x) / 2;
-				const my = (p.y + q.y) / 2;
-				let nx = mx - ccx;
-				let ny = my - ccy;
-				const nl = Math.hypot(nx, ny) || 1;
-				nx /= nl;
-				ny /= nl;
-				if (exploredSet.has(worldPointToCellKey(data, mx + nx * eps, my + ny * eps))) continue;
-				const phase = edgePhase(`${key}|${i}`);
-				const wob = 0.8 + 0.3 * Math.sin(time * 1.4 + phase);
-				const depth = Math.min(0.4 * cellVisualWidth(data) * wob, maxDepth);
-				const edgeAlpha = FOG_OPACITY_EXPLORED * 0.8 * (0.85 + 0.15 * Math.sin(time * 1.1 + phase * 1.3));
-				const ix = -nx;
-				const iy = -ny;
-				const grad = ctx.createLinearGradient(mx, my, mx + ix * depth, my + iy * depth);
-				grad.addColorStop(0, `rgba(8, 8, 12, ${edgeAlpha})`);
-				grad.addColorStop(1, "rgba(8, 8, 12, 0)");
-				ctx.fillStyle = grad;
-				ctx.beginPath();
-				ctx.moveTo(p.x, p.y);
-				ctx.lineTo(q.x, q.y);
-				ctx.lineTo(q.x + ix * depth, q.y + iy * depth);
-				ctx.lineTo(p.x + ix * depth, p.y + iy * depth);
-				ctx.closePath();
-				ctx.fill();
-			}
-		}
-	}
+	if (exploredKeys.length > 0) drawFogSofteningRamp(ctx, data, exploredSet, exploredKeys, rect, softeningLevel, time);
 	ctx.restore();
 }

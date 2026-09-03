@@ -1,11 +1,28 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type MapManagerPlugin from "../main";
-import { DEFAULT_TOKEN_TAB_NAMES, GRID_TYPE_LABELS, GRID_TYPES, GridType } from "../data/mapData";
+import { DEFAULT_TOKEN_TAB_NAMES, GRID_TYPE_LABELS, GRID_TYPES, GridType, VisionBlockerType, makeLink, splitLink } from "../data/mapData";
+import { GamepadAction, GamepadActionContact, GamepadActionEffect } from "../data/gamepadActions";
+import { FileSuggestModal } from "../ui/FileSuggestModal";
+import { HeadingSuggestModal } from "../ui/HeadingSuggestModal";
+import { WALL_BLOCKER_TYPE_OPTIONS } from "../ui/wallBlockerTypeOptions";
 import { generateId } from "../utils";
 
 export class MapManagerSettingsTab extends PluginSettingTab {
 	constructor(app: App, private plugin: MapManagerPlugin) {
 		super(app, plugin);
+	}
+
+	/**
+	 * Rebuilds the whole tab (`display`) while keeping the scroll position — every structural edit
+	 * (add/remove a zone, change a gamepad action's contact/effect, …) has to re-`display()` to show
+	 * the new controls, and a bare `display()` empties `containerEl` and snaps the view back to the top.
+	 */
+	private redraw(): void {
+		const scroller: HTMLElement = this.containerEl.closest<HTMLElement>(".vertical-tab-content") ?? this.containerEl;
+		const top = scroller.scrollTop;
+		this.display();
+		scroller.scrollTop = top;
+		window.requestAnimationFrame(() => (scroller.scrollTop = top));
 	}
 
 	display(): void {
@@ -101,11 +118,13 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Adoucir le brouillard")
 			.setDesc(
-				"Ajoute un léger fondu animé entre les cases explorées et les cases brouillard (le fondu reste du côté des cases explorées, les cases brouillard restent entièrement noires), au prix d'un rafraîchissement continu tant qu'une carte avec brouillard actif est ouverte. Désactivé : rendu net (case brouillard / explorée / visible bien distinctes), aucune animation."
+				"Intensité du fondu entre cases explorées et cases brouillard (le fondu reste du côté des cases explorées, les cases brouillard restent entièrement noires). 0 : désactivé, rendu net et statique, aucune animation. 1 à 10 : le fondu devient de plus en plus long et sombre ; à 10 la case explorée au bord du brouillard est presque noire. Un rafraîchissement continu tourne tant qu'une carte avec brouillard actif est ouverte."
 			)
-			.addToggle((toggle) => {
-				toggle.setValue(settings.fogSoftening);
-				toggle.onChange(async (value) => {
+			.addSlider((slider) => {
+				slider.setLimits(0, 10, 1);
+				slider.setValue(settings.fogSoftening);
+				slider.setDynamicTooltip();
+				slider.onChange(async (value) => {
 					settings.fogSoftening = value;
 					await this.plugin.saveSettings();
 				});
@@ -198,7 +217,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 					btn.setIcon("trash").setTooltip("Supprimer").onClick(async () => {
 						settings.defaultZoneTypes = settings.defaultZoneTypes.filter((z) => z.id !== zone.id);
 						await this.plugin.saveSettings();
-						this.display();
+						this.redraw();
 					});
 				});
 		}
@@ -207,7 +226,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			btn.setButtonText("Ajouter un type de zone").onClick(async () => {
 				settings.defaultZoneTypes.push({ id: generateId(), name: "Nouvelle zone", color: "#888888" });
 				await this.plugin.saveSettings();
-				this.display();
+				this.redraw();
 			});
 		});
 
@@ -261,7 +280,7 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 						btn.onClick(async () => {
 							settings.defaultTokenTemplates = settings.defaultTokenTemplates.filter((t) => t.id !== template.id);
 							await this.plugin.saveSettings();
-							this.display();
+							this.redraw();
 						});
 					}
 				});
@@ -271,7 +290,189 @@ export class MapManagerSettingsTab extends PluginSettingTab {
 			btn.setButtonText("Ajouter un modèle").onClick(async () => {
 				settings.defaultTokenTemplates.push({ id: generateId(), name: "Nouveau modèle", fields: [] });
 				await this.plugin.saveSettings();
-				this.display();
+				this.redraw();
+			});
+		});
+
+		this.renderGamepadActions(containerEl);
+	}
+
+	/**
+	 * "Actions manette" — CRUD for `settings.gamepadActions` (the Triangle/Y popup menu entries — see
+	 * `GamepadAction`). Same live-shared-list pattern as the zone palette above (`this.display()` after
+	 * any structural change).
+	 */
+	private renderGamepadActions(containerEl: HTMLElement): void {
+		const settings = this.plugin.settings;
+
+		new Setting(containerEl)
+			.setName("Actions manette")
+			.setDesc(
+				"Entrées du menu d'action qui s'ouvre en mode vue quand un joueur appuie sur le bouton du haut de sa manette. Chaque action : un nom, la condition de contact qui la rend disponible, l'effet exécuté à la validation et son coût en vie de lumière. Partagée par toutes les cartes."
+			)
+			.setHeading();
+
+		new Setting(containerEl)
+			.setName("Coût de navigation dans le menu d'action")
+			.setDesc("Points de vie de lumière retirés au pion joueur à chaque déplacement du curseur (flèches) dans le menu.")
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "0";
+				text.setValue(String(settings.actionMenuNavCost));
+				text.onChange(async (value) => {
+					const n = parseFloat(value);
+					if (!Number.isNaN(n) && n >= 0) {
+						settings.actionMenuNavCost = n;
+						await this.plugin.saveSettings();
+					}
+				});
+			});
+
+		for (const action of settings.gamepadActions) {
+			this.renderOneGamepadAction(containerEl, action);
+		}
+
+		new Setting(containerEl).addButton((btn) => {
+			btn.setButtonText("Ajouter une action").onClick(async () => {
+				settings.gamepadActions.push({
+					id: generateId(),
+					name: "Nouvelle action",
+					contact: { kind: "none" },
+					effect: { kind: "open-note", link: "" },
+					lightCost: 0,
+				});
+				await this.plugin.saveSettings();
+				this.redraw();
+			});
+		});
+	}
+
+	/**
+	 * One `GamepadAction`, all controls on a single `Setting` row (`.setClass` + CSS hides the empty
+	 * info column and lets the controls wrap): name, contact, effect, effect parameter (target wall
+	 * type / linked note, per effect), light cost, delete.
+	 */
+	private renderOneGamepadAction(containerEl: HTMLElement, action: GamepadAction): void {
+		const settings = this.plugin.settings;
+		const save = () => this.plugin.saveSettings();
+		// Which effects a given contact allows: wall effects need a wall contact, `toggle-light` needs a
+		// "token lumière" contact, `open-note` fits anything.
+		const effectFitsContact = (contact: GamepadActionContact, effect: GamepadActionEffect): boolean => {
+			if (effect.kind === "pass-through" || effect.kind === "change-wall-type") return contact.kind === "wall";
+			if (effect.kind === "toggle-light") return contact.kind === "token" && contact.category === "light";
+			return true;
+		};
+		const setContact = (contact: GamepadActionContact) => {
+			action.contact = contact;
+			if (!effectFitsContact(contact, action.effect)) action.effect = { kind: "open-note", link: "" };
+		};
+
+		const row = new Setting(containerEl).setClass("map-manager-gamepad-action");
+
+		row.addText((text) => {
+			text.setValue(action.name).setPlaceholder("Nom");
+			text.onChange(async (value) => {
+				action.name = value;
+				await save();
+			});
+		});
+
+		row.addDropdown((dd) => {
+			dd.addOption("none", "Contact : rien");
+			dd.addOption("wall", "Contact : mur");
+			dd.addOption("token:light", "Contact : token lumière");
+			dd.addOption("token:player", "Contact : token joueur");
+			dd.addOption("token:entity", "Contact : token ennemi");
+			dd.setValue(action.contact.kind === "token" ? `token:${action.contact.category}` : action.contact.kind);
+			dd.onChange(async (value) => {
+				if (value === "wall") setContact({ kind: "wall" });
+				else if (value.startsWith("token:")) setContact({ kind: "token", category: value.slice("token:".length) as "light" | "player" | "entity" });
+				else setContact({ kind: "none" });
+				await save();
+				this.redraw();
+			});
+		});
+
+		row.addDropdown((dd) => {
+			if (action.contact.kind === "wall") {
+				dd.addOption("pass-through", "Effet : passer outre le mur");
+				dd.addOption("change-wall-type", "Effet : changer le type du mur");
+			}
+			if (action.contact.kind === "token" && action.contact.category === "light") {
+				dd.addOption("toggle-light", "Effet : allumer/éteindre la lumière du token");
+			}
+			dd.addOption("open-note", "Effet : ouvrir une note");
+			dd.setValue(action.effect.kind);
+			dd.onChange(async (value) => {
+				if (value === "pass-through") action.effect = { kind: "pass-through" };
+				else if (value === "change-wall-type") action.effect = { kind: "change-wall-type", to: "opaque" };
+				else if (value === "toggle-light") action.effect = { kind: "toggle-light" };
+				else action.effect = { kind: "open-note", link: "" };
+				await save();
+				this.redraw();
+			});
+		});
+
+		if (action.effect.kind === "change-wall-type") {
+			const effect = action.effect;
+			row.addDropdown((dd) => {
+				for (const opt of WALL_BLOCKER_TYPE_OPTIONS) dd.addOption(opt.value, `→ ${opt.label.replace(/\s*\(.*\)\s*$/, "")}`);
+				dd.setValue(effect.to);
+				dd.onChange(async (value) => {
+					effect.to = value as VisionBlockerType;
+					await save();
+				});
+			});
+		} else if (action.effect.kind === "open-note") {
+			const effect = action.effect;
+			row.addButton((btn) => {
+				const { path, subpath } = splitLink(effect.link);
+				const base = path ? path.split("/").pop()!.replace(/\.md$/, "") : "";
+				btn.setButtonText(effect.link ? (subpath ? `${base} › ${subpath}` : base) : "Lier une note…");
+				btn.onClick(() => {
+					new FileSuggestModal(
+						this.app,
+						this.app.vault.getMarkdownFiles(),
+						(file) => {
+							const headings = this.app.metadataCache.getFileCache(file)?.headings ?? [];
+							const commit = async (link: string) => {
+								effect.link = link;
+								await save();
+								this.redraw();
+							};
+							if (headings.length === 0) {
+								void commit(makeLink(file.path));
+								return;
+							}
+							new HeadingSuggestModal(this.app, headings, (heading) => void commit(makeLink(file.path, heading?.heading))).open();
+						},
+						"Lier une note…"
+					).open();
+				});
+			});
+		}
+
+		row.addText((text) => {
+			text.inputEl.type = "number";
+			text.inputEl.min = "0";
+			text.inputEl.max = "100";
+			text.setValue(String(action.lightCost));
+			text.setPlaceholder("Coût");
+			text.inputEl.title = "Coût en vie de lumière";
+			text.onChange(async (value) => {
+				const n = parseFloat(value);
+				if (!Number.isNaN(n) && n >= 0) {
+					action.lightCost = n;
+					await save();
+				}
+			});
+		});
+
+		row.addExtraButton((btn) => {
+			btn.setIcon("trash").setTooltip("Supprimer").onClick(async () => {
+				settings.gamepadActions = settings.gamepadActions.filter((a) => a.id !== action.id);
+				await save();
+				this.redraw();
 			});
 		});
 	}

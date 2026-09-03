@@ -52,6 +52,13 @@ export type PlayerMirrorCameraMode = "mirror" | "freeze" | "center";
 
 export const PLAYER_MIRROR_CAMERA_MODES: PlayerMirrorCameraMode[] = ["mirror", "freeze", "center"];
 
+/** One open gamepad action menu — see `MapController.gamepadActionMenus` / `MapCanvas.syncActionMenuOverlay`. */
+export interface GamepadActionMenuState {
+	tokenId: string;
+	options: { label: string; lightCost: number }[];
+	highlightedIndex: number;
+}
+
 export const PLAYER_MIRROR_CAMERA_MODE_LABELS: Record<PlayerMirrorCameraMode, string> = {
 	mirror: "Miroir MJ",
 	freeze: "Figer",
@@ -110,6 +117,16 @@ export class MapController {
 	 * either (`InfoPanel`'s dropdown is the only writer).
 	 */
 	gamepadAssignments: Map<number, string> = new Map();
+
+	/**
+	 * The gamepad action menu (Triangle/Y popup) currently open for each gamepad, keyed by
+	 * `Gamepad.index` — session-only and notify-driven, exactly like `gamepadAssignments`, so both the
+	 * GM canvas and the player-mirror canvas draw the same menu off shared state with no dedicated echo
+	 * channel (see `MapCanvas.syncActionMenuOverlay`). `options` is display data only; the code that
+	 * actually runs each entry lives on the source `MapCanvas` (the sole poll site). Cleared when the
+	 * driving gamepad or token goes away.
+	 */
+	gamepadActionMenus: Map<number, GamepadActionMenuState> = new Map();
 
 	/**
 	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
@@ -1341,7 +1358,8 @@ export class MapController {
 	}
 
 	unassignGamepad(gamepadIndex: number): void {
-		if (!this.gamepadAssignments.delete(gamepadIndex)) return;
+		const hadMenu = this.gamepadActionMenus.delete(gamepadIndex);
+		if (!this.gamepadAssignments.delete(gamepadIndex) && !hadMenu) return;
 		this.notify();
 	}
 
@@ -1354,7 +1372,36 @@ export class MapController {
 				changed = true;
 			}
 		}
+		for (const [index, menu] of [...this.gamepadActionMenus]) {
+			if (tokenIds.has(menu.tokenId)) {
+				this.gamepadActionMenus.delete(index);
+				changed = true;
+			}
+		}
 		if (changed) this.notify();
+	}
+
+	// ---- Gamepad action menu (session-only — see `gamepadActionMenus`) ----
+
+	/** Opens the Triangle/Y action menu for `gamepadIndex`, driving `tokenId`, with `options` as its entries (cursor starts at the top). */
+	openGamepadActionMenu(gamepadIndex: number, tokenId: string, options: { label: string; lightCost: number }[]): void {
+		this.gamepadActionMenus.set(gamepadIndex, { tokenId, options, highlightedIndex: 0 });
+		this.notify();
+	}
+
+	/** Moves an open action menu's cursor by `delta` (wraps top/bottom). No-op if no menu is open for `gamepadIndex`. */
+	moveGamepadActionMenuCursor(gamepadIndex: number, delta: number): void {
+		const menu = this.gamepadActionMenus.get(gamepadIndex);
+		if (!menu || menu.options.length === 0) return;
+		const n = menu.options.length;
+		menu.highlightedIndex = ((menu.highlightedIndex + delta) % n + n) % n;
+		this.notify();
+	}
+
+	/** Closes the action menu for `gamepadIndex`, if any. */
+	closeGamepadActionMenu(gamepadIndex: number): void {
+		if (!this.gamepadActionMenus.delete(gamepadIndex)) return;
+		this.notify();
 	}
 
 	// ---- Clipboard (tokens only — see tokenClipboard.ts) ----

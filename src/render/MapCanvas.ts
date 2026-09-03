@@ -1,11 +1,13 @@
 import { App, Menu, Notice } from "obsidian";
-import { MapController, MapMode, MassSelectionKind } from "../controller/MapController";
+import { GamepadActionMenuState, MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
-import { DEFAULT_LIGHT_LIFE, DEFAULT_TOKEN_COLOR, Layer, Token, hexKey, isCellEmpty, parseCellKey, squareKey, wallPassableWithInteract } from "../data/mapData";
+import { DEFAULT_LIGHT_LIFE, DEFAULT_TOKEN_COLOR, Layer, Token, hexKey, isCellEmpty, parseCellKey, resolveLightLife, squareKey, wallPassableWithInteract } from "../data/mapData";
+import { GamepadAction, directionLabelFr } from "../data/gamepadActions";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { rgbToHex } from "../platform/detectMagicWalls";
+import { ActionNoteModal } from "../ui/ActionNoteModal";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
 import { FogRenderer } from "./FogRenderer";
 import { HitTester } from "./HitTester";
@@ -284,6 +286,15 @@ export class MapCanvas {
 
 	/** Continuously polls connected gamepads and turns a held direction into "move one step" calls (`handleGamepadMove`) — view mode only in effect (see the check inside), but always running so a direction held while switching into view mode doesn't fire immediately. `null` for a mirror canvas (see the constructor) — a mirror never drives token movement, only reflects it. */
 	private gamepadPoller: GamepadInputPoller | null = null;
+	/**
+	 * Execution closures for the currently-open gamepad action menu, keyed by gamepad index — one per
+	 * entry, aligned with `controller.gamepadActionMenus.get(index).options`. Lives here (not on the
+	 * controller) because it captures wall geometry / target tokens and only the source canvas ever
+	 * runs it (the mirror only draws the menu). See `handleGamepadActionButton`/`handleGamepadConfirm`.
+	 */
+	private gamepadActionRunners: Map<number, Array<() => void>> = new Map();
+	/** The action-menu popup DOM overlay (created lazily, one shared node) — see `syncActionMenuOverlay`. */
+	private actionMenuEl: HTMLDivElement | null = null;
 	/** In-flight gamepad-triggered "jump" hops, keyed by token id — see `CellHopState`/`startCellHop`/`drawTokens`. */
 	private cellHops: Map<string, CellHopState> = new Map();
 	/** Non-null while any `cellHops` entry is actively re-rendering every frame — same pattern as `pingAnimationFrameId`. */
@@ -1316,8 +1327,10 @@ export class MapCanvas {
 			this.canvas.addEventListener("keydown", this.onKeyDown);
 
 			this.gamepadPoller = new GamepadInputPoller({
-				onMove: (gamepadIndex, angleDeg, interactHeld) => this.handleGamepadMove(gamepadIndex, angleDeg, interactHeld),
-				onAction: (gamepadIndex) => this.handleGamepadAction(gamepadIndex),
+				onMove: (gamepadIndex, angleDeg) => this.handleGamepadMove(gamepadIndex, angleDeg),
+				onAction: (gamepadIndex) => this.handleGamepadActionButton(gamepadIndex),
+				onConfirm: (gamepadIndex) => this.handleGamepadConfirm(gamepadIndex),
+				onCancel: (gamepadIndex) => this.handleGamepadCancel(gamepadIndex),
 				onLightRefill: (gamepadIndex) => this.handleGamepadLightRefill(gamepadIndex),
 				onLightExtinguish: (gamepadIndex) => this.handleGamepadLightExtinguish(gamepadIndex),
 				onAim: (gamepadIndex, angleDeg) => this.handleGamepadAim(gamepadIndex, angleDeg),
@@ -1528,6 +1541,7 @@ export class MapCanvas {
 		this.unsubscribe();
 		this.canvas.remove();
 		this.magnifierEl?.remove();
+		this.actionMenuEl?.remove();
 	}
 
 	private resize(): void {
@@ -1627,27 +1641,6 @@ export class MapCanvas {
 		return this.wallCrossing(fromKey, toKey, wallSegments) !== "clear";
 	}
 
-	/**
-	 * Ids of every interact-crossable (`wallPassableWithInteract`) segment actually crossed between
-	 * `fromKey`/`toKey`'s cell centers — the same intersection test `wallCrossing` runs, kept as its
-	 * own method (rather than folded into `wallCrossing`'s own return value) so `edgeBlocked`/
-	 * `tokenCanInteract` don't need to change shape for a detail only `handleGamepadMove` cares about:
-	 * which specific `WallSegment`(s) to roll `MapController.triggerWallClock` against once a forced
-	 * crossing actually succeeds. Only meaningful when `wallCrossing` already returned `"interact"` for
-	 * this same pair (a `"blocked"` crossing may include non-interact-crossable segments too, which
-	 * this deliberately excludes).
-	 */
-	private interactCrossedSegmentIds(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): string[] {
-		const a = this.hit.cellCenter(fromKey);
-		const b = this.hit.cellCenter(toKey);
-		const ids: string[] = [];
-		for (const seg of wallSegments) {
-			if (!wallPassableWithInteract(seg.type)) continue;
-			if (segmentIntersection(a, b, seg.a, seg.b) === null) continue;
-			ids.push(seg.id);
-		}
-		return ids;
-	}
 
 	/** Smallest angular distance between two degree angles (0..180), direction-agnostic — used by `nearestNeighborKey` to find whichever grid direction a gamepad's held angle points closest to. */
 	private static angularDistanceDeg(a: number, b: number): number {
@@ -1682,16 +1675,20 @@ export class MapCanvas {
 
 	/**
 	 * `GamepadInputPoller`'s `onMove` callback (see the constructor): one gamepad just reported a held
-	 * direction (edge-triggered, possibly auto-repeating — see the poller itself) — if `gamepadIndex` is
-	 * assigned to a player token (`MapController.gamepadAssignments`), steps that token one cell in
-	 * whichever of its grid neighbors is closest to `inputAngleDeg`, rotating it to face that direction
-	 * (`token.rotation`, same commit as the move — see `MapController.moveToken`'s `rotation` param),
-	 * unless that neighbor is already occupied by something other than a "light" token (`moveToken`'s own
-	 * check) or a wall stands between the two (`wallCrossing`) — `"blocked"` always stops it, `"interact"`
-	 * only stops it while `interactHeld` is false, letting the gamepad's interact button force a step
-	 * through a `"pass-through"` wall. On success, plays the "jump" hop animation (`startCellHop`,
-	 * echoed to any player-mirror window via `MapCanvasOptions.onCellHop`) — started *before*
-	 * `MapController.moveToken` itself, see the comment at that call below for why the order matters.
+	 * direction (edge-triggered, possibly auto-repeating — see the poller itself).
+	 *
+	 * If an action menu is open for this gamepad (`controller.gamepadActionMenus`), the direction moves
+	 * that menu's cursor instead of the token (up/left → previous entry, down/right → next), and each
+	 * such move drains `settings.actionMenuNavCost` points of the player token's `lightLife`.
+	 *
+	 * Otherwise it's a normal step: the token moves one cell toward whichever of its grid neighbors is
+	 * closest to `inputAngleDeg`, rotating to face it (`MapController.moveToken`'s `rotation` param),
+	 * unless the neighbor is occupied by something other than a "light" token (`moveToken`'s own check)
+	 * or *any* wall stands between the two (`wallCrossing` returning anything but `"clear"` — a
+	 * `"pass-through"` wall is now crossed only via a `"pass-through"` action from the menu, not by
+	 * holding a button). On success, plays the "jump" hop animation (`startCellHop`, echoed to any
+	 * player-mirror window via `MapCanvasOptions.onCellHop`) — started *before* `MapController.moveToken`
+	 * itself, see the comment at that call below for why the order matters.
 	 *
 	 * A no-op outside view mode, on a mirror canvas (`gamepadPoller` is never even created for one — see
 	 * the constructor), for an unassigned gamepad, for a token with no `cellKey` (grid type "none" —
@@ -1699,10 +1696,23 @@ export class MapCanvas {
 	 * still mid an earlier hop (`cellHops`) — a new step only starts once the last one's animation has
 	 * actually finished, so held-direction auto-repeat can't outrun what's on screen.
 	 */
-	private handleGamepadMove(gamepadIndex: number, inputAngleDeg: number, interactHeld: boolean): void {
+	private handleGamepadMove(gamepadIndex: number, inputAngleDeg: number): void {
 		if (this.controller.mode !== "view") return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
+
+		// Menu open → navigate it, not the token. Up (270°) / left (180°) go to the previous entry.
+		if (this.controller.gamepadActionMenus.has(gamepadIndex)) {
+			const a = ((inputAngleDeg % 360) + 360) % 360;
+			const delta = a > 90 && a < 270 ? -1 : 1;
+			this.controller.moveGamepadActionMenuCursor(gamepadIndex, delta);
+			const navCost = this.settings.actionMenuNavCost;
+			if (navCost > 0 && this.controller.findToken(tokenId)) {
+				this.controller.updateToken(tokenId, (t) => (t.lightLife = clamp(resolveLightLife(t) - navCost, 0, 100)));
+			}
+			return;
+		}
+
 		if (this.cellHops.has(tokenId)) return;
 		const token = this.controller.findToken(tokenId);
 		if (!token?.cellKey) return;
@@ -1710,13 +1720,7 @@ export class MapCanvas {
 		if (!target) return;
 		const fromKey = token.cellKey;
 		const wallSegments = this.resolveWallSegments();
-		const crossing = this.wallCrossing(fromKey, target.key, wallSegments);
-		if (crossing === "blocked") return;
-		if (crossing === "interact" && !interactHeld) return;
-		// Resolved before `moveToken` mutates `token.cellKey` — geometry only depends on `fromKey`/
-		// `target.key`, both already captured — and only actually rolled once the crossing below
-		// succeeds (see the loop at the bottom of this method).
-		const triggeredSegmentIds = crossing === "interact" ? this.interactCrossedSegmentIds(fromKey, target.key, wallSegments) : [];
+		if (this.wallCrossing(fromKey, target.key, wallSegments) !== "clear") return;
 		const from = this.hit.cellCenter(fromKey);
 		const to = this.hit.cellCenter(target.key);
 		// Start the hop's render override on this canvas *and* broadcast it to any player-mirror window
@@ -1733,12 +1737,6 @@ export class MapCanvas {
 			this.cellHops.delete(tokenId);
 			return;
 		}
-		// The crossing actually succeeded: this is "a player interacting with the wall" — roll every
-		// crossed segment's clock trigger, if any (see `MapController.triggerWallClock`).
-		for (const segmentId of triggeredSegmentIds) {
-			const result = this.controller.triggerWallClock(segmentId);
-			if (result?.fired) new Notice("Une horloge a été déclenchée.");
-		}
 		// A completed step burns down carried/ambient light (see `MapController.drainLightForEvent`).
 		// Only the source canvas has a gamepad poller — the mirror never reaches here, so no double drain.
 		this.controller.drainLightForEvent("move", tokenId);
@@ -1751,17 +1749,208 @@ export class MapCanvas {
 	}
 
 	/**
-	 * `GamepadInputPoller`'s `onAction` callback (see the constructor): the interact button (triangle/Y)
-	 * was just pressed — if `gamepadIndex` is assigned to a player token, that's a token "action":
-	 * burns down light life (see `MapController.drainLightForEvent`). A no-op outside view mode, on a
-	 * mirror canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
+	 * `GamepadInputPoller`'s `onAction` callback (see the constructor): Triangle/Y was just pressed —
+	 * the gamepad action menu button. Resolves the actions currently available to the assigned player
+	 * token (`resolveAvailableActions` — `settings.gamepadActions` filtered by contact conditions):
+	 * none → nothing happens; exactly one → run it straight away, no menu; two or more → open the menu
+	 * (`MapController.openGamepadActionMenu`) and stash the run closures in `gamepadActionRunners`.
+	 * Pressing it again while a menu is already open closes it. A no-op outside view mode, on a mirror
+	 * canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
 	 */
-	private handleGamepadAction(gamepadIndex: number): void {
+	private handleGamepadActionButton(gamepadIndex: number): void {
 		if (this.controller.mode !== "view") return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
-		if (!this.controller.findToken(tokenId)) return;
+		if (this.controller.gamepadActionMenus.has(gamepadIndex)) {
+			this.handleGamepadCancel(gamepadIndex);
+			return;
+		}
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const options = this.resolveAvailableActions(token);
+		if (options.length === 0) return;
+		if (options.length === 1) {
+			options[0]!.run();
+			return;
+		}
+		this.gamepadActionRunners.set(gamepadIndex, options.map((o) => o.run));
+		this.controller.openGamepadActionMenu(gamepadIndex, tokenId, options.map((o) => ({ label: o.label, lightCost: o.lightCost })));
+	}
+
+	/** `GamepadInputPoller`'s `onConfirm` callback (Croix/A): run the highlighted entry of an open action menu, then close it. */
+	private handleGamepadConfirm(gamepadIndex: number): void {
+		if (this.controller.mode !== "view") return;
+		const menu = this.controller.gamepadActionMenus.get(gamepadIndex);
+		const runners = this.gamepadActionRunners.get(gamepadIndex);
+		if (!menu || !runners) return;
+		const run = runners[menu.highlightedIndex];
+		this.handleGamepadCancel(gamepadIndex);
+		run?.();
+	}
+
+	/** `GamepadInputPoller`'s `onCancel` callback (Rond/B): close an open action menu, running nothing. */
+	private handleGamepadCancel(gamepadIndex: number): void {
+		this.gamepadActionRunners.delete(gamepadIndex);
+		this.controller.closeGamepadActionMenu(gamepadIndex);
+	}
+
+	/**
+	 * Every gamepad action (`settings.gamepadActions`) currently available to `token`, expanded to
+	 * concrete menu entries — a `wall` contact yields one entry per matching wall segment touching the
+	 * token's cell (labelled with its direction), a `token` contact one entry per matching token on the
+	 * token's cell or an adjacent one, a `none` contact a single entry. Each entry carries a `run`
+	 * closure (`executeActionOption`, bound to that entry's concrete target). Empty for a token with no
+	 * `cellKey` (grid type "none").
+	 */
+	private resolveAvailableActions(token: Token): { label: string; lightCost: number; run: () => void }[] {
+		const cellKey = token.cellKey;
+		if (!cellKey) return [];
+		const data = this.controller.getData();
+		const hex = data.gridType === "hex-pointy" || data.gridType === "hex-flat";
+		const wallSegments = this.resolveWallSegments();
+		const contacts = this.contactedWalls(cellKey, wallSegments);
+		const out: { label: string; lightCost: number; run: () => void }[] = [];
+		for (const action of this.settings.gamepadActions) {
+			const contact = action.contact;
+			if (contact.kind === "none") {
+				out.push({ label: action.name, lightCost: action.lightCost, run: () => this.executeActionOption(token.id, action, {}) });
+			} else if (contact.kind === "wall") {
+				for (const c of contacts) {
+					// A gamepad action only ever acts on a franchissable wall (door/curtain) — see `GamepadActionContact`.
+					const seg = c.segments.find((s) => wallPassableWithInteract(s.type));
+					if (!seg) continue;
+					out.push({
+						label: `${action.name} (${directionLabelFr(c.angleDeg, hex)})`,
+						lightCost: action.lightCost,
+						run: () => this.executeActionOption(token.id, action, { wall: { segmentId: seg.id, neighborKey: c.neighborKey, angleDeg: c.angleDeg } }),
+					});
+				}
+			} else {
+				const cells = new Set<string>([cellKey, ...this.neighborKeys(cellKey)]);
+				for (const other of data.tokens) {
+					if (other.id === token.id) continue;
+					if ((other.category ?? "entity") !== contact.category) continue;
+					if (!other.cellKey || !cells.has(other.cellKey)) continue;
+					const suffix = other.label ? ` — ${other.label}` : "";
+					const otherId = other.id;
+					out.push({ label: `${action.name}${suffix}`, lightCost: action.lightCost, run: () => this.executeActionOption(token.id, action, { lightTokenId: otherId }) });
+				}
+			}
+		}
+		return out;
+	}
+
+	/**
+	 * Each grid neighbour of `cellKey` that has at least one wall segment on the line between the two
+	 * cell centres, with that neighbour's direction angle and the crossing segments. Same intersection
+	 * test as `wallCrossing`.
+	 */
+	private contactedWalls(cellKey: string, wallSegments: ResolvedWallSegment[]): { neighborKey: string; angleDeg: number; segments: ResolvedWallSegment[] }[] {
+		const origin = this.hit.cellCenter(cellKey);
+		const out: { neighborKey: string; angleDeg: number; segments: ResolvedWallSegment[] }[] = [];
+		for (const neighborKey of this.neighborKeys(cellKey)) {
+			const center = this.hit.cellCenter(neighborKey);
+			const segments = wallSegments.filter((seg) => segmentIntersection(origin, center, seg.a, seg.b) !== null);
+			if (segments.length === 0) continue;
+			const raw = (Math.atan2(center.y - origin.y, center.x - origin.x) * 180) / Math.PI;
+			out.push({ neighborKey, angleDeg: raw < 0 ? raw + 360 : raw, segments });
+		}
+		return out;
+	}
+
+	/**
+	 * Runs one resolved action entry: applies its effect (step across the wall / rewrite the wall type /
+	 * toggle the contacted "light" token's own light / open a linked note), rolls the target wall's
+	 * clock trigger where relevant (`MapController.triggerWallClock`), then drains the action's
+	 * `lightCost` from the acting player token plus the usual per-action ambient light drain
+	 * (`drainLightForEvent("action")`). `target` carries whichever concrete thing the resolved entry
+	 * was bound to — a contacted wall (`wall`) or a contacted "light" token (`lightTokenId`).
+	 */
+	private executeActionOption(
+		tokenId: string,
+		action: GamepadAction,
+		target: { wall?: { segmentId: string; neighborKey: string; angleDeg: number }; lightTokenId?: string }
+	): void {
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const effect = action.effect;
+		const wall = target.wall;
+		if (effect.kind === "pass-through" && wall && token.cellKey) {
+			const from = this.hit.cellCenter(token.cellKey);
+			const to = this.hit.cellCenter(wall.neighborKey);
+			this.startCellHop(tokenId, from, to);
+			this.options.onCellHop?.(tokenId, from, to);
+			if (!this.controller.moveToken(tokenId, wall.neighborKey, wall.angleDeg)) {
+				this.cellHops.delete(tokenId);
+			} else {
+				const result = this.controller.triggerWallClock(wall.segmentId);
+				if (result?.fired) new Notice("Une horloge a été déclenchée.");
+			}
+		} else if (effect.kind === "change-wall-type" && wall) {
+			this.controller.setWallSegmentBlockerType(wall.segmentId, effect.to);
+			const result = this.controller.triggerWallClock(wall.segmentId);
+			if (result?.fired) new Notice("Une horloge a été déclenchée.");
+		} else if (effect.kind === "toggle-light" && target.lightTokenId) {
+			// Toggle the contacted "light" token's own light (100 ⇄ 0), not the player's.
+			const lightToken = this.controller.findToken(target.lightTokenId);
+			if (lightToken) {
+				const life = resolveLightLife(lightToken) >= DEFAULT_LIGHT_LIFE ? 0 : DEFAULT_LIGHT_LIFE;
+				this.controller.updateToken(lightToken.id, (t) => (t.lightLife = life));
+			}
+		} else if (effect.kind === "open-note") {
+			new ActionNoteModal(this.app, action.name, effect.link).open();
+		}
+		if (action.lightCost > 0 && this.controller.findToken(tokenId)) {
+			this.controller.updateToken(tokenId, (t) => (t.lightLife = clamp(resolveLightLife(t) - action.lightCost, 0, 100)));
+		}
 		this.controller.drainLightForEvent("action", tokenId);
+	}
+
+	/**
+	 * Creates / updates / removes the action-menu popup DOM overlay from `controller.gamepadActionMenus`
+	 * — a `position: absolute` panel in `this.container` (same float-over-the-canvas approach as the
+	 * "Seau à murs" magnifier), anchored just above the driving token's on-screen position. Called from
+	 * `render()`, so both the GM canvas and the player-mirror canvas draw the same menu off the shared
+	 * session state, no echo channel needed.
+	 */
+	private syncActionMenuOverlay(): void {
+		const menus = this.controller.gamepadActionMenus;
+		if (menus.size === 0 || this.effectiveMode() !== "view") {
+			this.actionMenuEl?.remove();
+			this.actionMenuEl = null;
+			return;
+		}
+		// One menu at a time on screen (the common single-gamepad case) — take whichever the map iterates first.
+		let menu: GamepadActionMenuState | undefined;
+		for (const m of menus.values()) {
+			menu = m;
+			break;
+		}
+		const token = menu ? this.controller.findToken(menu.tokenId) : undefined;
+		if (!menu || !token) {
+			this.actionMenuEl?.remove();
+			this.actionMenuEl = null;
+			return;
+		}
+		if (!this.actionMenuEl) this.actionMenuEl = this.container.createDiv({ cls: "map-manager-action-menu" });
+		const el = this.actionMenuEl;
+		el.empty();
+		for (let i = 0; i < menu.options.length; i++) {
+			const opt = menu.options[i]!;
+			const row = el.createDiv({ cls: "map-manager-action-menu-item" });
+			if (i === menu.highlightedIndex) row.addClass("is-active");
+			row.createSpan({ cls: "map-manager-action-menu-label", text: opt.label });
+			if (opt.lightCost > 0) row.createSpan({ cls: "map-manager-action-menu-cost", text: `−${opt.lightCost}%` });
+		}
+		const pose = this.currentHopPose(menu.tokenId) ?? this.hit.footprintCenter(token);
+		const screen = worldToScreen(pose.x, pose.y, this.transform);
+		const r = this.hit.tokenRadius(token) * this.transform.zoom;
+		// Anchor above the token, but flip below it when the panel would clip past the top edge
+		// (`container` is `overflow: hidden`). `translate(-50%, …)` centres it horizontally.
+		const above = screen.y - r - 8 - el.offsetHeight >= 0;
+		el.toggleClass("is-below", !above);
+		el.style.left = `${Math.round(screen.x)}px`;
+		el.style.top = `${Math.round(above ? screen.y - r - 8 : screen.y + r + 8)}px`;
 	}
 
 	/**
@@ -1840,21 +2029,16 @@ export class MapCanvas {
 	}
 
 	/**
-	 * Whether `token` currently has something to interact with via the gamepad's interact button — a
-	 * "light" category token sharing its cell, or a `"pass-through"` wall standing between it and one of
-	 * its grid neighbors (`wallCrossing` returning `"interact"` — see `handleGamepadMove`). Drives the
-	 * live "!" indicator (`drawTokens`/`drawInteractIndicator`): recomputed fresh from the token's actual
-	 * current position on every render rather than triggered for a fixed duration by the button itself,
-	 * so it appears/disappears immediately as the token moves, in perfect sync on a player-mirror window
-	 * too (no separate echo needed — both canvases already share the same `MapController` data this
+	 * Whether `token` currently has at least one gamepad action available (`resolveAvailableActions`) —
+	 * i.e. pressing Triangle/Y right now would do something. Drives the live "!" indicator
+	 * (`drawTokens`/`drawInteractIndicator`): recomputed fresh from the token's actual current position
+	 * on every render rather than triggered for a fixed duration by the button itself, so it
+	 * appears/disappears immediately as the token moves, in perfect sync on a player-mirror window too
+	 * (no separate echo needed — both canvases already share the same `MapController`/`settings` this
 	 * reads). `false` for a token with no `cellKey` (grid type "none").
 	 */
-	private tokenCanInteract(token: Token, wallSegments: ResolvedWallSegment[]): boolean {
-		const cellKey = token.cellKey;
-		if (!cellKey) return false;
-		const data = this.controller.getData();
-		if (data.tokens.some((t) => t.id !== token.id && t.cellKey === cellKey && (t.category ?? "entity") === "light")) return true;
-		return this.neighborKeys(cellKey).some((neighborKey) => this.wallCrossing(cellKey, neighborKey, wallSegments) === "interact");
+	private tokenCanInteract(token: Token): boolean {
+		return this.resolveAvailableActions(token).length > 0;
 	}
 
 	/**
@@ -2437,7 +2621,8 @@ export class MapCanvas {
 		if (this.fog.isCurrentlyVisible()) {
 			if (celledFog) this.fog.renderCellFog(ctx, dpr, imageBounds, getWallSegments());
 			else this.fog.renderAndComposite(ctx, dpr, imageBounds);
-			this.fog.drawDebugVisionRays(ctx, getWallSegments());
+			// Debug overlay is a GM tuning aid only — never draw it on a player-mirror ("Vue Joueur") window.
+			if (!this.isMirror) this.fog.drawDebugVisionRays(ctx, getWallSegments());
 		}
 
 		// GM's own window always shows this tactical hint; a player-mirror window only shows it while
@@ -2458,6 +2643,7 @@ export class MapCanvas {
 		if (this.activePing) this.drawPing(ctx);
 
 		ctx.restore();
+		this.syncActionMenuOverlay();
 		this.fog.syncAnimationLoop();
 	}
 
@@ -2516,16 +2702,15 @@ export class MapCanvas {
 				this.drawToken(ctx, pose.x, pose.y, token, token.id === this.controller.selectedTokenId);
 			}
 		}
-		// Gamepad interact button's "!" indicator — live (`tokenCanInteract`), not tied to the button
-		// ever having been pressed: shown above any gamepad-assigned token for as long as it actually
-		// has something to interact with right now, view mode only (the only mode the button does
-		// anything in — see `handleGamepadMove`/`handleGamepadAction`), drawn above whatever position
-		// the token is actually at (mid-hop or not, see `currentHopPose`'s footprint-center fallback).
+		// Gamepad action button's "!" indicator — live (`tokenCanInteract`), not tied to the button
+		// ever having been pressed: shown above any gamepad-assigned token for as long as at least one
+		// gamepad action is available to it right now, view mode only (the only mode the button does
+		// anything in — see `handleGamepadMove`/`handleGamepadActionButton`), drawn above whatever
+		// position the token is actually at (mid-hop or not, see `currentHopPose`'s footprint-center fallback).
 		if (this.effectiveMode() === "view" && this.controller.gamepadAssignments.size > 0) {
-			const wallSegments = this.resolveWallSegments();
 			for (const tokenId of this.controller.gamepadAssignments.values()) {
 				const token = data.tokens.find((t) => t.id === tokenId);
-				if (!token || !this.tokenCanInteract(token, wallSegments)) continue;
+				if (!token || !this.tokenCanInteract(token)) continue;
 				const pose = this.currentHopPose(tokenId) ?? this.hit.footprintCenter(token);
 				this.drawInteractIndicator(ctx, pose.x, pose.y, token);
 			}

@@ -38,12 +38,15 @@ const DPAD_BUTTONS: { index: number; angleDeg: number }[] = [
 
 /**
  * "Triangle"/"Y" — the standard Gamepad API mapping's button index 3 (top face button, whichever
- * label the physical pad uses for it) — the interact button: every press fires `onAction` (a token
- * "action", which burns light life — see `MapCanvas.handleGamepadAction`), and holding it alongside a
- * direction forces a step through a `"pass-through"` wall (see `handleGamepadMove`). Holding it on its
- * own does nothing.
+ * label the physical pad uses for it) — the action-menu button: every press fires `onAction`, which
+ * opens (or, with a single available entry, directly runs) the gamepad action menu — see
+ * `MapCanvas.handleGamepadActionButton` / `GamepadAction`.
  */
 const INTERACT_BUTTON_INDEX = 3;
+/** "Croix"/"A" — standard mapping index 0 — confirms the highlighted entry of an open action menu (`onConfirm`). */
+const CONFIRM_BUTTON_INDEX = 0;
+/** "Rond"/"B" — standard mapping index 1 — closes an open action menu without running anything (`onCancel`). */
+const CANCEL_BUTTON_INDEX = 1;
 /** How long L1 must be held before `onLightExtinguish` fires (life → 0), ms — long enough that a stray tap doesn't snuff a torch. */
 const LIGHT_EXTINGUISH_HOLD_MS = 1500;
 /** L1/LB — standard mapping index 4 — held for `LIGHT_EXTINGUISH_HOLD_MS` snuffs a player's light (`onLightExtinguish`). */
@@ -98,6 +101,10 @@ interface GamepadPollState {
 	moveNextFireAt: number;
 	/** Last-seen pressed state of the interact button, for edge-detecting `onAction`. */
 	interactPressed: boolean;
+	/** Last-seen pressed state of the confirm button (Croix/A), for edge-detecting `onConfirm`. */
+	confirmPressed: boolean;
+	/** Last-seen pressed state of the cancel button (Rond/B), for edge-detecting `onCancel`. */
+	cancelPressed: boolean;
 	/** When L1 most recently went from released to held (`performance.now()`), or `null` while it's up — the basis for `onLightExtinguish`'s `LIGHT_EXTINGUISH_HOLD_MS` long-press gate. */
 	l1PressedAt: number | null;
 	/** Whether `onLightExtinguish` has already fired for L1's current hold, so it fires exactly once per press-and-hold. */
@@ -111,17 +118,19 @@ export interface GamepadCallbacks {
 	/**
 	 * A held left-stick/d-pad direction, edge-triggered (fires once the instant a direction is first
 	 * pushed) with auto-repeat while held (`MOVE_REPEAT_DELAY_MS`/`MOVE_REPEAT_INTERVAL_MS`), the same
-	 * one-tap-one-step-then-hold-to-keep-going feel as a keyboard's own key-repeat. `interactHeld` is
-	 * whether the interact button happens to be held down on this same poll — read fresh alongside the
-	 * direction rather than tracked separately, so this always sees the two in sync.
+	 * one-tap-one-step-then-hold-to-keep-going feel as a keyboard's own key-repeat. Drives token
+	 * movement normally, or the cursor of an open action menu — see `MapCanvas.handleGamepadMove`.
 	 */
-	onMove: (gamepadIndex: number, inputAngleDeg: number, interactHeld: boolean) => void;
+	onMove: (gamepadIndex: number, inputAngleDeg: number) => void;
 	/**
-	 * The interact button (triangle/Y) pressed, edge-triggered (fires once the instant it goes down,
-	 * whatever else is held) — a token "action". Fires on every press, including ones that also force a
-	 * wall crossing.
+	 * The action-menu button (triangle/Y) pressed, edge-triggered (fires once the instant it goes
+	 * down, whatever else is held) — opens or directly runs the gamepad action menu.
 	 */
 	onAction: (gamepadIndex: number) => void;
+	/** The confirm button (Croix/A) pressed, edge-triggered — runs the highlighted action-menu entry. */
+	onConfirm: (gamepadIndex: number) => void;
+	/** The cancel button (Rond/B) pressed, edge-triggered — closes an open action menu. */
+	onCancel: (gamepadIndex: number) => void;
 	/** R1 pressed, edge-triggered — refill the player's light life (see `MapCanvas.handleGamepadLightRefill`). */
 	onLightRefill: (gamepadIndex: number) => void;
 	/** L1 held continuously for `LIGHT_EXTINGUISH_HOLD_MS`, once per press-and-hold — snuff the player's light (life → 0). */
@@ -172,13 +181,21 @@ export class GamepadInputPoller {
 			seen.add(pad.index);
 			let entry = this.state.get(pad.index);
 			if (!entry) {
-				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, l1PressedAt: null, l1Fired: false, r1Pressed: false };
+				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, confirmPressed: false, cancelPressed: false, l1PressedAt: null, l1Fired: false, r1Pressed: false };
 				this.state.set(pad.index, entry);
 			}
 
 			const interactHeld = pad.buttons[INTERACT_BUTTON_INDEX]?.pressed ?? false;
 			if (interactHeld && !entry.interactPressed) this.callbacks.onAction(pad.index);
 			entry.interactPressed = interactHeld;
+
+			const confirmHeld = pad.buttons[CONFIRM_BUTTON_INDEX]?.pressed ?? false;
+			if (confirmHeld && !entry.confirmPressed) this.callbacks.onConfirm(pad.index);
+			entry.confirmPressed = confirmHeld;
+
+			const cancelHeld = pad.buttons[CANCEL_BUTTON_INDEX]?.pressed ?? false;
+			if (cancelHeld && !entry.cancelPressed) this.callbacks.onCancel(pad.index);
+			entry.cancelPressed = cancelHeld;
 
 			const l1Held = pad.buttons[L1_BUTTON_INDEX]?.pressed ?? false;
 			if (l1Held && entry.l1PressedAt === null) {
@@ -207,10 +224,10 @@ export class GamepadInputPoller {
 			if (!entry.moveActive) {
 				entry.moveActive = true;
 				entry.moveNextFireAt = now + MOVE_REPEAT_DELAY_MS;
-				this.callbacks.onMove(pad.index, angle, interactHeld);
+				this.callbacks.onMove(pad.index, angle);
 			} else if (now >= entry.moveNextFireAt) {
 				entry.moveNextFireAt = now + MOVE_REPEAT_INTERVAL_MS;
-				this.callbacks.onMove(pad.index, angle, interactHeld);
+				this.callbacks.onMove(pad.index, angle);
 			}
 		}
 		// Drop bookkeeping for gamepads that disconnected since the last poll, so a reconnect (possibly
