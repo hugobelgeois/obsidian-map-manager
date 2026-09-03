@@ -396,9 +396,14 @@ export class InfoPanel {
 		};
 
 		const seed = tokens[0];
+		// For the light editor, seed off a token that actually has a light (player/light category) if
+		// the selection contains one — so "Vie/Rayon/Perte" show up for a mixed selection, not just when
+		// the very first token happens to be a player/light.
+		const lightSeed = tokens.find((t) => { const c = t.category ?? "entity"; return c === "player" || c === "light"; });
 		const lightEditable = this.controller.mode === "edit";
 		if (allLight) {
-			if (seed && lightEditable) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
+			if (seed && lightEditable) this.renderLightRadiusField(lightSeed ?? seed, (mutator) => this.controller.massUpdateTokens(mutator));
+			else if (seed) this.renderMassLightLifeField(tokens);
 			const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 			const deleteBtn = footer.createEl("button", {
 				text: tokens.length > 1 ? "Supprimer les pions" : "Supprimer le pion",
@@ -439,9 +444,10 @@ export class InfoPanel {
 		colorInput.onchange = () => this.controller.massUpdateTokens((t) => (t.color = colorInput.value));
 
 		// Light means the same thing for every category, so it's shown here regardless of whether the
-		// selection mixes categories — but edit mode only, like the single-token panel (during play a
-		// light is gamepad-driven, not menu-edited).
-		if (seed && lightEditable) this.renderLightRadiusField(seed, (mutator) => this.controller.massUpdateTokens(mutator));
+		// selection mixes categories. Edit mode gets the full editor (radius/life/drain); "Vue" mode
+		// gets just the life slider, mirroring the single-token `renderTokenLightLifeField`.
+		if (seed && lightEditable) this.renderLightRadiusField(lightSeed ?? seed, (mutator) => this.controller.massUpdateTokens(mutator));
+		else if (seed) this.renderMassLightLifeField(tokens);
 
 		// Vision (entity-only — see `renderMassVisionFields`). Nothing shown at all for a selection
 		// that's entirely players — there's no vision concept left to edit for them.
@@ -1063,6 +1069,7 @@ export class InfoPanel {
 		// size/color/template/tabs) only makes sense for an actual character.
 		if (category === "light") {
 			this.renderLightRadiusField(token, (mutator) => this.controller.updateToken(token.id, mutator));
+			this.renderLightInteractableField(token);
 			const footer = this.el.createDiv({ cls: "map-manager-infopanel-footer" });
 			const deleteBtn = footer.createEl("button", { text: "Supprimer le pion", cls: "map-manager-btn map-manager-btn-danger" });
 			deleteBtn.onclick = () => this.controller.removeToken(token.id);
@@ -1161,21 +1168,71 @@ export class InfoPanel {
 	 * (player-only — `renderGamepadField`, see its own doc comment), and tabs' read-only content
 	 * (stats/inventory/story/... — see `renderTokenTabsReadOnly`, which applies to both categories).
 	 * Everything else (icon/image/category/size/color/template picker/vision shape/delete) is
-	 * edit-only, and so is the whole light setup (radius/life/drain) — during play a light is driven
-	 * by the gamepad (drain on move/action, L1/R1), not this menu. A "light" token has neither a
-	 * facing, a gamepad, nor tabs to begin with (see `TokenCategory`'s own doc comment), so it just
-	 * gets a short note here.
+	 * edit-only, as is most of the light setup (radius/drain) — but the light *life* is shown here
+	 * (`renderTokenLightLifeField`) for *every* category, since the gamepad (L1/R1) and the move/action
+	 * drains all push it around mid-session and the GM needs to see (and can nudge) where it's at. A
+	 * "light" token has neither a facing, a gamepad, nor tabs to begin with (see `TokenCategory`'s own
+	 * doc comment), so it gets a short note plus that life field. Never reached on the player-facing
+	 * mirror panel (`renderPlayerPanel`), so the life read-out stays GM-only.
 	 */
 	private renderTokenViewPanel(token: Token): void {
 		const category = token.category ?? "entity";
 		if (category === "light") {
 			this.el.createDiv({ cls: "map-manager-view-empty", text: "Source de lumière — invisible pour les joueurs." });
+			this.renderTokenLightLifeField(token);
+			this.renderLightInteractableField(token);
 			return;
 		}
 		this.renderTokenLogoAndName(token);
 		if (category === "entity") this.renderRotationField(token);
 		if (category === "player") this.renderGamepadField(token);
+		this.renderTokenLightLifeField(token);
 		this.renderTokenTabsReadOnly(token);
+	}
+
+	/**
+	 * "Vue"-mode read-out and quick-adjust of a token's own light life (`Token.lightLife`) — the one
+	 * piece of the edit-mode light editor (`renderLightRadiusField`) that stays relevant during play,
+	 * since the gamepad's L1/R1 and the per-move/per-action drains all move this value while playing.
+	 * Shown for every token category. GM-only: the player-facing mirror panel (`renderPlayerPanel`)
+	 * never calls this.
+	 */
+	private renderTokenLightLifeField(token: Token): void {
+		const wrap = this.el.createDiv({ cls: "map-manager-field" });
+		wrap.createEl("label", { text: "Vie de la lumière" });
+		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
+		this.makeSliderField(row, "Vie (%)", token.lightLife ?? DEFAULT_LIGHT_LIFE, 0, 100, (v) => this.controller.updateToken(token.id, (t) => (t.lightLife = clamp(v, 0, 100))), 5);
+	}
+
+	/**
+	 * Mass "Vie de la lumière" slider for the "Vue"-mode multi-token panel — writes `lightLife` to
+	 * every selected token at once (`massUpdateTokens`), mirroring the single-token
+	 * `renderTokenLightLifeField`. Seeded from the first selected token that carries a light, else
+	 * `tokens[0]`; nothing is written until the slider actually moves. Edit mode shows
+	 * `renderLightRadiusField`'s own life slider instead.
+	 */
+	private renderMassLightLifeField(tokens: Token[]): void {
+		const seed = tokens.find((t) => (t.lightRadius ?? 0) > 0) ?? tokens[0];
+		if (!seed) return;
+		const wrap = this.el.createDiv({ cls: "map-manager-field" });
+		wrap.createEl("label", { text: "Vie de la lumière" });
+		const row = wrap.createDiv({ cls: "map-manager-vision-row" });
+		this.makeSliderField(row, "Vie (%)", seed.lightLife ?? DEFAULT_LIGHT_LIFE, 0, 100, (v) => this.controller.massUpdateTokens((t) => (t.lightLife = clamp(v, 0, 100))), 5);
+	}
+
+	/**
+	 * Checkbox on a "light" token's panel toggling `Token.lightInteractable` — unchecked locks the
+	 * fixture so players can't tend it through the gamepad (the action menu's `token: "light"` contact,
+	 * L1/R1 on a co-located light — see `MapCanvas.resolveAvailableActions`/`colocatedLight`). Unset
+	 * reads as interactable, so the box starts checked. GM-only (both call sites are GM panels).
+	 */
+	private renderLightInteractableField(token: Token): void {
+		const field = this.el.createDiv({ cls: "map-manager-field" });
+		const label = field.createEl("label");
+		const checkbox = label.createEl("input", { type: "checkbox" });
+		checkbox.checked = token.lightInteractable !== false;
+		label.appendText(" Interagible par les joueurs (manette)");
+		checkbox.onchange = () => this.controller.updateToken(token.id, (t) => (t.lightInteractable = checkbox.checked ? undefined : false));
 	}
 
 	/**

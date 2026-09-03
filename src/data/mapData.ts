@@ -276,6 +276,15 @@ export interface Token {
 	/** Percent of `lightLife` removed per action when `lightDrainOnAction` is on — see `DEFAULT_LIGHT_ACTION_DRAIN`. */
 	lightActionDrain?: number;
 	/**
+	 * "light" tokens only — whether players may interact with this light fixture through the gamepad:
+	 * the action menu's `token: "light"` contact (`MapCanvas.resolveAvailableActions`, e.g. the
+	 * "allumer/éteindre" toggle) and L1/R1 acting on a co-located light (`MapCanvas.colocatedLight`).
+	 * **Unset means yes** (only an explicit `false` locks it), so old files and freshly-placed lights
+	 * stay interactable. A locked light still burns down on its own (`drainLightForEvent`) and still
+	 * lights the map — this only gates deliberate player interaction.
+	 */
+	lightInteractable?: boolean;
+	/**
 	 * Legacy: used to link a player token's effective light radius to its own `visionRadius`. No
 	 * longer read anywhere — `lightRadius` is now the single, direct source of a player's light
 	 * (see `configuredLightRadius`). Left in the type so old map files still parse.
@@ -529,7 +538,7 @@ export function applyClockDelta(clock: Clock, delta: number): void {
 }
 
 export interface MapFileData {
-	version: 18;
+	version: 19;
 	gridType: GridType;
 	cellSize: number;
 	layers: Layer[];
@@ -628,7 +637,7 @@ function clampZoomSetting(value: number): number {
 export function createDefaultMapData(defaults: MapDefaults): MapFileData {
 	const layer = createLayer("Calque 1");
 	return {
-		version: 18,
+		version: 19,
 		gridType: defaults.gridType,
 		cellSize: defaults.cellSize,
 		layers: [layer],
@@ -783,6 +792,7 @@ export function parseToken(value: unknown): Token | null {
 		lightMoveDrain: typeof value.lightMoveDrain === "number" && value.lightMoveDrain >= 0 ? value.lightMoveDrain : undefined,
 		lightDrainOnAction: typeof value.lightDrainOnAction === "boolean" ? value.lightDrainOnAction : undefined,
 		lightActionDrain: typeof value.lightActionDrain === "number" && value.lightActionDrain >= 0 ? value.lightActionDrain : undefined,
+		lightInteractable: typeof value.lightInteractable === "boolean" ? value.lightInteractable : undefined,
 		lightRadiusLinkedToVision: typeof value.lightRadiusLinkedToVision === "boolean" ? value.lightRadiusLinkedToVision : undefined,
 		sideEyeAngle: typeof value.sideEyeAngle === "number" ? value.sideEyeAngle : undefined,
 		detectionAngle: typeof value.detectionAngle === "number" ? value.detectionAngle : undefined,
@@ -983,6 +993,8 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// switch). `exploredCells` is kept as-is: it stays the memory store for grid type "none", which
 	// keeps the legacy ray-traced fog.
 	const exploredCellsByGridType = version >= 18 ? parseExploredCellsByGridType(p.exploredCellsByGridType) : emptyExploredCellsByGridType();
+	// v19: "light" tokens gained an optional `lightInteractable` boolean (see `parseToken`) — purely
+	// additive, no reinterpretation: a pre-v19 file simply has none, and an unset flag reads as "yes".
 
 	const activeLayerId = isString(p.activeLayerId) && layers.some((l) => l.id === p.activeLayerId) ? p.activeLayerId : (layers[0]?.id ?? "");
 
@@ -996,7 +1008,7 @@ function normalizeMapData(parsed: unknown, defaults: MapDefaults): MapFileData {
 	// rather than misinterpreted — it simply gets re-explored as players move around.
 	const exploredCells = version >= 11 && Array.isArray(p.exploredCells) ? p.exploredCells.filter(isString) : [];
 
-	return { version: 18, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells, exploredCellsByGridType };
+	return { version: 19, gridType, cellSize, layers, activeLayerId, tokens, clocks, minZoom, maxZoom, fogEnabled, fogFrozen, exploredCells, exploredCellsByGridType };
 }
 
 function purgeEmptyCells(cells: Record<string, CellData>): Record<string, CellData> {

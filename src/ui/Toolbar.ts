@@ -1,6 +1,6 @@
 import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import { MapController, PLAYER_MIRROR_CAMERA_MODES, PLAYER_MIRROR_CAMERA_MODE_LABELS, PlayerMirrorCameraMode } from "../controller/MapController";
-import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, getActiveLayer } from "../data/mapData";
+import { GRID_TYPE_LABELS, GRID_TYPES, GridType, MapBackground, MapFileData, TokenCategory, getActiveLayer } from "../data/mapData";
 import { ABS_MAX_ZOOM, ABS_MIN_ZOOM, clamp, hexCorners } from "../grid/gridMath";
 import { MapManagerSettings } from "../settings/types";
 import { FileSuggestModal, IMAGE_EXTENSIONS } from "./FileSuggestModal";
@@ -62,6 +62,12 @@ export class Toolbar {
 	private fogMenuOpen = false;
 	private playerWindowMenuOpen = false;
 	private infoMenuOpen = false;
+	private tokenTreeMenuOpen = false;
+	/**
+	 * Anchor for the token tree's shift+click range selection — the last row clicked without shift (a
+	 * plain or ctrl+click). Session-only, purely a UI cursor for `renderTokenTreeDropdown`.
+	 */
+	private tokenTreeAnchorId: string | null = null;
 	private openDropdownEl: HTMLElement | null = null;
 	/**
 	 * Unlike the click-toggled dropdowns above, the "Zones"/"Murs" tool panel (brush/fill/wall options)
@@ -106,6 +112,7 @@ export class Toolbar {
 		this.fogMenuOpen = false;
 		this.playerWindowMenuOpen = false;
 		this.infoMenuOpen = false;
+		this.tokenTreeMenuOpen = false;
 	}
 
 	private handleDocumentClick = (e: MouseEvent): void => {
@@ -214,7 +221,103 @@ export class Toolbar {
 
 		this.renderPlayerWindowControl(recenterGroup);
 
+		this.renderTokenTreeDropdown(this.el);
 		this.renderInfoDropdown(this.el);
+	}
+
+	/**
+	 * "Arbre des pions" — collé juste à gauche du bouton Info. Liste tous les pions de la carte,
+	 * groupés par catégorie (Lumières / Joueurs / Ennemis), et permet de les sélectionner :
+	 * - clic simple : sélectionne ce seul pion ;
+	 * - Ctrl + clic : ajoute/retire ce pion de la sélection multiple ;
+	 * - Shift + clic : sélectionne tous les pions entre le dernier cliqué (ancre) et celui-ci, dans
+	 *   l'ordre d'affichage de l'arbre.
+	 * Reprend exactement la sélection multiple de pions du canvas (`massSelectionKind === "token"`),
+	 * donc l'InfoPanel affiche le même panneau d'édition groupée.
+	 */
+	private renderTokenTreeDropdown(container: HTMLElement): void {
+		const wrapper = container.createDiv({ cls: "map-manager-dropdown map-manager-token-tree-dropdown" });
+		wrapper.toggleClass("is-open", this.tokenTreeMenuOpen);
+		if (this.tokenTreeMenuOpen) this.openDropdownEl = wrapper;
+
+		const trigger = wrapper.createEl("button", { cls: "map-manager-btn map-manager-btn-icon map-manager-dropdown-trigger" });
+		setIcon(trigger, "list-tree");
+		setTooltip(trigger, "Arbre des pions");
+		trigger.onclick = () => {
+			const wasOpen = this.tokenTreeMenuOpen;
+			this.closeMenus();
+			this.tokenTreeMenuOpen = !wasOpen;
+			this.render();
+		};
+
+		const panel = wrapper.createDiv({ cls: "map-manager-dropdown-panel map-manager-token-tree-dropdown-panel" });
+		panel.createDiv({ cls: "map-manager-dropdown-title", text: "Pions" });
+
+		const tokens = this.controller.getData().tokens;
+		if (tokens.length === 0) {
+			panel.createDiv({ cls: "map-manager-token-tree-empty", text: "Aucun pion sur la carte." });
+			return;
+		}
+
+		const groups: { category: TokenCategory; label: string }[] = [
+			{ category: "light", label: "Lumières" },
+			{ category: "player", label: "Joueurs" },
+			{ category: "entity", label: "Ennemis" },
+		];
+
+		// Ordre d'affichage à plat (groupes dans l'ordre ci-dessus), pour la sélection par plage
+		// (Shift + clic). Reconstruit à chaque rendu à partir de la même source.
+		const orderedIds: string[] = [];
+		for (const group of groups) {
+			for (const token of tokens) {
+				if ((token.category ?? "entity") === group.category) orderedIds.push(token.id);
+			}
+		}
+
+		const selectedTokenId = this.controller.selectedTokenId;
+		const massIds = this.controller.massSelectedTokenIds;
+
+		const handleRowClick = (tokenId: string, e: MouseEvent) => {
+			if (e.shiftKey) {
+				const anchor = this.tokenTreeAnchorId ?? selectedTokenId;
+				const from = anchor ? orderedIds.indexOf(anchor) : -1;
+				const to = orderedIds.indexOf(tokenId);
+				if (from === -1 || to === -1) {
+					this.controller.clearMassSelection();
+					this.controller.selectToken(tokenId);
+					this.tokenTreeAnchorId = tokenId;
+				} else {
+					const [lo, hi] = from <= to ? [from, to] : [to, from];
+					this.controller.clearMassSelection();
+					this.controller.addMassSelection("token", orderedIds.slice(lo, hi + 1));
+				}
+			} else if (e.ctrlKey || e.metaKey) {
+				this.controller.toggleMassSelection("token", tokenId);
+				this.tokenTreeAnchorId = tokenId;
+			} else {
+				this.controller.clearMassSelection();
+				this.controller.selectToken(tokenId);
+				this.tokenTreeAnchorId = tokenId;
+			}
+		};
+
+		for (const group of groups) {
+			const groupTokens = tokens.filter((t) => (t.category ?? "entity") === group.category);
+			if (groupTokens.length === 0) continue;
+			panel.createDiv({
+				cls: "map-manager-info-section-title map-manager-token-tree-group-title",
+				text: `${group.label} (${groupTokens.length})`,
+			});
+			const list = panel.createDiv({ cls: "map-manager-token-tree-list" });
+			for (const token of groupTokens) {
+				const row = list.createEl("button", { cls: "map-manager-btn map-manager-token-tree-row" });
+				const isSelected = token.id === selectedTokenId || massIds.has(token.id);
+				row.toggleClass("is-active", isSelected);
+				row.createSpan({ cls: "map-manager-token-tree-icon", text: token.icon || "•" });
+				row.createSpan({ cls: "map-manager-token-tree-label", text: token.label?.trim() || "(sans nom)" });
+				row.onclick = (e) => handleRowClick(token.id, e);
+			}
+		}
 	}
 
 	/**

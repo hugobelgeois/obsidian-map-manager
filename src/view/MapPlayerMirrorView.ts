@@ -47,6 +47,8 @@ export class MapPlayerMirrorView extends ItemView {
 	private unsubscribePathAnimation: (() => void) | null = null;
 	private unsubscribeCellHop: (() => void) | null = null;
 	private unsubscribeAim: (() => void) | null = null;
+	/** Whether this view is currently counted in `MapController.playerMirrorRefs` — see `mount`/`destroyComponents`. */
+	private mirrorCounted = false;
 	/** Watches the mirror registry so this view re-attaches by itself when the GM window reopens the same map (see `onMirrorSourceChange`). Keyed to `filePath`, kept alive across `mount()` calls, torn down only on close. */
 	private unsubscribeRegistry: (() => void) | null = null;
 	private rootEl: HTMLElement;
@@ -120,6 +122,8 @@ export class MapPlayerMirrorView extends ItemView {
 
 		this.source = source;
 		this.controller = source.controller;
+		this.controller.addPlayerMirror();
+		this.mirrorCounted = true;
 		this.bodyEl = this.rootEl.createDiv({ cls: "map-manager-body" });
 		const canvasHost = this.bodyEl.createDiv({ cls: "map-manager-canvas-host" });
 		this.canvasComp = new MapCanvas(canvasHost, source.controller, this.app, this.plugin.settings, {
@@ -144,6 +148,9 @@ export class MapPlayerMirrorView extends ItemView {
 		this.unsubscribePathAnimation = source.onPathAnimationStart((routes, speedWorldPerMs) => this.canvasComp?.playPathAnimationEcho(routes, speedWorldPerMs));
 		this.unsubscribeCellHop = source.onCellHop((tokenId, from, to) => this.canvasComp?.playCellHopEcho(tokenId, from, to));
 		this.unsubscribeAim = source.onAim((tokenId, angleDeg) => this.canvasComp?.playAimEcho(tokenId, angleDeg));
+		// A gamepad `open-note` action's note sidebar renders straight off shared `MapController` session
+		// state (`gamepadActionNotes`), same as the action menu — this mirror's own `MapCanvas` draws it,
+		// no echo channel needed.
 		this.unsubscribeController = source.controller.onChange(() => {
 			this.syncInfoPanel();
 			this.applyCameraForMode();
@@ -158,7 +165,8 @@ export class MapPlayerMirrorView extends ItemView {
 	 * current position into view (`MapCanvas.computeFitCamera`), recomputed only when the underlying
 	 * data actually changed (`MapController.dataVersion`) or the mode was just switched into — not on
 	 * every selection-only notify, so the camera doesn't visibly jump while the GM is just clicking
-	 * around.
+	 * around — and then *glided* to rather than snapped (see `MapCanvas.setMirrorCamera`'s `smooth`), so
+	 * a player stepping cell-to-cell doesn't yank the camera in one frame.
 	 */
 	private applyCameraForMode(): void {
 		if (!this.controller || !this.source || !this.canvasComp) return;
@@ -178,7 +186,10 @@ export class MapPlayerMirrorView extends ItemView {
 		const data = this.controller.getData();
 		const playerPoints = data.tokens.filter((t) => t.category === "player").map((t) => footprintCenter(data, t));
 		const camera = this.canvasComp.computeFitCamera(playerPoints);
-		if (camera) this.canvasComp.setMirrorCamera(camera);
+		// Glide to the new fit rather than snapping — a player stepping cell-to-cell shouldn't make the
+		// camera jump/zoom in one frame (see `MapCanvas.setMirrorCamera`'s `smooth`). The first fit (at
+		// mount, before any camera exists) still lands instantly.
+		if (camera) this.canvasComp.setMirrorCamera(camera, true);
 	}
 
 	/** Mounts/unmounts the InfoPanel to match `controller.showInfoToPlayers`, live (see the class comment), following the source's scroll position while mounted. */
@@ -202,6 +213,10 @@ export class MapPlayerMirrorView extends ItemView {
 	}
 
 	private destroyComponents(): void {
+		if (this.mirrorCounted) {
+			this.controller?.removePlayerMirror();
+			this.mirrorCounted = false;
+		}
 		this.canvasComp?.destroy();
 		this.clockBarComp?.destroy();
 		this.infoPanelComp?.destroy();

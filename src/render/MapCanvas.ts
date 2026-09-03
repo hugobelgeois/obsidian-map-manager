@@ -1,4 +1,4 @@
-import { App, Menu, Notice } from "obsidian";
+import { App, Component, Menu, Notice } from "obsidian";
 import { GamepadActionMenuState, MapController, MapMode, MassSelectionKind } from "../controller/MapController";
 import { getTokenClipboard, hasTokenClipboard, parseClipboardTokens, serializeClipboardTokens, setTokenClipboard } from "../controller/tokenClipboard";
 import { MapManagerSettings } from "../settings/types";
@@ -7,8 +7,8 @@ import { GamepadAction, directionLabelFr } from "../data/gamepadActions";
 import { drawTokenFacingArrow } from "./drawing";
 import { detectColorRegionWalls } from "../platform/detectColorRegionWalls";
 import { rgbToHex } from "../platform/detectMagicWalls";
-import { ActionNoteModal } from "../ui/ActionNoteModal";
 import { ColorRegionWallsModal } from "../ui/ColorRegionWallsModal";
+import { renderLinkedNote } from "../ui/renderLinkedNote";
 import { FogRenderer } from "./FogRenderer";
 import { HitTester } from "./HitTester";
 import { MapDrawer } from "./MapDrawer";
@@ -41,20 +41,57 @@ const PATH_SAMPLE_SPACING_RATIO = 0.15;
 const PATH_ANIMATION_CELLS_PER_SEC = 3.5;
 /** Animated token movement: how many cells short of the drawn path's own end each successive follower (in "closest to the path's start" order) stops, so they end up queued single-file rather than stacked on the same spot. */
 const PATH_FOLLOW_GAP_CELLS = 1;
+/** Animated token movement, celled grids only (`buildCellRoute`/`bfsCellPath`): the per-leg BFS that stitches the drawn stroke's cells into an adjacency-valid, wall-free chain gives up past this many visited cells — a single leg only ever spans a pointer jump, so this is generous. */
+const PATH_CELL_SEARCH_LIMIT = 4000;
 /** Animated token movement collision resolution (`nearestFreeCell`): the BFS gives up and leaves a token where it collided past this many visited cells — generous enough for any realistically packed map without ever searching unboundedly. */
 const COLLISION_SEARCH_LIMIT = 400;
 /** Below this on-screen cell size (in px), the grid/cell overlay auto-hides until zoomed back in. */
 const MIN_CELL_PIXELS = 12;
 /** Gamepad-driven token movement (see `GamepadInputPoller`/`handleGamepadMove`): how long a single-cell "jump" hop (`cellHops`) takes, ms — quick enough to keep up with a direction held down and auto-repeating. */
-const CELL_HOP_DURATION_MS = 180;
+const CELL_HOP_DURATION_MS = 150;
 /** How high (as a fraction of a cell's width) a "jump" hop arcs upward at its midpoint — see `currentHopPose`. */
 const CELL_HOP_HEIGHT_RATIO = 0.35;
 /** Percent of `Token.lightLife` one R1 press restores (see `handleGamepadLightRefill`). */
 const LIGHT_REFILL_PERCENT = 50;
+/** Percent of `Token.lightLife` one L1 press removes (see `handleGamepadLightDim`). */
+const LIGHT_DIM_PERCENT = 10;
 /** "Centrer" player-mirror camera mode (see `computeFitCamera`/`MapPlayerMirrorView`): the tightest player-token bounding box is padded by this factor so tokens don't sit flush against the viewport edges. */
 const CENTER_CAMERA_PADDING_RATIO = 1.4;
 /** "Centrer" player-mirror camera mode: minimum framed extent, in cells, so a single token (or a tight cluster) doesn't zoom in absurdly close. */
 const CENTER_CAMERA_MIN_CELLS = 6;
+/**
+ * "Centrer" player-mirror camera follow (see `setMirrorCamera`/`runMirrorCameraFollow`): the
+ * critically-damped-spring smoothing time, in seconds — roughly how long the displayed camera takes
+ * to catch up to a new target. A refit after a player token steps (`applyCameraForMode`) then eases
+ * in *and* out (no lurch at the start, no snap at the end) rather than jumping. `zoom` gets its own,
+ * longer time so spreading/regrouping player tokens don't make the camera zoom abruptly — that
+ * channel is the one that reads as harsh. Larger = more languid.
+ */
+const MIRROR_CAMERA_PAN_SMOOTH_TIME = 0.32;
+const MIRROR_CAMERA_ZOOM_SMOOTH_TIME = 0.6;
+/** Player-mirror camera follow: below this gap (world units for pan, relative ratio for zoom) — and with negligible velocity — the follow snaps to the target and stops its RAF loop. */
+const MIRROR_CAMERA_SNAP_EPS = 0.4;
+
+/**
+ * One critically-damped-spring step (Game Programming Gems 4 / Unity's `Mathf.SmoothDamp`): eases
+ * `current` toward `target` carrying `vel` (mutated in place) so retargeting mid-glide stays smooth,
+ * with no overshoot. `dt`/`smoothTime` in seconds. Returns the new position.
+ */
+function smoothDampChannel(current: number, target: number, vel: { v: number }, smoothTime: number, dt: number): number {
+	const omega = 2 / smoothTime;
+	const x = omega * dt;
+	const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+	const change = current - target;
+	const temp = (vel.v + omega * change) * dt;
+	vel.v = (vel.v - omega * temp) * exp;
+	let output = target + (change + temp) * exp;
+	// Overshoot guard (Unity's): if we've crossed the target this step, clamp onto it and stop.
+	if ((change < 0) === (output > target)) {
+		output = target;
+		vel.v = 0;
+	}
+	return output;
+}
 
 /** Axial neighbor offsets (orientation-agnostic — pointy vs. flat only changes pixel<->hex conversion, not adjacency). */
 const HEX_NEIGHBOR_OFFSETS: Array<{ dq: number; dr: number }> = [
@@ -138,11 +175,17 @@ interface PathAnimationState {
  * `MapController.moveToken` has already committed the token's new `cellKey` (see `handleGamepadMove`),
  * same "draw the tween, not yet the commit" idea as `pathAnimation`/`draggingToken`, just for a single
  * step instead of a whole gesture. `from`/`to` are the two cells' centers in world space.
+ *
+ * `startedAt` is `null` until the hop's *first animation frame* actually runs (`runCellHopLoop`),
+ * not when `startCellHop` was called: `handleGamepadMove` fires a burst of synchronous `render()`s
+ * right after (`moveToken` → `drainLightForEvent` → the fog's re-entrant `markExplored`), which on a
+ * heavy map can itself take longer than `CELL_HOP_DURATION_MS` — timing the hop from `startCellHop`
+ * meant it was already "expired" before the browser ever dispatched a single animation frame for it.
  */
 interface CellHopState {
 	from: Point;
 	to: Point;
-	startedAt: number;
+	startedAt: number | null;
 }
 
 /** Live preview for the Ctrl-drag "distribute the selection into this area" gesture — see `MapCanvas.recomputeDistributePreview`. */
@@ -195,8 +238,18 @@ export class MapCanvas {
 	private transform: ViewTransform = { zoom: 1, panX: 0, panY: 0 };
 	private viewportW = 0;
 	private viewportH = 0;
-	/** Mirror-only: the source's last-pushed world-space camera — see `setMirrorCamera` and the note on `MapCanvasOptions.isMirror`. */
+	/** Mirror-only: the world-space camera `render()` actually displays — see `setMirrorCamera` and the note on `MapCanvasOptions.isMirror`. In "mirror"/"freeze" camera modes this is the source's last-pushed camera as-is; in "center" mode it eases toward `mirrorCameraTarget` a frame at a time (see `runMirrorCameraFollow`). */
 	private mirrorCamera: { zoom: number; x: number; y: number } | null = null;
+	/** Mirror-only, "center" camera mode: the camera `mirrorCamera` is gliding toward (the latest player-token fit). Equal to `mirrorCamera` when the follow has settled or the caller asked for an instant set. */
+	private mirrorCameraTarget: { zoom: number; x: number; y: number } | null = null;
+	/** Non-null while `runMirrorCameraFollow`'s RAF loop is easing `mirrorCamera` toward `mirrorCameraTarget` — same self-contained start/stop pattern as `pingAnimationFrameId`. */
+	private mirrorCameraFollowFrameId: number | null = null;
+	/** `performance.now()` of the last `runMirrorCameraFollow` frame, for frame-rate-independent easing. */
+	private mirrorCameraFollowLastAt = 0;
+	/** Per-channel spring velocities carried between `runMirrorCameraFollow` frames (zoom tracked in log space) — carrying them is what keeps a retarget mid-glide smooth instead of restarting from a standstill. */
+	private mirrorCameraVel = { x: 0, y: 0, logZoom: 0 };
+	/** RAF id of a queued coalesced render, or `null` — see `scheduleRender`. */
+	private scheduledRenderFrameId: number | null = null;
 
 	private bgImages: Map<string, BackgroundEntry> = new Map();
 	/** Keyed by token id (not path), since several tokens could share the same image. */
@@ -295,6 +348,13 @@ export class MapCanvas {
 	private gamepadActionRunners: Map<number, Array<() => void>> = new Map();
 	/** The action-menu popup DOM overlay (created lazily, one shared node) — see `syncActionMenuOverlay`. */
 	private actionMenuEl: HTMLDivElement | null = null;
+	/**
+	 * The gamepad `open-note` action sidebars currently mounted in `this.container`, one per open note,
+	 * keyed by gamepad index — reconciled against `controller.gamepadActionNotes` in `syncActionNoteOverlay`.
+	 * `link` is what's currently rendered (so the Markdown is only re-rendered when it changes); `component`
+	 * owns that render and is unloaded when the sidebar goes away.
+	 */
+	private actionNoteEls: Map<number, { el: HTMLDivElement; link: string; component: Component }> = new Map();
 	/** In-flight gamepad-triggered "jump" hops, keyed by token id — see `CellHopState`/`startCellHop`/`drawTokens`. */
 	private cellHops: Map<string, CellHopState> = new Map();
 	/** Non-null while any `cellHops` entry is actively re-rendering every frame — same pattern as `pingAnimationFrameId`. */
@@ -1056,12 +1116,18 @@ export class MapCanvas {
 	}
 
 	/**
-	 * Builds one `PathAnimationRoute` per animatable token and starts the tween loop. Each token's
-	 * own route is a straight lead-in from wherever it actually is onto the drawn path's first point,
-	 * then as much of the path itself as its rank allows — see the interface doc on
-	 * `PathAnimationRoute`/`PATH_FOLLOW_GAP_CELLS` for why rank (closest-to-the-path's-start-first)
-	 * shortens how far along the path each successive token gets to go, so they end up queued
-	 * single-file rather than stacked on the same final cell.
+	 * Builds one `PathAnimationRoute` per animatable token and starts the tween loop.
+	 *
+	 * On a celled grid (`square`/`hex-*`) each route is snapped to whole cells: it starts at the
+	 * token's own anchor cell, follows the cells the drawn stroke passes over, and is stitched into
+	 * an adjacency-valid chain that never steps through a wall (`buildCellRoute` — a walled-off
+	 * stretch just stops the route early), so the token walks cell-to-cell around obstacles rather
+	 * than sliding along the raw freehand line. On grid type `"none"` there are no cells, so the
+	 * route stays the raw stroke with a straight lead-in from wherever the token actually is.
+	 *
+	 * Either way, rank (closest-to-the-path's-start-first) shortens how far each successive token
+	 * gets to travel — see the interface doc on `PathAnimationRoute`/`PATH_FOLLOW_GAP_CELLS` — so
+	 * they end up queued single-file rather than stacked on the same final cell.
 	 */
 	private startPathAnimation(pathPoints: Point[]): void {
 		const pathStart = pathPoints[0];
@@ -1077,20 +1143,30 @@ export class MapCanvas {
 			})
 			.sort((a, b) => a.dist - b.dist);
 
+		const cellW = this.hit.cellVisualWidth();
+		const gridded = this.controller.getData().gridType !== "none";
+		const wallSegments = gridded ? this.resolveWallSegments() : [];
 		const pathCumulative = polylineCumulativeLengths(pathPoints);
 		const pathTotalLength = pathCumulative[pathCumulative.length - 1] ?? 0;
-		const gap = this.hit.cellVisualWidth() * PATH_FOLLOW_GAP_CELLS;
+		const gap = cellW * PATH_FOLLOW_GAP_CELLS;
 
 		const routes: PathAnimationRoute[] = ranked.map(({ token, origin }, rank) => {
-			const stopArc = Math.max(0, pathTotalLength - rank * gap);
-			const points = [origin, ...truncatePolyline(pathPoints, pathCumulative, stopArc)];
+			let points: Point[];
+			if (gridded) {
+				const cells = this.buildCellRoute(token, origin, pathPoints, wallSegments);
+				const kept = cells.slice(0, Math.max(1, cells.length - rank * PATH_FOLLOW_GAP_CELLS));
+				points = [origin, ...kept.slice(1).map((k) => this.hit.cellCenter(k))];
+			} else {
+				const stopArc = Math.max(0, pathTotalLength - rank * gap);
+				points = [origin, ...truncatePolyline(pathPoints, pathCumulative, stopArc)];
+			}
 			const cumulative = polylineCumulativeLengths(points);
 			const totalLength = cumulative[cumulative.length - 1] ?? 0;
 			const finalRotation = directionAtArcLength(points, cumulative, totalLength) ?? token.rotation ?? 0;
 			return { tokenId: token.id, points, cumulative, totalLength, finalRotation };
 		});
 
-		const speedWorldPerMs = (this.hit.cellVisualWidth() * PATH_ANIMATION_CELLS_PER_SEC) / 1000;
+		const speedWorldPerMs = (cellW * PATH_ANIMATION_CELLS_PER_SEC) / 1000;
 		this.playPathAnimation(routes, speedWorldPerMs, true);
 		// A mirror never touches `MapController` until this canvas's own `finishPathAnimation` commits
 		// (they share the same controller — see `mirrorRegistry`), so left alone it would only see the
@@ -1143,6 +1219,73 @@ export class MapCanvas {
 			this.pathAnimationFrameId = requestAnimationFrame(tick);
 		};
 		this.pathAnimationFrameId = requestAnimationFrame(tick);
+	}
+
+	/**
+	 * Celled grids only: turns the freehand drawn stroke into a cell-by-cell route for `token`.
+	 * Starts at the token's own anchor cell, then walks the cells the stroke passes over in order
+	 * (deduped). Each successive pair is joined by `bfsCellPath` so the result is always
+	 * adjacency-valid and never steps through a wall segment (`edgeBlocked`) — this both bridges
+	 * pointer jumps in the stroke and routes the token around walls it was drawn across. If a cell
+	 * the stroke wants is walled off from the route so far, the route just stops at the last cell it
+	 * could actually reach.
+	 */
+	private buildCellRoute(token: Token, origin: Point, pathPoints: Point[], wallSegments: ResolvedWallSegment[]): string[] {
+		const startKey = this.hit.dropAnchorKey(token, origin.x, origin.y);
+		const waypoints: string[] = [startKey];
+		for (const p of pathPoints) {
+			const key = this.hit.cellKeyAt(p.x, p.y);
+			if (key !== waypoints[waypoints.length - 1]) waypoints.push(key);
+		}
+		const route: string[] = [startKey];
+		for (let i = 1; i < waypoints.length; i++) {
+			const from = route[route.length - 1];
+			const to = waypoints[i];
+			if (!from || !to || to === from) continue;
+			const leg = this.bfsCellPath(from, to, wallSegments);
+			if (!leg) break;
+			for (let j = 1; j < leg.length; j++) {
+				const step = leg[j];
+				if (step) route.push(step);
+			}
+		}
+		return route;
+	}
+
+	/**
+	 * Shortest wall-free cell path (inclusive of both ends) from `fromKey` to `toKey` over grid
+	 * adjacency (`neighborKeys`), skipping any hop a wall segment blocks (`edgeBlocked` — every wall
+	 * type stops a plain step, matching gamepad movement and the fill flood). `null` if `toKey` is
+	 * unreachable within `PATH_CELL_SEARCH_LIMIT` visited cells.
+	 */
+	private bfsCellPath(fromKey: string, toKey: string, wallSegments: ResolvedWallSegment[]): string[] | null {
+		if (fromKey === toKey) return [fromKey];
+		const prev = new Map<string, string>();
+		const visited = new Set<string>([fromKey]);
+		const queue: string[] = [fromKey];
+		let head = 0;
+		let visitedCount = 0;
+		while (head < queue.length && visitedCount < PATH_CELL_SEARCH_LIMIT) {
+			const key = queue[head++];
+			if (!key) break;
+			for (const n of this.neighborKeys(key)) {
+				if (visited.has(n) || this.edgeBlocked(key, n, wallSegments)) continue;
+				visited.add(n);
+				visitedCount++;
+				prev.set(n, key);
+				if (n === toKey) {
+					const path: string[] = [n];
+					let cur: string | undefined = n;
+					while (cur && cur !== fromKey) {
+						cur = prev.get(cur);
+						if (cur) path.push(cur);
+					}
+					return path.reverse();
+				}
+				queue.push(n);
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -1287,6 +1430,17 @@ export class MapCanvas {
 		return this.isMirror ? "view" : this.controller.mode;
 	}
 
+	/**
+	 * Whether gamepad input should drive player tokens right now. Normally that's "the shared mode is
+	 * Vue", but a player-mirror window being open (`MapController.hasPlayerMirror`) keeps gamepad
+	 * control live even while the GM flips their *own* window to Édition to tweak the map — the players
+	 * on the second screen can still move around. Only ever consulted on the source canvas (a mirror
+	 * has no poller — see the constructor).
+	 */
+	private gamepadControlAllowed(): boolean {
+		return this.controller.mode === "view" || this.controller.hasPlayerMirror;
+	}
+
 	constructor(private container: HTMLElement, private controller: MapController, private app: App, private settings: MapManagerSettings, private options: MapCanvasOptions = {}) {
 		this.canvas = container.createEl("canvas", { cls: "map-manager-canvas" });
 		if (this.isMirror) this.canvas.addClass("is-mirror-canvas");
@@ -1307,7 +1461,9 @@ export class MapCanvas {
 			!!this.options.forceFog,
 			() => ({ w: this.viewportW, h: this.viewportH }),
 			(tokenId) => this.currentAnimatedPose(tokenId),
-			() => this.render()
+			// The flicker/softening loop asks for a frame here; coalesced so it doesn't double up with
+			// the camera-follow loop (or a cell hop) while a player walks — see `scheduleRender`.
+			() => this.scheduleRender()
 		);
 		this.hit = new HitTester(this.controller, () => this.transform, this.fog);
 		this.drawer = new MapDrawer(this.controller, this.settings, () => this.transform, () => ({ w: this.viewportW, h: this.viewportH }), this.hit);
@@ -1332,6 +1488,7 @@ export class MapCanvas {
 				onConfirm: (gamepadIndex) => this.handleGamepadConfirm(gamepadIndex),
 				onCancel: (gamepadIndex) => this.handleGamepadCancel(gamepadIndex),
 				onLightRefill: (gamepadIndex) => this.handleGamepadLightRefill(gamepadIndex),
+				onLightDim: (gamepadIndex) => this.handleGamepadLightDim(gamepadIndex),
 				onLightExtinguish: (gamepadIndex) => this.handleGamepadLightExtinguish(gamepadIndex),
 				onAim: (gamepadIndex, angleDeg) => this.handleGamepadAim(gamepadIndex, angleDeg),
 			});
@@ -1395,10 +1552,87 @@ export class MapCanvas {
 	 * Mirror-only: sets the camera to display, pushed by the caller (`MapPlayerMirrorView`) only when
 	 * the source's camera actually changed (its `onViewportChange`) plus once at mount — never read on
 	 * a schedule, for exactly the reason explained on `MapCanvasOptions.isMirror`.
+	 *
+	 * `smooth` (used by the "Centrer" camera mode) eases the displayed camera toward `view` with a
+	 * critically-damped spring instead of snapping — so a refit after a player token steps glides in,
+	 * accelerating and decelerating (see `runMirrorCameraFollow` / `MIRROR_CAMERA_*_SMOOTH_TIME`). It's
+	 * ignored on the very first push (nothing to glide from) and when the move is smaller than
+	 * `MIRROR_CAMERA_SNAP_EPS`.
 	 */
-	setMirrorCamera(view: { zoom: number; x: number; y: number }): void {
-		this.mirrorCamera = view;
-		this.render();
+	setMirrorCamera(view: { zoom: number; x: number; y: number }, smooth = false): void {
+		this.mirrorCameraTarget = { ...view };
+		if (!smooth || !this.mirrorCamera || this.mirrorCameraSettled()) {
+			this.stopMirrorCameraFollow();
+			this.mirrorCameraVel = { x: 0, y: 0, logZoom: 0 };
+			this.mirrorCamera = { ...view };
+			this.render();
+			return;
+		}
+		this.runMirrorCameraFollow();
+	}
+
+	/** True when `mirrorCamera` sits within `MIRROR_CAMERA_SNAP_EPS` of `mirrorCameraTarget` on pan and zoom alike *and* the spring has essentially stopped moving — the follow has nothing left to do. */
+	private mirrorCameraSettled(): boolean {
+		const cur = this.mirrorCamera;
+		const tgt = this.mirrorCameraTarget;
+		if (!cur || !tgt) return true;
+		const v = this.mirrorCameraVel;
+		return (
+			Math.abs(cur.x - tgt.x) < MIRROR_CAMERA_SNAP_EPS &&
+			Math.abs(cur.y - tgt.y) < MIRROR_CAMERA_SNAP_EPS &&
+			Math.abs(cur.zoom / tgt.zoom - 1) < MIRROR_CAMERA_SNAP_EPS / 100 &&
+			Math.abs(v.x) < MIRROR_CAMERA_SNAP_EPS &&
+			Math.abs(v.y) < MIRROR_CAMERA_SNAP_EPS &&
+			Math.abs(v.logZoom) < MIRROR_CAMERA_SNAP_EPS / 100
+		);
+	}
+
+	private stopMirrorCameraFollow(): void {
+		if (this.mirrorCameraFollowFrameId !== null) {
+			cancelAnimationFrame(this.mirrorCameraFollowFrameId);
+			this.mirrorCameraFollowFrameId = null;
+		}
+	}
+
+	/**
+	 * Springs `mirrorCamera` toward `mirrorCameraTarget` one frame at a time (`smoothDampChannel` per
+	 * channel, zoom in log space, pan and zoom on their own smoothing times). Same self-contained
+	 * start/stop RAF pattern as `triggerPing`; retargets seamlessly when `setMirrorCamera` pushes a new
+	 * target mid-glide — the carried `mirrorCameraVel` means no restart-from-standstill stutter.
+	 */
+	private runMirrorCameraFollow(): void {
+		if (this.mirrorCameraFollowFrameId !== null) return;
+		this.mirrorCameraFollowLastAt = performance.now();
+		const tick = () => {
+			const cur = this.mirrorCamera;
+			const tgt = this.mirrorCameraTarget;
+			if (!cur || !tgt) {
+				this.mirrorCameraFollowFrameId = null;
+				return;
+			}
+			const now = performance.now();
+			// Clamp dt so a stalled tab (or a long GC pause) resumes gently instead of teleporting.
+			const dt = Math.min(Math.max(now - this.mirrorCameraFollowLastAt, 1), 50) / 1000;
+			this.mirrorCameraFollowLastAt = now;
+			const vx = { v: this.mirrorCameraVel.x };
+			const vy = { v: this.mirrorCameraVel.y };
+			const vz = { v: this.mirrorCameraVel.logZoom };
+			const nx = smoothDampChannel(cur.x, tgt.x, vx, MIRROR_CAMERA_PAN_SMOOTH_TIME, dt);
+			const ny = smoothDampChannel(cur.y, tgt.y, vy, MIRROR_CAMERA_PAN_SMOOTH_TIME, dt);
+			const nLogZoom = smoothDampChannel(Math.log(cur.zoom), Math.log(tgt.zoom), vz, MIRROR_CAMERA_ZOOM_SMOOTH_TIME, dt);
+			this.mirrorCameraVel = { x: vx.v, y: vy.v, logZoom: vz.v };
+			this.mirrorCamera = { x: nx, y: ny, zoom: Math.exp(nLogZoom) };
+			if (this.mirrorCameraSettled()) {
+				this.mirrorCamera = { ...tgt };
+				this.mirrorCameraVel = { x: 0, y: 0, logZoom: 0 };
+				this.mirrorCameraFollowFrameId = null;
+				this.scheduleRender();
+				return;
+			}
+			this.scheduleRender();
+			this.mirrorCameraFollowFrameId = requestAnimationFrame(tick);
+		};
+		this.mirrorCameraFollowFrameId = requestAnimationFrame(tick);
 	}
 
 	/**
@@ -1526,6 +1760,8 @@ export class MapCanvas {
 		if (this.pingAnimationFrameId !== null) cancelAnimationFrame(this.pingAnimationFrameId);
 		if (this.pathAnimationFrameId !== null) cancelAnimationFrame(this.pathAnimationFrameId);
 		if (this.cellHopFrameId !== null) cancelAnimationFrame(this.cellHopFrameId);
+		if (this.scheduledRenderFrameId !== null) cancelAnimationFrame(this.scheduledRenderFrameId);
+		this.stopMirrorCameraFollow();
 		this.gamepadPoller?.stop();
 		this.resizeObserver.disconnect();
 		if (!this.isMirror) {
@@ -1542,6 +1778,11 @@ export class MapCanvas {
 		this.canvas.remove();
 		this.magnifierEl?.remove();
 		this.actionMenuEl?.remove();
+		for (const { el, component } of this.actionNoteEls.values()) {
+			component.unload();
+			el.remove();
+		}
+		this.actionNoteEls.clear();
 	}
 
 	private resize(): void {
@@ -1677,9 +1918,10 @@ export class MapCanvas {
 	 * `GamepadInputPoller`'s `onMove` callback (see the constructor): one gamepad just reported a held
 	 * direction (edge-triggered, possibly auto-repeating — see the poller itself).
 	 *
-	 * If an action menu is open for this gamepad (`controller.gamepadActionMenus`), the direction moves
-	 * that menu's cursor instead of the token (up/left → previous entry, down/right → next), and each
-	 * such move drains `settings.actionMenuNavCost` points of the player token's `lightLife`.
+	 * If an action menu is open for this gamepad (`controller.gamepadActionMenus`), a vertical direction
+	 * moves that menu's cursor instead of the token (up → previous entry, down → next; left/right are
+	 * ignored), and each such move drains `settings.actionMenuNavCost` points of the player token's
+	 * `lightLife`.
 	 *
 	 * Otherwise it's a normal step: the token moves one cell toward whichever of its grid neighbors is
 	 * closest to `inputAngleDeg`, rotating to face it (`MapController.moveToken`'s `rotation` param),
@@ -1697,14 +1939,18 @@ export class MapCanvas {
 	 * actually finished, so held-direction auto-repeat can't outrun what's on screen.
 	 */
 	private handleGamepadMove(gamepadIndex: number, inputAngleDeg: number): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 
-		// Menu open → navigate it, not the token. Up (270°) / left (180°) go to the previous entry.
+		// Menu open → navigate it, not the token. Only a clear vertical input moves the cursor: up
+		// (270°, y-down) → previous entry, down (90°) → next. Left/right (and shallow diagonals) do
+		// nothing, so a sideways nudge on the stick/d-pad can't scroll the menu.
 		if (this.controller.gamepadActionMenus.has(gamepadIndex)) {
 			const a = ((inputAngleDeg % 360) + 360) % 360;
-			const delta = a > 90 && a < 270 ? -1 : 1;
+			const vertical = Math.sin((a * Math.PI) / 180);
+			const delta = vertical <= -0.5 ? -1 : vertical >= 0.5 ? 1 : 0;
+			if (delta === 0) return;
 			this.controller.moveGamepadActionMenuCursor(gamepadIndex, delta);
 			const navCost = this.settings.actionMenuNavCost;
 			if (navCost > 0 && this.controller.findToken(tokenId)) {
@@ -1742,10 +1988,12 @@ export class MapCanvas {
 		this.controller.drainLightForEvent("move", tokenId);
 	}
 
-	/** Whichever "light" token shares `token`'s own cell (a co-located torch — see `MapController.moveToken`'s light-passthrough), if any. */
+	/** Whichever *interactable* "light" token shares `token`'s own cell (a co-located torch the player can tend — see `Token.lightInteractable` / `MapController.moveToken`'s light-passthrough), if any. */
 	private colocatedLight(token: Token): Token | undefined {
 		if (!token.cellKey) return undefined;
-		return this.controller.getData().tokens.find((t) => t.id !== token.id && t.cellKey === token.cellKey && (t.category ?? "entity") === "light");
+		return this.controller
+			.getData()
+			.tokens.find((t) => t.id !== token.id && t.cellKey === token.cellKey && (t.category ?? "entity") === "light" && t.lightInteractable !== false);
 	}
 
 	/**
@@ -1758,7 +2006,7 @@ export class MapCanvas {
 	 * canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
 	 */
 	private handleGamepadActionButton(gamepadIndex: number): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 		if (this.controller.gamepadActionMenus.has(gamepadIndex)) {
@@ -1767,19 +2015,19 @@ export class MapCanvas {
 		}
 		const token = this.controller.findToken(tokenId);
 		if (!token) return;
-		const options = this.resolveAvailableActions(token);
+		const options = this.resolveAvailableActions(token, gamepadIndex);
 		if (options.length === 0) return;
 		if (options.length === 1) {
 			options[0]!.run();
 			return;
 		}
 		this.gamepadActionRunners.set(gamepadIndex, options.map((o) => o.run));
-		this.controller.openGamepadActionMenu(gamepadIndex, tokenId, options.map((o) => ({ label: o.label, lightCost: o.lightCost })));
+		this.controller.openGamepadActionMenu(gamepadIndex, tokenId, options.map((o) => ({ label: o.label })));
 	}
 
 	/** `GamepadInputPoller`'s `onConfirm` callback (Croix/A): run the highlighted entry of an open action menu, then close it. */
 	private handleGamepadConfirm(gamepadIndex: number): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const menu = this.controller.gamepadActionMenus.get(gamepadIndex);
 		const runners = this.gamepadActionRunners.get(gamepadIndex);
 		if (!menu || !runners) return;
@@ -1788,10 +2036,17 @@ export class MapCanvas {
 		run?.();
 	}
 
-	/** `GamepadInputPoller`'s `onCancel` callback (Rond/B): close an open action menu, running nothing. */
+	/**
+	 * `GamepadInputPoller`'s `onCancel` callback (Rond/B): close an open action menu, running nothing.
+	 * With no menu open, it instead dismisses a still-showing gamepad `open-note` sidebar
+	 * (`MapController.closeGamepadActionNote` — shared state, so both the GM canvas and the mirror drop it).
+	 */
 	private handleGamepadCancel(gamepadIndex: number): void {
+		const hadMenu = this.controller.gamepadActionMenus.has(gamepadIndex);
 		this.gamepadActionRunners.delete(gamepadIndex);
 		this.controller.closeGamepadActionMenu(gamepadIndex);
+		if (hadMenu) return;
+		this.controller.closeGamepadActionNote(gamepadIndex);
 	}
 
 	/**
@@ -1802,18 +2057,18 @@ export class MapCanvas {
 	 * closure (`executeActionOption`, bound to that entry's concrete target). Empty for a token with no
 	 * `cellKey` (grid type "none").
 	 */
-	private resolveAvailableActions(token: Token): { label: string; lightCost: number; run: () => void }[] {
+	private resolveAvailableActions(token: Token, gamepadIndex: number): { label: string; requiresContact: boolean; run: () => void }[] {
 		const cellKey = token.cellKey;
 		if (!cellKey) return [];
 		const data = this.controller.getData();
 		const hex = data.gridType === "hex-pointy" || data.gridType === "hex-flat";
 		const wallSegments = this.resolveWallSegments();
 		const contacts = this.contactedWalls(cellKey, wallSegments);
-		const out: { label: string; lightCost: number; run: () => void }[] = [];
+		const out: { label: string; requiresContact: boolean; run: () => void }[] = [];
 		for (const action of this.settings.gamepadActions) {
 			const contact = action.contact;
 			if (contact.kind === "none") {
-				out.push({ label: action.name, lightCost: action.lightCost, run: () => this.executeActionOption(token.id, action, {}) });
+				out.push({ label: action.name, requiresContact: false, run: () => this.executeActionOption(token.id, gamepadIndex, action, {}) });
 			} else if (contact.kind === "wall") {
 				for (const c of contacts) {
 					// A gamepad action only ever acts on a franchissable wall (door/curtain) — see `GamepadActionContact`.
@@ -1821,8 +2076,8 @@ export class MapCanvas {
 					if (!seg) continue;
 					out.push({
 						label: `${action.name} (${directionLabelFr(c.angleDeg, hex)})`,
-						lightCost: action.lightCost,
-						run: () => this.executeActionOption(token.id, action, { wall: { segmentId: seg.id, neighborKey: c.neighborKey, angleDeg: c.angleDeg } }),
+						requiresContact: true,
+						run: () => this.executeActionOption(token.id, gamepadIndex, action, { wall: { segmentId: seg.id, neighborKey: c.neighborKey, angleDeg: c.angleDeg } }),
 					});
 				}
 			} else {
@@ -1830,10 +2085,12 @@ export class MapCanvas {
 				for (const other of data.tokens) {
 					if (other.id === token.id) continue;
 					if ((other.category ?? "entity") !== contact.category) continue;
+					// A "light" fixture the GM has locked (`lightInteractable: false`) is never a valid action target.
+					if ((other.category ?? "entity") === "light" && other.lightInteractable === false) continue;
 					if (!other.cellKey || !cells.has(other.cellKey)) continue;
 					const suffix = other.label ? ` — ${other.label}` : "";
 					const otherId = other.id;
-					out.push({ label: `${action.name}${suffix}`, lightCost: action.lightCost, run: () => this.executeActionOption(token.id, action, { lightTokenId: otherId }) });
+					out.push({ label: `${action.name}${suffix}`, requiresContact: true, run: () => this.executeActionOption(token.id, gamepadIndex, action, { lightTokenId: otherId }) });
 				}
 			}
 		}
@@ -1868,6 +2125,7 @@ export class MapCanvas {
 	 */
 	private executeActionOption(
 		tokenId: string,
+		gamepadIndex: number,
 		action: GamepadAction,
 		target: { wall?: { segmentId: string; neighborKey: string; angleDeg: number }; lightTokenId?: string }
 	): void {
@@ -1898,7 +2156,9 @@ export class MapCanvas {
 				this.controller.updateToken(lightToken.id, (t) => (t.lightLife = life));
 			}
 		} else if (effect.kind === "open-note") {
-			new ActionNoteModal(this.app, action.name, effect.link).open();
+			// Session state on the shared controller — both the GM canvas and the player-mirror canvas
+			// render the same note sidebar off it (see `syncActionNoteOverlay`), no echo channel needed.
+			this.controller.openGamepadActionNote(gamepadIndex, tokenId, action.name, effect.link);
 		}
 		if (action.lightCost > 0 && this.controller.findToken(tokenId)) {
 			this.controller.updateToken(tokenId, (t) => (t.lightLife = clamp(resolveLightLife(t) - action.lightCost, 0, 100)));
@@ -1940,7 +2200,6 @@ export class MapCanvas {
 			const row = el.createDiv({ cls: "map-manager-action-menu-item" });
 			if (i === menu.highlightedIndex) row.addClass("is-active");
 			row.createSpan({ cls: "map-manager-action-menu-label", text: opt.label });
-			if (opt.lightCost > 0) row.createSpan({ cls: "map-manager-action-menu-cost", text: `−${opt.lightCost}%` });
 		}
 		const pose = this.currentHopPose(menu.tokenId) ?? this.hit.footprintCenter(token);
 		const screen = worldToScreen(pose.x, pose.y, this.transform);
@@ -1954,12 +2213,85 @@ export class MapCanvas {
 	}
 
 	/**
+	 * Creates / updates / removes the gamepad `open-note` action's note sidebars from
+	 * `controller.gamepadActionNotes` — one full-slot-height `position: absolute` panel in `this.container`
+	 * per open note, docked left/right like a sidebar (never over the token). Slots are assigned by *player
+	 * number* (`playerSlotRect`): odd-numbered players dock left, even-numbered right, and each side splits
+	 * its height evenly between the players on it. Player order is the connected gamepads sorted by index
+	 * (`controller.gamepadAssignments`), so player 1 always owns the same corner. The Markdown is only
+	 * (re)rendered when a note's `link` changes; called from `render()`, so both the GM canvas and the
+	 * player-mirror canvas show the same sidebars off the shared session state.
+	 */
+	private syncActionNoteOverlay(): void {
+		const notes = this.controller.gamepadActionNotes;
+		if (notes.size === 0 || this.effectiveMode() !== "view") {
+			for (const { el, component } of this.actionNoteEls.values()) {
+				component.unload();
+				el.remove();
+			}
+			this.actionNoteEls.clear();
+			return;
+		}
+		const playerOrder = [...new Set([...this.controller.gamepadAssignments.keys(), ...notes.keys()])].sort((a, b) => a - b);
+		const total = Math.max(playerOrder.length, 1);
+		const live = new Set<number>();
+		for (const [gamepadIndex, note] of notes) {
+			if (!this.controller.findToken(note.tokenId)) continue;
+			live.add(gamepadIndex);
+			let entry = this.actionNoteEls.get(gamepadIndex);
+			if (!entry) {
+				const el = this.container.createDiv({ cls: "map-manager-action-note" });
+				entry = { el, link: "", component: new Component() };
+				this.actionNoteEls.set(gamepadIndex, entry);
+			}
+			// Only rebuild (and re-render Markdown) when the target note actually changed.
+			if (entry.link !== note.link || entry.el.childElementCount === 0) {
+				entry.component.unload();
+				entry.el.empty();
+				entry.el.createDiv({ cls: "map-manager-action-note-title", text: note.title });
+				const body = entry.el.createDiv({ cls: "map-manager-action-note-body" });
+				entry.component = new Component();
+				entry.component.load();
+				entry.link = note.link;
+				void renderLinkedNote(this.app, body, note.link, entry.component);
+			}
+			const idx = playerOrder.indexOf(gamepadIndex);
+			const rect = this.playerSlotRect(idx < 0 ? total : idx + 1, total);
+			entry.el.toggleClass("is-right", rect.side === "right");
+			entry.el.style.left = rect.side === "left" ? "0" : "";
+			entry.el.style.right = rect.side === "right" ? "0" : "";
+			entry.el.style.top = `${rect.topPct}%`;
+			entry.el.style.height = `${rect.heightPct}%`;
+		}
+		for (const [gamepadIndex, entry] of [...this.actionNoteEls]) {
+			if (live.has(gamepadIndex)) continue;
+			entry.component.unload();
+			entry.el.remove();
+			this.actionNoteEls.delete(gamepadIndex);
+		}
+	}
+
+	/**
+	 * Where player `n`'s action sidebar sits (1-based `n`, `total` players). Odd players dock left, even
+	 * players right; each side divides its full height evenly among its players, top-to-bottom in
+	 * player-number order — so 1 player fills the left edge, 2 players take a full edge each, 3 split the
+	 * left edge 50/50 (p1 top, p3 bottom) with p2 owning the whole right edge, 4 split both edges, etc.
+	 */
+	private playerSlotRect(n: number, total: number): { side: "left" | "right"; topPct: number; heightPct: number } {
+		const isLeft = n % 2 === 1;
+		const sideCount = isLeft ? Math.ceil(total / 2) : Math.floor(total / 2);
+		const posInSide = isLeft ? (n - 1) / 2 : (n - 2) / 2;
+		const heightPct = 100 / Math.max(sideCount, 1);
+		return { side: isLeft ? "left" : "right", topPct: posInSide * heightPct, heightPct };
+	}
+
+	/**
 	 * `GamepadInputPoller`'s `onLightRefill` callback: R1 was just pressed — refills the light life
 	 * (`Token.lightLife`) of the co-located "light" fixture if there is one, else the player token's
 	 * own, by `LIGHT_REFILL_PERCENT`, clamped to 100. Same gating as `handleGamepadMove`.
 	 */
 	private handleGamepadLightRefill(gamepadIndex: number): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 		const token = this.controller.findToken(tokenId);
@@ -1969,13 +2301,29 @@ export class MapCanvas {
 	}
 
 	/**
+	 * `GamepadInputPoller`'s `onLightDim` callback: L1 was pressed — dims the co-located "light" fixture
+	 * if there is one, else the player token's own, by removing `LIGHT_DIM_PERCENT` from its
+	 * `Token.lightLife` (clamped at 0; the configured `lightRadius` is kept, so R1 can bring it back).
+	 * Same gating as `handleGamepadMove`.
+	 */
+	private handleGamepadLightDim(gamepadIndex: number): void {
+		if (!this.gamepadControlAllowed()) return;
+		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
+		if (!tokenId) return;
+		const token = this.controller.findToken(tokenId);
+		if (!token) return;
+		const targetId = this.colocatedLight(token)?.id ?? token.id;
+		this.controller.updateToken(targetId, (t) => (t.lightLife = clamp((t.lightLife ?? DEFAULT_LIGHT_LIFE) - LIGHT_DIM_PERCENT, 0, 100)));
+	}
+
+	/**
 	 * `GamepadInputPoller`'s `onLightExtinguish` callback: L1 was held for `LIGHT_EXTINGUISH_HOLD_MS` —
-	 * snuffs the co-located "light" fixture if there is one, else the player token's own, by setting
-	 * `Token.lightLife` to 0 (the configured `lightRadius` is kept, so R1 can bring it back). Same
-	 * gating as `handleGamepadMove`.
+	 * snuffs the co-located "light" fixture if there is one, else the player token's own, straight to
+	 * `Token.lightLife` 0 (the configured `lightRadius` is kept, so R1 can bring it back). Same gating as
+	 * `handleGamepadMove`.
 	 */
 	private handleGamepadLightExtinguish(gamepadIndex: number): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 		const token = this.controller.findToken(tokenId);
@@ -1997,7 +2345,7 @@ export class MapCanvas {
 	 * canvas, or for an unassigned gamepad — same gating as `handleGamepadMove`.
 	 */
 	private handleGamepadAim(gamepadIndex: number, angleDeg: number | null): void {
-		if (this.controller.mode !== "view") return;
+		if (!this.gamepadControlAllowed()) return;
 		const tokenId = this.controller.gamepadAssignments.get(gamepadIndex);
 		if (!tokenId) return;
 		if (angleDeg === null) {
@@ -2029,16 +2377,21 @@ export class MapCanvas {
 	}
 
 	/**
-	 * Whether `token` currently has at least one gamepad action available (`resolveAvailableActions`) —
-	 * i.e. pressing Triangle/Y right now would do something. Drives the live "!" indicator
-	 * (`drawTokens`/`drawInteractIndicator`): recomputed fresh from the token's actual current position
-	 * on every render rather than triggered for a fixed duration by the button itself, so it
-	 * appears/disappears immediately as the token moves, in perfect sync on a player-mirror window too
-	 * (no separate echo needed — both canvases already share the same `MapController`/`settings` this
-	 * reads). `false` for a token with no `cellKey` (grid type "none").
+	 * Whether `token` currently has at least one *contact-based* gamepad action available
+	 * (`resolveAvailableActions` with `requiresContact`) — i.e. it's standing next to a door, a light, an
+	 * entity… something worth flagging. A `contact: "none"` action (always offered, regardless of where
+	 * the token stands) deliberately doesn't light the indicator: it isn't a reaction to anything on the
+	 * map. Drives the live "!" indicator (`drawTokens`/`drawInteractIndicator`): recomputed fresh from
+	 * the token's actual current position on every render rather than triggered for a fixed duration by
+	 * the button itself, so it appears/disappears immediately as the token moves, in perfect sync on a
+	 * player-mirror window too (no separate echo needed — both canvases already share the same
+	 * `MapController`/`settings` this reads). `false` for a token with no `cellKey` (grid type "none").
 	 */
 	private tokenCanInteract(token: Token): boolean {
-		return this.resolveAvailableActions(token).length > 0;
+		// The `run` closures are never invoked here (we only read `requiresContact`), so the gamepad
+		// index only needs to be this token's real one when it has an assignment — `-1` otherwise.
+		const gamepadIndex = [...this.controller.gamepadAssignments].find(([, id]) => id === token.id)?.[0] ?? -1;
+		return this.resolveAvailableActions(token, gamepadIndex).some((o) => o.requiresContact);
 	}
 
 	/**
@@ -2521,6 +2874,21 @@ export class MapCanvas {
 		if (!(tool === "wall" && this.controller.pendingWallBucket)) this.hideColorMagnifier();
 	}
 
+	/**
+	 * Requests a single `render()` on the next animation frame, collapsing any number of requests in
+	 * the same frame into one. The per-frame animation loops (camera follow, fog flicker) go through
+	 * this rather than calling `render()` directly: when several run at once — a player walking with
+	 * fog and a light on screen — each would otherwise trigger its own full re-render, two or three per
+	 * frame, which is the stutter. One-shot callers still call `render()` directly.
+	 */
+	scheduleRender(): void {
+		if (this.scheduledRenderFrameId !== null) return;
+		this.scheduledRenderFrameId = requestAnimationFrame(() => {
+			this.scheduledRenderFrameId = null;
+			this.render();
+		});
+	}
+
 	render(): void {
 		if (this.viewportW === 0 || this.viewportH === 0) return;
 		this.updateCursor();
@@ -2619,7 +2987,12 @@ export class MapCanvas {
 		this.drawer.drawWalls(ctx, cellsVisible, this.effectiveMode(), this.isMirror, this.draggingWallPoint);
 
 		if (this.fog.isCurrentlyVisible()) {
-			if (celledFog) this.fog.renderCellFog(ctx, dpr, imageBounds, getWallSegments());
+			// A gamepad "jump" hop is purely cosmetic — the move already committed, so fog is identical
+			// every one of the hop's frames. Let `renderCellFog` reblit its last build instead of
+			// re-tracing it ~11 times (a path-animation tween, by contrast, moves the caster's pose
+			// frame by frame and must recompute — hence the `!pathAnimation` guard).
+			const cosmeticHopFrame = this.cellHops.size > 0 && !this.pathAnimation;
+			if (celledFog) this.fog.renderCellFog(ctx, dpr, imageBounds, getWallSegments(), cosmeticHopFrame);
 			else this.fog.renderAndComposite(ctx, dpr, imageBounds);
 			// Debug overlay is a GM tuning aid only — never draw it on a player-mirror ("Vue Joueur") window.
 			if (!this.isMirror) this.fog.drawDebugVisionRays(ctx, getWallSegments());
@@ -2644,6 +3017,7 @@ export class MapCanvas {
 
 		ctx.restore();
 		this.syncActionMenuOverlay();
+		this.syncActionNoteOverlay();
 		this.fog.syncAnimationLoop();
 	}
 
@@ -2738,7 +3112,7 @@ export class MapCanvas {
 
 	/** Starts (or restarts, if a fast gamepad repeat lands mid-hop) `tokenId`'s "jump" bounce from `from` to `to` (both world points, its old and new cell centers) — see `CellHopState`/`drawTokens`/`currentHopPose`. Called by `handleGamepadMove` right before `MapController.moveToken` commits the actual cell change. */
 	private startCellHop(tokenId: string, from: Point, to: Point): void {
-		this.cellHops.set(tokenId, { from, to, startedAt: performance.now() });
+		this.cellHops.set(tokenId, { from, to, startedAt: null });
 		this.runCellHopLoop();
 	}
 
@@ -2748,7 +3122,9 @@ export class MapCanvas {
 		const tick = () => {
 			const now = performance.now();
 			for (const [id, hop] of this.cellHops) {
-				if (now - hop.startedAt >= CELL_HOP_DURATION_MS) this.cellHops.delete(id);
+				// The hop's clock starts on its first frame here, not at `startCellHop` — see `CellHopState`.
+				if (hop.startedAt === null) hop.startedAt = now;
+				else if (now - hop.startedAt >= CELL_HOP_DURATION_MS) this.cellHops.delete(id);
 			}
 			this.render();
 			if (this.cellHops.size === 0) {
@@ -2769,7 +3145,8 @@ export class MapCanvas {
 	private currentHopPose(tokenId: string): Point | null {
 		const hop = this.cellHops.get(tokenId);
 		if (!hop) return null;
-		const t = clamp((performance.now() - hop.startedAt) / CELL_HOP_DURATION_MS, 0, 1);
+		// Before the first frame stamps `startedAt`, hold at t=0 (the `from` cell) — see `CellHopState`.
+		const t = hop.startedAt === null ? 0 : clamp((performance.now() - hop.startedAt) / CELL_HOP_DURATION_MS, 0, 1);
 		const height = cellVisualWidth(this.controller.getData()) * CELL_HOP_HEIGHT_RATIO;
 		return {
 			x: hop.from.x + (hop.to.x - hop.from.x) * t,

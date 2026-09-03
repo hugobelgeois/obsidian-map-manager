@@ -47,10 +47,10 @@ const INTERACT_BUTTON_INDEX = 3;
 const CONFIRM_BUTTON_INDEX = 0;
 /** "Rond"/"B" — standard mapping index 1 — closes an open action menu without running anything (`onCancel`). */
 const CANCEL_BUTTON_INDEX = 1;
-/** How long L1 must be held before `onLightExtinguish` fires (life → 0), ms — long enough that a stray tap doesn't snuff a torch. */
-const LIGHT_EXTINGUISH_HOLD_MS = 1500;
-/** L1/LB — standard mapping index 4 — held for `LIGHT_EXTINGUISH_HOLD_MS` snuffs a player's light (`onLightExtinguish`). */
+/** L1/LB — standard mapping index 4 — each press dims a player's light by one step (`onLightDim`); held past `LIGHT_EXTINGUISH_HOLD_MS` snuffs it entirely (`onLightExtinguish`). */
 const L1_BUTTON_INDEX = 4;
+/** How long L1 must be held before `onLightExtinguish` fires (life → 0), ms — long enough that a normal dim-tap doesn't trip it. */
+const LIGHT_EXTINGUISH_HOLD_MS = 1500;
 /** R1/RB — standard mapping index 5 — each press refills a player's light life (`onLightRefill`). */
 const R1_BUTTON_INDEX = 5;
 
@@ -91,9 +91,9 @@ function readRightStickDirection(pad: Gamepad): number | null {
 }
 
 /** How long a freshly-pushed direction waits before it starts auto-repeating, ms. */
-const MOVE_REPEAT_DELAY_MS = 320;
+const MOVE_REPEAT_DELAY_MS = 260;
 /** Once repeating, how often a held direction fires another move, ms. */
-const MOVE_REPEAT_INTERVAL_MS = 170;
+const MOVE_REPEAT_INTERVAL_MS = 130;
 
 interface GamepadPollState {
 	/** Whether the last poll saw the left stick/d-pad pushed past the deadzone — a direction only ever fires on the poll it first becomes true (then again per the repeat timer), never continuously, so tapping the stick yields exactly one step. */
@@ -105,10 +105,12 @@ interface GamepadPollState {
 	confirmPressed: boolean;
 	/** Last-seen pressed state of the cancel button (Rond/B), for edge-detecting `onCancel`. */
 	cancelPressed: boolean;
+	/** Last-seen pressed state of L1, for edge-detecting `onLightDim`. */
+	l1Pressed: boolean;
 	/** When L1 most recently went from released to held (`performance.now()`), or `null` while it's up — the basis for `onLightExtinguish`'s `LIGHT_EXTINGUISH_HOLD_MS` long-press gate. */
 	l1PressedAt: number | null;
 	/** Whether `onLightExtinguish` has already fired for L1's current hold, so it fires exactly once per press-and-hold. */
-	l1Fired: boolean;
+	l1ExtinguishFired: boolean;
 	/** Last-seen pressed state of R1, for edge-detecting `onLightRefill`. */
 	r1Pressed: boolean;
 }
@@ -133,6 +135,8 @@ export interface GamepadCallbacks {
 	onCancel: (gamepadIndex: number) => void;
 	/** R1 pressed, edge-triggered — refill the player's light life (see `MapCanvas.handleGamepadLightRefill`). */
 	onLightRefill: (gamepadIndex: number) => void;
+	/** L1 pressed, edge-triggered — dim the player's light by one step (see `MapCanvas.handleGamepadLightDim`). */
+	onLightDim: (gamepadIndex: number) => void;
 	/** L1 held continuously for `LIGHT_EXTINGUISH_HOLD_MS`, once per press-and-hold — snuff the player's light (life → 0). */
 	onLightExtinguish: (gamepadIndex: number) => void;
 	/**
@@ -181,7 +185,7 @@ export class GamepadInputPoller {
 			seen.add(pad.index);
 			let entry = this.state.get(pad.index);
 			if (!entry) {
-				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, confirmPressed: false, cancelPressed: false, l1PressedAt: null, l1Fired: false, r1Pressed: false };
+				entry = { moveActive: false, moveNextFireAt: 0, interactPressed: false, confirmPressed: false, cancelPressed: false, l1Pressed: false, l1PressedAt: null, l1ExtinguishFired: false, r1Pressed: false };
 				this.state.set(pad.index, entry);
 			}
 
@@ -198,17 +202,20 @@ export class GamepadInputPoller {
 			entry.cancelPressed = cancelHeld;
 
 			const l1Held = pad.buttons[L1_BUTTON_INDEX]?.pressed ?? false;
-			if (l1Held && entry.l1PressedAt === null) {
+			if (l1Held && !entry.l1Pressed) {
+				// A fresh press: one dim step now, and start the long-press timer for a full snuff.
+				this.callbacks.onLightDim(pad.index);
 				entry.l1PressedAt = now;
-				entry.l1Fired = false;
+				entry.l1ExtinguishFired = false;
 			}
 			if (!l1Held) {
 				entry.l1PressedAt = null;
-				entry.l1Fired = false;
-			} else if (!entry.l1Fired && entry.l1PressedAt !== null && now - entry.l1PressedAt >= LIGHT_EXTINGUISH_HOLD_MS) {
+				entry.l1ExtinguishFired = false;
+			} else if (!entry.l1ExtinguishFired && entry.l1PressedAt !== null && now - entry.l1PressedAt >= LIGHT_EXTINGUISH_HOLD_MS) {
 				this.callbacks.onLightExtinguish(pad.index);
-				entry.l1Fired = true;
+				entry.l1ExtinguishFired = true;
 			}
+			entry.l1Pressed = l1Held;
 
 			const r1Held = pad.buttons[R1_BUTTON_INDEX]?.pressed ?? false;
 			if (r1Held && !entry.r1Pressed) this.callbacks.onLightRefill(pad.index);

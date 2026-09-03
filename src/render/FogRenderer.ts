@@ -198,6 +198,18 @@ export class FogRenderer {
 	/** Non-null while the fog-tremble animation loop (settings.fogAnimationMode) is actively re-rendering every frame. */
 	private animationFrameId: number | null = null;
 
+	/**
+	 * Signature of everything `renderCellFog`'s composited `fogCanvas` depends on (`dataVersion` +
+	 * this frame's transform / viewport / `fogSoftening`), stamped after each full build. When a
+	 * later `renderCellFog` call passes `allowReuse` and this still matches, the existing `fogCanvas`
+	 * is reblitted rather than rebuilt — the point being a purely cosmetic token hop
+	 * (`MapCanvas.cellHops`), whose ~11 frames would otherwise each re-trace every light's visibility
+	 * polygon, rebuild the explored/concave `Path2D`s and re-run `drawFogSofteningRamp` only to
+	 * produce a bit-for-bit identical frame. The light flicker (`lightCoreRatio`) and softening
+	 * tremble just hold still for the ~180 ms the hop lasts.
+	 */
+	private cellFogSignature: string | null = null;
+
 	/** Translucent fill color for a token's own `lightRadius` preview — warm/amber, distinct from the entity eye-cone red so it reads as "light" rather than "sight". */
 	private static readonly TOKEN_LIGHT_ZONE_COLOR = "rgba(250, 204, 21, 0.2)";
 	/**
@@ -955,13 +967,22 @@ export class FogRenderer {
 	 * plus a small neighbourhood around each light, so it stays cheap however far the view is zoomed
 	 * out. Drawn crisp on the offscreen `fogCanvas` (no blur pass) and blitted back.
 	 */
-	renderCellFog(ctx: CanvasRenderingContext2D, dpr: number, imageBounds: ImageBounds | null, wallSegments: ResolvedWallSegment[]): void {
+	renderCellFog(ctx: CanvasRenderingContext2D, dpr: number, imageBounds: ImageBounds | null, wallSegments: ResolvedWallSegment[], allowReuse = false): void {
 		const data = this.controller.getData();
 		if (data.gridType === "none") return;
 		const rect = this.visibleWorldRect();
 		const { w: viewportW, h: viewportH } = this.getViewportSize();
 		const w = Math.max(1, Math.round(viewportW * dpr));
 		const h = Math.max(1, Math.round(viewportH * dpr));
+
+		// Cosmetic-only frame (a token hop mid-flight — see `cellFogSignature`) whose fog inputs are
+		// all unchanged: reblit the last full build instead of redoing every trace/path/blur.
+		const signature = `${this.controller.dataVersion}|${w}|${h}|${Math.round(this.transform.panX)}|${Math.round(this.transform.panY)}|${this.transform.zoom}|${this.settings.fogSoftening}`;
+		if (allowReuse && signature === this.cellFogSignature && this.fogCanvas.width === w && this.fogCanvas.height === h) {
+			this.blitCellFog(ctx, rect, imageBounds);
+			return;
+		}
+
 		if (this.fogCanvas.width !== w || this.fogCanvas.height !== h) {
 			this.fogCanvas.width = w;
 			this.fogCanvas.height = h;
@@ -1129,14 +1150,8 @@ export class FogRenderer {
 		fctx.globalCompositeOperation = "source-over";
 		fctx.restore();
 
-		ctx.save();
-		if (imageBounds) {
-			ctx.beginPath();
-			ctx.rect(imageBounds.x, imageBounds.y, imageBounds.w, imageBounds.h);
-			ctx.clip();
-		}
-		ctx.drawImage(this.fogCanvas, rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
-		ctx.restore();
+		this.cellFogSignature = signature;
+		this.blitCellFog(ctx, rect, imageBounds);
 
 		// Cells a player can wholly see right now — lit by the player's own light OR by an outside
 		// light source the player has line of sight to — become permanently explored. Last, since
@@ -1160,6 +1175,18 @@ export class FogRenderer {
 			for (const light of this.frameLightRawCache) consider(light.center, light.radius);
 			if (newlyExplored.length > 0) this.controller.markExplored(newlyExplored);
 		}
+	}
+
+	/** Draws the already-composited `fogCanvas` onto the main context, clipped to `imageBounds` — the tail shared by a full `renderCellFog` build and its cheap `allowReuse` reblit. */
+	private blitCellFog(ctx: CanvasRenderingContext2D, rect: WorldRect, imageBounds: ImageBounds | null): void {
+		ctx.save();
+		if (imageBounds) {
+			ctx.beginPath();
+			ctx.rect(imageBounds.x, imageBounds.y, imageBounds.w, imageBounds.h);
+			ctx.clip();
+		}
+		ctx.drawImage(this.fogCanvas, rect.minX, rect.minY, rect.maxX - rect.minX, rect.maxY - rect.minY);
+		ctx.restore();
 	}
 
 	/**

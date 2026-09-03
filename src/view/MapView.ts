@@ -37,6 +37,33 @@ export class MapView extends TextFileView {
 	/** Player mirror windows subscribed to this view's live gamepad right-stick "look" ticks via `registerMirrorSource`'s `onAim`. */
 	private aimListeners: Set<(tokenId: string, angleDeg: number | null) => void> = new Set();
 	private rootEl: HTMLElement;
+	/**
+	 * The exact file content we ourselves last wrote to disk (`save`) or loaded from it
+	 * (`setViewData`/`handleExternalModify`). `handleExternalModify` compares against *this*, not the
+	 * live in-memory state, to tell "another window saved the file" apart from an echo of our own
+	 * debounced save.
+	 */
+	private lastSyncedRaw: string | null = null;
+	/**
+	 * What `getViewData()` last returned, promoted to `lastSyncedRaw` by `save()` once the write it
+	 * feeds has actually landed. Kept separate because Obsidian also calls `getViewData()` when *not*
+	 * saving (leaf serialization, tab switches) — writing straight to `lastSyncedRaw` there would let
+	 * a late `modify` event from an earlier save read back now-stale disk content that no longer
+	 * matches, and `replaceData` every move made since.
+	 */
+	private pendingSaveRaw: string | null = null;
+	/** `controller.dataVersion` captured when `getViewData()` produced `pendingSaveRaw` — promoted to `lastSavedDataVersion` by `save()` once that write lands. */
+	private pendingSaveDataVersion = 0;
+	/**
+	 * `controller.dataVersion` as of our last *completed* save (or the initial load). When the live
+	 * `dataVersion` is ahead of this we have edits not yet on disk, so a `modify` event now is our own
+	 * still-in-flight (debounced) save echoing back — never an external change to pull in. This is the
+	 * real fix for the "gamepad move, token teleports back" bug: while driving a token, moves land
+	 * faster than the 2s save debounce, and every `modify` from an earlier save would otherwise
+	 * `replaceData` the controller (both the GM tab and the shared player-mirror window) back to that
+	 * older snapshot.
+	 */
+	private lastSavedDataVersion = 0;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: MapManagerPlugin) {
 		super(leaf);
@@ -54,11 +81,16 @@ export class MapView extends TextFileView {
 	/** Reloads from disk when another open window saved a change to this same file (e.g. this map opened in a second normal tab elsewhere). No-op if the file on disk still matches what we already hold in memory (an echo of our own debounced save). A player mirror window doesn't need this — it shares this instance's `MapController` object directly (see `mirrorRegistry`). */
 	private async handleExternalModify(): Promise<void> {
 		if (!this.file || !this.controller) return;
+		// We have local edits not yet flushed to disk (the save debounce hasn't fired, or its write
+		// is still in flight) — this `modify` is our own save echoing back, not an external change.
+		// Pulling from disk here would drop everything edited since that write was queued.
+		if (this.controller.dataVersion !== this.lastSavedDataVersion) return;
 		const raw = await this.app.vault.read(this.file);
-		const current = serializeMapData(this.controller.getData());
-		if (raw === current) return;
+		if (raw === this.lastSyncedRaw || raw === serializeMapData(this.controller.getData())) return;
+		this.lastSyncedRaw = raw;
 		const parsed = parseMapData(raw, this.plugin.getMapDefaults());
 		this.controller.replaceData(parsed);
+		this.lastSavedDataVersion = this.controller.dataVersion;
 	}
 
 	getViewType(): string {
@@ -74,13 +106,31 @@ export class MapView extends TextFileView {
 	}
 
 	getViewData(): string {
-		return this.controller ? serializeMapData(this.controller.getData()) : "";
+		if (!this.controller) return "";
+		const data = serializeMapData(this.controller.getData());
+		// Not `lastSyncedRaw`/`lastSavedDataVersion` directly — Obsidian also calls this outside of
+		// saving. `save()` promotes both once the write actually lands (see `pendingSaveRaw`).
+		this.pendingSaveRaw = data;
+		this.pendingSaveDataVersion = this.controller.dataVersion;
+		return data;
+	}
+
+	async save(clear?: boolean): Promise<void> {
+		await super.save(clear);
+		// `super.save()` called `getViewData()` and wrote its result — that string is now on disk, so
+		// the `modify` event it triggers should read back as our own echo (see `handleExternalModify`).
+		if (this.pendingSaveRaw !== null) {
+			this.lastSyncedRaw = this.pendingSaveRaw;
+			this.lastSavedDataVersion = this.pendingSaveDataVersion;
+		}
 	}
 
 	setViewData(data: string, _clear: boolean): void {
 		this.destroyComponents();
+		this.lastSyncedRaw = data;
 		const parsed = parseMapData(data, this.plugin.getMapDefaults());
 		this.controller = new MapController(parsed, () => this.requestSave());
+		this.lastSavedDataVersion = this.controller.dataVersion;
 		if (this.file) this.unsubscribeAutoPublish = wireAutoPublish(this.app, this.file, this.controller, this.plugin.settings);
 		this.unsubscribeSettings = this.plugin.onSettingsChanged(() => this.controller?.refresh());
 		this.mountComponents();

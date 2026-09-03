@@ -34,7 +34,7 @@ export type GamepadActionEffect =
 	| { kind: "change-wall-type"; to: VisionBlockerType }
 	/** Toggle the acting player's light (or a co-located "light" fixture): `lightLife` 100 ⇄ 0. */
 	| { kind: "toggle-light" }
-	/** Open a read-only modal rendering the vault note (or heading) at `link` (`path` or `path#heading` — see `ActionNoteModal`). */
+	/** Open a read-only sidebar rendering the vault note (or heading) at `link` (`path` or `path#heading` — see `MapCanvas.syncActionNoteOverlay`). */
 	| { kind: "open-note"; link: string };
 
 export interface GamepadAction {

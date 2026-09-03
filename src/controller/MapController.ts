@@ -55,8 +55,16 @@ export const PLAYER_MIRROR_CAMERA_MODES: PlayerMirrorCameraMode[] = ["mirror", "
 /** One open gamepad action menu — see `MapController.gamepadActionMenus` / `MapCanvas.syncActionMenuOverlay`. */
 export interface GamepadActionMenuState {
 	tokenId: string;
-	options: { label: string; lightCost: number }[];
+	options: { label: string }[];
 	highlightedIndex: number;
+}
+
+/** One open gamepad `open-note` action sidebar — see `MapController.gamepadActionNotes` / `MapCanvas.syncActionNoteOverlay`. */
+export interface GamepadActionNoteState {
+	tokenId: string;
+	title: string;
+	/** Vault note link (`path` or `path#heading`) — rendered read-only via `renderLinkedNote`. */
+	link: string;
 }
 
 export const PLAYER_MIRROR_CAMERA_MODE_LABELS: Record<PlayerMirrorCameraMode, string> = {
@@ -127,6 +135,15 @@ export class MapController {
 	 * driving gamepad or token goes away.
 	 */
 	gamepadActionMenus: Map<number, GamepadActionMenuState> = new Map();
+
+	/**
+	 * The gamepad `open-note` action's note currently open for each gamepad, keyed by `Gamepad.index` —
+	 * session-only and notify-driven, exactly like `gamepadActionMenus`, so both the GM canvas and the
+	 * player-mirror canvas render the same note sidebar off shared state with no echo channel. Each
+	 * player's note docks as a full-height sidebar on the left/right map edge (`MapCanvas.playerSlotRect`).
+	 * Cleared when the driving gamepad or token goes away, or on Rond/B (`closeGamepadActionNote`).
+	 */
+	gamepadActionNotes: Map<number, GamepadActionNoteState> = new Map();
 
 	/**
 	 * Brush/fill tools (edit mode): apply a zone type to cells, either one at a time while dragging
@@ -212,6 +229,28 @@ export class MapController {
 	constructor(data: MapFileData, private onSave: (data: MapFileData) => void, initialMode: MapMode = "edit") {
 		this.data = data;
 		this.mode = initialMode;
+	}
+
+	/**
+	 * How many player-mirror windows (`MapPlayerMirrorView`) are currently mounted against this
+	 * controller. Session-only, not persisted. Keeps gamepad control driving player tokens even when the
+	 * GM flips their own window to edit mode — see `MapCanvas.gamepadControlAllowed`.
+	 */
+	private playerMirrorRefs = 0;
+
+	/** Whether at least one player-mirror window is currently open — see `playerMirrorRefs`. */
+	get hasPlayerMirror(): boolean {
+		return this.playerMirrorRefs > 0;
+	}
+
+	/** Called by `MapPlayerMirrorView` when it mounts against this controller. */
+	addPlayerMirror(): void {
+		this.playerMirrorRefs++;
+	}
+
+	/** Called by `MapPlayerMirrorView` when it unmounts. */
+	removePlayerMirror(): void {
+		this.playerMirrorRefs = Math.max(0, this.playerMirrorRefs - 1);
 	}
 
 	setMode(mode: MapMode): void {
@@ -1359,7 +1398,8 @@ export class MapController {
 
 	unassignGamepad(gamepadIndex: number): void {
 		const hadMenu = this.gamepadActionMenus.delete(gamepadIndex);
-		if (!this.gamepadAssignments.delete(gamepadIndex) && !hadMenu) return;
+		const hadNote = this.gamepadActionNotes.delete(gamepadIndex);
+		if (!this.gamepadAssignments.delete(gamepadIndex) && !hadMenu && !hadNote) return;
 		this.notify();
 	}
 
@@ -1378,13 +1418,19 @@ export class MapController {
 				changed = true;
 			}
 		}
+		for (const [index, note] of [...this.gamepadActionNotes]) {
+			if (tokenIds.has(note.tokenId)) {
+				this.gamepadActionNotes.delete(index);
+				changed = true;
+			}
+		}
 		if (changed) this.notify();
 	}
 
 	// ---- Gamepad action menu (session-only — see `gamepadActionMenus`) ----
 
 	/** Opens the Triangle/Y action menu for `gamepadIndex`, driving `tokenId`, with `options` as its entries (cursor starts at the top). */
-	openGamepadActionMenu(gamepadIndex: number, tokenId: string, options: { label: string; lightCost: number }[]): void {
+	openGamepadActionMenu(gamepadIndex: number, tokenId: string, options: { label: string }[]): void {
 		this.gamepadActionMenus.set(gamepadIndex, { tokenId, options, highlightedIndex: 0 });
 		this.notify();
 	}
@@ -1402,6 +1448,21 @@ export class MapController {
 	closeGamepadActionMenu(gamepadIndex: number): void {
 		if (!this.gamepadActionMenus.delete(gamepadIndex)) return;
 		this.notify();
+	}
+
+	// ---- Gamepad `open-note` action sidebar (session-only — see `gamepadActionNotes`) ----
+
+	/** Opens (or replaces) `gamepadIndex`'s note sidebar, driven by `tokenId`, showing the vault note at `link` under `title`. */
+	openGamepadActionNote(gamepadIndex: number, tokenId: string, title: string, link: string): void {
+		this.gamepadActionNotes.set(gamepadIndex, { tokenId, title, link });
+		this.notify();
+	}
+
+	/** Closes the note sidebar for `gamepadIndex`, if any. Returns whether one was open. */
+	closeGamepadActionNote(gamepadIndex: number): boolean {
+		if (!this.gamepadActionNotes.delete(gamepadIndex)) return false;
+		this.notify();
+		return true;
 	}
 
 	// ---- Clipboard (tokens only — see tokenClipboard.ts) ----

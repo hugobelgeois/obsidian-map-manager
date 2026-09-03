@@ -44,9 +44,22 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	const raw = await app.vault.read(file);
 	const data = parseMapData(raw, plugin.getMapDefaults());
 
+	// The exact content we ourselves last wrote to / read from disk, and `controller.dataVersion` as
+	// of that write. `handleExternalModify` uses both, not the live in-memory state: while
+	// gamepad-driving a token, moves land faster than the save debounce, so a `modify` event from an
+	// earlier write is our own save echoing back — reloading from disk there would `replaceData` the
+	// token (and the shared player-mirror window) back to that older snapshot.
+	let lastSyncedRaw = raw;
+	let lastSavedDataVersion = 0;
+
 	const save = debounce(
 		(d: ReturnType<typeof parseMapData>) => {
-			void app.vault.process(file, () => serializeMapData(d));
+			void app.vault.process(file, () => {
+				const serialized = serializeMapData(d);
+				lastSyncedRaw = serialized;
+				lastSavedDataVersion = controller.dataVersion;
+				return serialized;
+			});
 		},
 		500,
 		true
@@ -62,11 +75,15 @@ export async function renderMapEmbed(plugin: MapManagerPlugin, source: string, e
 	// hold in memory (an echo of our own debounced `save`).
 	const handleExternalModify = async (changed: TFile) => {
 		if (changed.path !== file.path) return;
+		// Local edits not yet flushed (the save debounce hasn't fired, or its write is in flight) —
+		// this `modify` is our own save echoing back, not an external change.
+		if (controller.dataVersion !== lastSavedDataVersion) return;
 		const raw = await app.vault.read(file);
-		const current = serializeMapData(controller.getData());
-		if (raw === current) return;
+		if (raw === lastSyncedRaw || raw === serializeMapData(controller.getData())) return;
+		lastSyncedRaw = raw;
 		const parsed = parseMapData(raw, plugin.getMapDefaults());
 		controller.replaceData(parsed);
+		lastSavedDataVersion = controller.dataVersion;
 	};
 	const modifyRef = app.vault.on("modify", (f) => {
 		if (f instanceof TFile) void handleExternalModify(f);
